@@ -156,7 +156,7 @@ class InstallerTests(unittest.TestCase):
     def test_help_is_available_without_root_or_host_mutation(self):
         result = subprocess.run(["bash", str(SCRIPT), "--help"], text=True, capture_output=True, check=True)
         self.assertIn("--install-lts", result.stdout); self.assertIn("never migrates", result.stdout)
-        self.assertIn("--routing", result.stdout)
+        self.assertIn("--routing", result.stdout); self.assertIn("--enable-physical-gpu", result.stdout)
         self.assertIn("--trusted-worker-image", result.stdout); self.assertIn("NEVER choose", result.stdout)
 
     def test_command_space_failure_is_actionable_without_raw_secret_diagnostics(self):
@@ -463,6 +463,40 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "restrictions differ"): SETUP.resource_setup(config, ["/srv/approved"])
             self.assertEqual(commands.call_count, 1)
 
+    def test_physical_gpu_opt_in_is_idempotent_and_preserves_mdev_and_device_restrictions(self):
+        for profile in ("", "i915-GVTg_V5_4"):
+            config = {**self.config(), "gpuPhysicalEnabled": True, "gpuMdevProfile": profile}
+            project = {"name": config["project"], "config": {SETUP.MARKER: INSTALLATION,
+                "features.images": "true", "features.storage.volumes": "true", "features.networks": "false",
+                "restricted": "true", "restricted.devices.nic": "managed", "restricted.devices.disk": "allow",
+                "restricted.networks.access": config["network"], "restricted.devices.disk.paths": "/srv/approved"}}
+            if profile:
+                project["config"].update({"restricted.devices.gpu": "allow", "user.agentor.gpu-mdev-profile": profile})
+            pool = {"name": config["pool"], "driver": "dir", "status": "Created", "config": {SETUP.MARKER: INSTALLATION}}
+            network = {"name": config["network"], "managed": True, "type": "bridge", "config": {SETUP.MARKER: INSTALLATION,
+                "ipv4.nat": "true", "ipv6.address": "none", "ipv4.address": "10.25.0.1/24"}}
+            def resource(kind, name): return copy.deepcopy({"/1.0/projects": project, "/1.0/networks": network, "/1.0/storage-pools": pool}[kind])
+            def enable(*args):
+                self.assertEqual(args, ("project", "set", config["project"], "restricted.devices.gpu=allow", "user.agentor.gpu-physical=true"))
+                project["config"].update({"restricted.devices.gpu": "allow", "user.agentor.gpu-physical": "true"})
+            with self.subTest(profile=profile), patch.object(SETUP, "resource", side_effect=resource), patch.object(SETUP, "incus", side_effect=enable) as commands:
+                SETUP.resource_setup(config, ["/srv/approved"])
+                SETUP.resource_setup(config, ["/srv/approved"])
+                self.assertEqual(commands.call_count, 1)
+                for key, value in (("restricted.devices.pci", "allow"), ("restricted.devices.usb", "allow"),
+                                   ("restricted.devices.unix-char", "allow"), ("restricted.devices.unix-block", "allow"),
+                                   ("restricted.virtual-machines.lowlevel", "allow"), ("user.agentor.gpu-physical", "false")):
+                    project["config"][key] = value
+                    with self.assertRaises(ValueError): SETUP.resource_setup(config, ["/srv/approved"])
+                    del project["config"][key]
+                    project["config"]["user.agentor.gpu-physical"] = "true"
+                with self.assertRaises(ValueError): SETUP.resource_setup({**config, "gpuPhysicalEnabled": False}, ["/srv/approved"])
+                self.assertEqual(commands.call_count, 1)
+                del project["config"]["user.agentor.gpu-physical"]
+                if not profile:
+                    with self.assertRaisesRegex(ValueError, "ambiguous"): SETUP.resource_setup(config, ["/srv/approved"])
+                    self.assertEqual(commands.call_count, 1)
+
     def test_gpu_profile_admission_reads_real_shaped_sysfs_without_writing(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); params = root / 'module/i915/parameters'; params.mkdir(parents=True)
@@ -566,11 +600,11 @@ print('attempting',flush=True);m.routing({'installation':ident})
 '''
             writers = []
             try:
-                first = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "A"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); writers.append(first)
+                first = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "A"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0); writers.append(first)
                 for expected in ("attempting", "entered"):
-                    self.assertTrue(select.select([first.stdout], [], [], 3)[0]); self.assertEqual(first.stdout.readline().strip(), expected)
-                second = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "B"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True); writers.append(second)
-                self.assertTrue(select.select([second.stdout], [], [], 3)[0]); self.assertEqual(second.stdout.readline().strip(), "attempting")
+                    self.assertTrue(select.select([first.stdout], [], [], 3)[0]); self.assertEqual(first.stdout.readline().decode().strip(), expected)
+                second = subprocess.Popen([sys.executable, "-c", child, str(SCRIPT), str(base), INSTALLATION, "B"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0); writers.append(second)
+                self.assertTrue(select.select([second.stdout], [], [], 3)[0]); self.assertEqual(second.stdout.readline().decode().strip(), "attempting")
                 self.assertFalse(select.select([second.stdout], [], [], .1)[0]); self.assertEqual(events.read_text(), "A-start\n")
                 release.touch()
                 for writer in writers:

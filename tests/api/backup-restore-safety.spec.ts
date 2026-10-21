@@ -516,6 +516,7 @@ test("archive retries after stop/remove and persistence failures without restopp
     const fakeManager = {
       containers,
       assertOrdinaryMutation: () => {},
+      assertNoPhysicalGpuRemoval: async () => {},
       persistentBackupPathMounts: async () => [],
       persistDesiredRuntimeStatus: async (current: any, desired: string) => {
         current.desiredRuntimeStatus = desired;

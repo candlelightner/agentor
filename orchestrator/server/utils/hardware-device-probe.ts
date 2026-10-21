@@ -1,5 +1,5 @@
 /** Runs in the existing networkless, read-only /dev + /sys discovery helper.
- * No node is opened, driver rebound, module loaded or host mount inspected.
+ * No /dev node is opened, driver rebound, module loaded or host mount inspected.
  * Refusing ALL storage/hubs also protects unmounted backups, swap and controllers. */
 export const HARDWARE_DEVICE_PROBE = String.raw`
 import json, os, re, stat
@@ -15,12 +15,83 @@ def link(path):
     except OSError: return None
 def unsupported(reason, evidence=None):
     return dict(supported=False, mode='unsupported', reason=reason, **({'evidence':evidence} if evidence else {}))
+def gpu_serial(sys):
+    serial = read(sys/'serial')
+    if re.fullmatch(r'[A-Za-z0-9._-]{1,128}', serial): return serial
+    try:
+        with (sys/'vpd').open('rb') as stream: data = stream.read(4097)
+    except OSError: return ''
+    if len(data) > 4096: return ''
+    offset, serials = 0, []
+    while offset < len(data):
+        tag = data[offset]; offset += 1
+        if tag == 0x78: break
+        if tag & 0x80:
+            if offset + 2 > len(data): return ''
+            length = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
+        else: length = tag & 7
+        end = offset + length
+        if end > len(data): return ''
+        if tag == 0x90:
+            while offset < end:
+                if offset + 3 > end: return ''
+                key, size = data[offset:offset+2], data[offset+2]; offset += 3
+                if offset + size > end: return ''
+                if key == b'SN':
+                    value = data[offset:offset+size].decode('ascii', errors='replace').strip()
+                    if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', value): return ''
+                    serials.append(value)
+                offset += size
+        offset = end
+    return serials[0] if len(serials) == 1 else ''
 result = []
+drm_devices = set()
+gpu_nodes = {}
+receipts = json.loads(os.environ.get('AGENTOR_GPU_IDENTITIES', '[]'))
+boot_id = read(root/'boot_id')
+uuid_pattern = r'GPU-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'
+def physical_identity(sys, ids):
+    serial = gpu_serial(sys)
+    before = sys.stat().st_ino
+    info = ''
+    if ids[0] == '10de':
+        try:
+            with (Path('/proc/driver/nvidia/gpus')/sys.name/'information').open() as stream: info = stream.read(4097)
+        except (OSError, UnicodeError): pass
+    if len(info) > 4096: info = ''
+    matches = re.findall(r'^GPU UUID:\s*('+uuid_pattern+r')\s*$', info, re.M)
+    location = re.findall(r'^Bus Location:\s*([^\s]+)\s*$', info, re.M)
+    # kernfs uses its unique 64-bit object ID as st_ino on 64-bit hosts.
+    if not re.fullmatch(r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}', boot_id) or os.sysconf('SC_LONG_BIT') != 64 or sys.stat().st_ino != before:
+        return serial, None
+    witness = dict(bootId=boot_id, deviceInode=str(before))
+    prefix = 'pci-gpu:'+':'.join(ids)+':'
+    known = [item for item in receipts
+             if isinstance(item, dict) and isinstance(item.get('selector'), str) and item['selector'].startswith(prefix)
+             and isinstance(item.get('physicalIdentity'), dict)
+             and all(item['physicalIdentity'].get(key) == value for key, value in witness.items())]
+    if not serial and len(matches) == 1 and location == [sys.name]: serial = matches[0]
+    if not serial:
+        if ids[0] != '10de': return '', None
+        driver = link(sys/'driver')
+        if driver and driver.name != 'vfio-pci': return '', None
+        known = [item for item in known if re.fullmatch(uuid_pattern, item['selector'][len(prefix):])]
+        if len(known) != 1: return '', None
+        serial = known[0]['selector'][len(prefix):]
+    aliases = list(gpu_nodes.get(sys, []))
+    minor = re.findall(r'^Device Minor:\s*([0-9]+)\s*$', info, re.M)
+    if location == [sys.name] and len(minor) == 1 and (root/'dev'/('nvidia'+minor[0])).exists(): aliases.append('/dev/nvidia'+minor[0])
+    for item in known:
+        if item['selector'] == prefix+serial: aliases += item['physicalIdentity'].get('deviceNodes', [])
+    witness['deviceNodes'] = sorted(set(aliases))
+    return serial, witness
 for node in sorted((root/'dev/dri').glob('renderD*')):
     sys = link(root/'sys/class/drm'/node.name/'device')
     if not sys: continue
+    drm_devices.add(sys)
     nodes = [root/'dev/dri'/p.name for p in (root/'sys/class/drm').iterdir()
              if re.fullmatch(r'(card|renderD)\d+', p.name) and link(p/'device') == sys and (root/'dev/dri'/p.name).exists()]
+    gpu_nodes[sys] = ['/dev/dri/'+p.name for p in nodes]
     driver, iommu = link(sys/'driver'), link(sys/'iommu_group')
     profiles = sorted(p.name for p in (sys/'mdev_supported_types').glob('*'))
     available, instances = {}, {}
@@ -52,6 +123,45 @@ for node in sorted((root/'dev/dri').glob('renderD*')):
     result.append(dict(kind='gpu', selector='drm:pci:'+sys.name, name='GPU '+vendor+':'+product+' ('+sys.name+')',
                        vendor=vendor, product=product, deviceNodes=[str(p).removeprefix('/host') for p in nodes],
                        groupIds=sorted(set(p.stat().st_gid for p in nodes)), incus=capability))
+for entry in sorted((root/'sys/bus/pci/devices').glob('*')):
+    sys = link(entry)
+    if not sys or not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', entry.name): continue
+    gpu_class = read(sys/'class')
+    if not re.fullmatch(r'0x03[0-9a-f]{4}', gpu_class): continue
+    ids = [read(sys/name).removeprefix('0x') for name in ['vendor', 'device', 'subsystem_vendor', 'subsystem_device']]
+    if sys in drm_devices and ids[0] == '8086': continue
+    serial, identity = physical_identity(sys, ids)
+    driver, iommu = link(sys/'driver'), link(sys/'iommu_group')
+    members = sorted(p.name for p in (iommu/'devices').glob('*')) if iommu else []
+    bridges = [p.name for p in (iommu/'devices').glob('*') if link(p) in sys.parents
+               and re.fullmatch(r'0x0604[0-9a-f]{2}', read(p/'class'))] if iommu else []
+    reset_methods = read(sys/'reset_method').split()
+    reset_safe = 'bus' not in reset_methods or (re.fullmatch(r'0x0604[0-9a-f]{2}', read(sys.parent/'class')) is not None
+        and [p.name for p in sys.parent.iterdir() if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', p.name)] == [entry.name])
+    boot = read(sys/'boot_vga')
+    nonboot = boot == '0' or (not (sys/'boot_vga').exists() and not (sys/'boot_vga').is_symlink() and re.fullmatch(r'0x03(?:02|80)[0-9a-f]{2}', gpu_class))
+    evidence = dict(pciAddress=entry.name, driver=driver.name if driver else '',
+                    iommuGroup=iommu.name if iommu else '', iommuMembers=members, iommuBridges=sorted(bridges),
+                    resetMethods=reset_methods, resetDomainSafe=bool(reset_safe), bootVga=not nonboot)
+    reason = ''
+    if not serial or not all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids):
+        reason = 'Physical GPU requires a stable serial number and complete PCI identity; missing identity cannot authorize passthrough.'
+    elif not nonboot:
+        reason = 'Physical GPU must be explicitly identified as a non-boot device; host boot GPUs are protected.'
+    elif not iommu or not iommu.name.isdigit() or members != sorted([entry.name]+bridges) or link(iommu/'devices'/entry.name) != sys:
+        reason = 'Physical GPU IOMMU group may contain only this endpoint and its PCI bridge ancestors.'
+    elif not reset_safe:
+        reason = 'Physical GPU bus reset domain contains another PCI device or cannot be established safely.'
+    elif (driver and driver.name != 'vfio-pci') or (not driver and (sys/'driver').is_symlink()):
+        reason = 'Physical GPU is owned by a host driver or its ownership is unknown; operator maintenance must release it before assignment.'
+    capability = unsupported(reason, evidence) if reason else dict(supported=True, mode='gpu-physical',
+        reason='Exclusive physical GPU passthrough; current identity, isolation and ownership are checked before start.', evidence=evidence)
+    # shortcut: driver UUID continuity expires on host reboot or PCI re-enumeration; revalidate with the host driver then.
+    selector = 'pci-gpu:'+':'.join(ids)+':'+serial if serial and all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids) else 'pci-gpu:unavailable:'+entry.name
+    result.append(dict(kind='gpu', selector=selector, name='GPU '+ids[0]+':'+ids[1]+' ('+entry.name+')',
+                       vendor=ids[0], product=ids[1], serial=serial or None,
+                       deviceNodes=identity['deviceNodes'] if identity else gpu_nodes.get(sys, []), groupIds=[],
+                       **({'physicalIdentity':identity} if identity else {}), incus=capability))
 for sys in sorted((root/'sys/bus/usb/devices').glob('*')):
     vendor, product = read(sys/'idVendor'), read(sys/'idProduct')
     if not vendor or not product: continue

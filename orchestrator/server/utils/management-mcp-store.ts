@@ -1110,6 +1110,18 @@ export class ManagementMcpStore {
                 current.scope === "group" ||
                 useAdminWorkspaceStore().getRecord()?.id === current.workspaceId,
             )
+          : name.startsWith("hardware-devices.gpu.")
+          ? {
+              ...identity,
+              reauthorize: async () => {
+                await this.mutations;
+                const current = await this.introspect(credential);
+                if (current.scope !== "platform" || current.workspaceId !== identity.workspaceId ||
+                    useAdminWorkspaceStore().getRecord()?.id !== current.workspaceId ||
+                    !this.state.policy.groups.configuration.enabled)
+                  throw Object.assign(new Error("Physical GPU administration is no longer authorized"), { statusCode: 403 });
+              },
+            }
           : identity;
         const execute = () =>
           this.executeTool(name, args, identity.workspaceId, executionIdentity);

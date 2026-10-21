@@ -18,6 +18,7 @@ import type { Readable, Duplex } from "node:stream";
 import * as tar from "tar-stream";
 import { DockerService } from "./docker";
 import { IncusWorkerCommands } from "./incus-worker-commands";
+import { isNvidiaPhysicalGpuDevice, isPhysicalGpuDevice } from './hardware-device-store';
 import type { ManagedNetworkManager } from './managed-network-manager';
 import type {
   EnvironmentJsonPayload,
@@ -82,7 +83,7 @@ import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from './ordinary-worker-identity';
 import { readAdministrativeRuntimeRecord, administrativeRuntimeOwner } from './admin-native-authority';
-import { useAdministrativeWorkspaceRuntime } from './services';
+import { useAdministrativeWorkspaceRuntime, useHardwareDeviceStore } from './services';
 import { useAdminWorkspaceStore } from './admin-workspace-store';
 import { useGroupAdminWorkspaceStore } from './group-admin-workspace-store';
 import { assertLegacyMigrationAuthority } from './legacy-incus-migration-authority';
@@ -1849,8 +1850,19 @@ export class ContainerManager {
   unregisterExternal(id: string): void {
     this.containers.delete(id);
   }
-  private assertOrdinaryMutation(info: ContainerInfo) {
+  private assertOrdinaryMutation(info: ContainerInfo, allowPhysicalGpuRecovery = false) {
     assertOrdinaryWorkerIdentity(info.id, info.userId);
+    if (!allowPhysicalGpuRecovery) {
+      const record = this.workerStore?.get(info.userId, info.id);
+      if (record?.runtimeKind === 'incus-vm') {
+        const hardware = useHardwareDeviceStore();
+        const selected = record.hardwareDeviceIds?.filter(value => isPhysicalGpuDevice(hardware.getDevice(value))) ?? [];
+        const assigned = hardware.listCatalog().filter(device => device.physicalAssignment?.userId === info.userId &&
+          device.physicalAssignment.workerId === info.id);
+        if (record.hardwareDevicesRevoked && (selected.length || assigned.length) || assigned.some(device => !selected.includes(device.id)))
+          throw Object.assign(new Error('Use the platform-admin GPU control to finish physical GPU recovery before changing worker lifecycle'), { statusCode: 409 });
+      }
+    }
     this.assertMigrationSettled(info);
     if (this.workerStore?.get(info.userId, info.id)?.incusCpuResize)
       throw Object.assign(new Error('VM CPU change requires reconciliation in CPU settings before lifecycle changes.'), { statusCode: 409 });
@@ -1907,17 +1919,18 @@ export class ContainerManager {
   private withExistingWorkerLifecycleMutation<T>(
     id: string,
     operation: () => Promise<T>,
+    allowPhysicalGpuRecovery = false,
   ): Promise<T> {
     const snapshot = this.containers.get(id);
     if (!snapshot) return Promise.reject(new Error("Container not found"));
-    this.assertOrdinaryMutation(snapshot);
+    this.assertOrdinaryMutation(snapshot, allowPhysicalGpuRecovery);
     return withOwnerWorkerLifecycleMutation(snapshot.userId, id, async () => {
       await this.assertOwnerExists(snapshot.userId);
       const current = this.containers.get(id);
       if (!current || current.userId !== snapshot.userId) {
         throw new Error("Container not found");
       }
-      this.assertOrdinaryMutation(current);
+      this.assertOrdinaryMutation(current, allowPhysicalGpuRecovery);
       if (current.runtimeKind === 'incus-vm') await this.incusRuntime.assertWorkspaceReplacementSettled(current);
       return operation();
     });
@@ -2402,6 +2415,84 @@ export class ContainerManager {
     return live
       ? store.resolveAuthorizedDevices(userId, workerId, deviceIds, directGroupId)
       : store.authorizeDeviceIds(userId, workerId, deviceIds, directGroupId);
+  }
+
+  /** Dedicated platform-admin domain only. The callback rechecks current
+   * administrative authority and the existing worker protection lock. */
+  async setPhysicalGpuSelection(id: string, deviceId: string | undefined,
+    authorize: () => Promise<void>): Promise<void> {
+    const conflict = (message: string) => Object.assign(new Error(message), { statusCode: 409, statusMessage: message });
+    return this.withExistingWorkerLifecycleMutation(id, async () => {
+      const info = this.containers.get(id)!, record = this.workerStore?.get(info.userId, id);
+      if (!record || info.runtimeKind !== 'incus-vm' || record.runtimeKind !== 'incus-vm' ||
+          record.status !== 'active' || record.deletionPending || record.hostMountsRevoked)
+        throw conflict('Physical GPU assignment requires a settled ordinary Incus VM');
+      const { useHardwareDeviceStore } = await import('./services');
+      const hardware = useHardwareDeviceStore(), incarnation = this.capturedIncusIncarnation(info);
+      const binding = hardware.listCatalog().filter(device => device.physicalAssignment?.userId === info.userId &&
+        device.physicalAssignment.workerId === id);
+      const selected = [...new Set([...(record.hardwareDeviceIds ?? []), ...(info.hardwareDeviceIds ?? [])])]
+        .filter(value => isPhysicalGpuDevice(hardware.getDevice(value)));
+      const physical = [...new Set([...binding.map(device => device.id), ...selected])];
+      if (physical.length > 1 || deviceId && physical.some(value => value !== deviceId))
+        throw conflict('Release the existing physical GPU before selecting another device');
+      const currentId = deviceId ?? physical[0];
+      if (!currentId) return;
+      const device = hardware.getDevice(currentId);
+      if (!isNvidiaPhysicalGpuDevice(device)) throw conflict('Direct physical GPU assignment supports NVIDIA devices only');
+      if (device!.physicalAssignment && (device!.physicalAssignment.userId !== info.userId || device!.physicalAssignment.workerId !== id))
+        throw conflict('Physical GPU belongs to another VM; release its assignment first');
+      if ((record.hardwareDevicesRevoked || !deviceId && !record.hardwareDeviceIds?.includes(currentId)) &&
+          device!.physicalAssignment?.incarnation && device!.physicalAssignment.incarnation !== incarnation)
+        throw conflict('Physical GPU recovery incarnation changed; preserve the stopped VM for administrative recovery');
+      if ((record.pendingRebuild || info.pendingRebuild) && !record.hardwareDevicesRevoked)
+        throw conflict('Apply pending worker configuration before changing its physical GPU');
+      const validate = async () => {
+        await authorize();
+        const fresh = this.workerStore?.get(info.userId, id), live = this.containers.get(id);
+        if (!fresh || fresh.status !== 'active' || fresh.runtimeKind !== 'incus-vm' || fresh.deletionPending ||
+            live?.userId !== info.userId || live.containerId !== `incus:${incarnation}`)
+          throw conflict('Physical GPU worker identity changed; preserve its recovery fence');
+      };
+      await validate(); await this.incusRuntime.assertPhysicalGpuStopped(info, incarnation);
+      // Existing restart/recovery fences are durable before either catalog or
+      // native device mutation; unknown outcomes always retain this intent.
+      await this.workerStore!.updateHardwareDeviceAccess(info.userId, id, record.hardwareDeviceIds, true);
+      info.hardwareDevicesRevoked = true; info.pendingRebuild = true;
+      await this.persistDesiredRuntimeStatus(info, 'stopped');
+      const retained = (record.hardwareDeviceIds ?? []).filter(value => !isPhysicalGpuDevice(hardware.getDevice(value)));
+      const finalIds = deviceId ? [...retained, deviceId].sort() : retained;
+      const receipt = { userId: info.userId, workerId: id, incarnation };
+      await hardware.setPhysicalGpuAssignment(currentId, receipt);
+      if (deviceId) {
+        const ids = [...retained, deviceId].sort();
+        await this.workerStore!.updateHardwareDeviceAccess(info.userId, id, ids, true);
+        info.hardwareDeviceIds = ids;
+        const options = { id, userId: info.userId, containerName: info.containerName,
+          hardwareDevices: ids.map(value => ({ deviceId: value, deviceNodes: [], groupIds: [] })) };
+        await this.incusRuntime.assignPhysicalGpuHardware(options, incarnation, deviceId, validate);
+      } else {
+        await this.incusRuntime.releasePhysicalGpuHardware(info, incarnation, currentId, validate);
+      }
+      await validate(); await this.incusRuntime.assertPhysicalGpuStopped(info, incarnation);
+      const fresh = this.workerStore!.get(info.userId, id)!;
+      await this.workerStore!.upsert({ ...fresh, hardwareDeviceIds: finalIds.length ? finalIds : undefined,
+        pendingRebuild: false, hardwareDevicesRevoked: false, desiredRuntimeStatus: 'stopped' });
+      info.hardwareDeviceIds = finalIds.length ? finalIds : undefined;
+      info.pendingRebuild = false; info.hardwareDevicesRevoked = false; info.status = 'stopped';
+      info.desiredRuntimeStatus = 'stopped'; info.updatedAt = new Date().toISOString();
+      // Clear catalog authority last. A failed final catalog write retains the
+      // captured UUID for retry; the VM already has no physical GPU mapping.
+      if (!deviceId) await hardware.setPhysicalGpuAssignment(currentId, undefined, receipt);
+    }, true);
+  }
+
+  private async assertNoPhysicalGpuRemoval(info: Pick<ContainerInfo, 'id' | 'userId'>): Promise<void> {
+    const { useHardwareDeviceStore } = await import('./services');
+    const hardware = useHardwareDeviceStore(), record = this.workerStore?.get(info.userId, info.id);
+    if (record?.hardwareDeviceIds?.some(value => isPhysicalGpuDevice(hardware.getDevice(value))) ||
+        hardware.listCatalog().some(device => device.physicalAssignment?.userId === info.userId && device.physicalAssignment.workerId === info.id))
+      throw Object.assign(new Error('A platform administrator must release the physical GPU before archiving or deleting this worker'), { statusCode: 403 });
   }
 
   async create(request: CreateContainerRequest): Promise<ContainerInfo> {
@@ -3582,13 +3673,14 @@ for p in sys.argv[1:]:
   async stop(id: string): Promise<void> {
     return this.withExistingWorkerLifecycleMutation(id, () =>
       this.stopUnlocked(id),
+      true,
     );
   }
 
   async emergencyStop(id: string): Promise<void> {
     if (isWorkerLifecycleMutationPending(id))
       throw Object.assign(new Error("Worker lifecycle operation is still pending; refresh status before retrying emergency stop"), { statusCode: 409 });
-    return this.withExistingWorkerLifecycleMutation(id, () => this.stopUnlocked(id, false, true));
+    return this.withExistingWorkerLifecycleMutation(id, () => this.stopUnlocked(id, false, true), true);
   }
 
   /** Apply a lifecycle action to all ordinary workers directly contained in a
@@ -3693,7 +3785,7 @@ for p in sys.argv[1:]:
   private async stopUnlocked(id: string, verifyRevokedIncus = false, force = false): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
-    this.assertOrdinaryMutation(info);
+    this.assertOrdinaryMutation(info, true);
     if (info.runtimeKind === 'incus-vm') {
       const { useManagedVolumeManager } = await import('./managed-volume-manager');
       const volumes = useManagedVolumeManager(); await volumes.init();
@@ -4100,10 +4192,11 @@ for p in sys.argv[1:]:
         let revoked = record.hardwareDevicesRevoked === true;
         for (const deviceId of record.hardwareDeviceIds ?? []) {
           try {
-            const allowed = await this.resolveHardwareDeviceAccess(
-              record.userId, record.id, [deviceId], undefined, false,
-            );
-            if (allowed?.[0]) retained.push(allowed[0]);
+            const { useHardwareDeviceStore, useWorkerGroupStore } = await import('./services');
+            const memberships = useWorkerGroupStore().listForUser(record.userId).filter(group => group.workerIds.includes(record.id));
+            if (memberships.length > 1 || !useHardwareDeviceStore().canWorkerUseDevice(record.userId, record.id, deviceId, memberships[0]?.id))
+              throw new Error('Hardware authority was revoked');
+            retained.push(deviceId);
           } catch { revoked = true; }
         }
         const next = retained.length ? retained.sort() : undefined;
@@ -4191,6 +4284,13 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    if (patch.hardwareDeviceIds !== undefined) {
+      const { useHardwareDeviceStore } = await import('./services');
+      const physical = (ids: string[] | undefined) => [...new Set(ids ?? [])]
+        .filter(value => isPhysicalGpuDevice(useHardwareDeviceStore().getDevice(value))).sort();
+      if (!isDeepStrictEqual(physical(info.hardwareDeviceIds), physical(patch.hardwareDeviceIds)))
+        throw Object.assign(new Error('Use the platform-admin physical GPU assignment control'), { statusCode: 403 });
+    }
     // WorkerStore persistence is the commit point. Keep an exact snapshot so
     // a failed write cannot leave uncommitted desired settings active in the
     // live inventory until the next orchestrator restart.
@@ -4353,6 +4453,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    await this.assertNoPhysicalGpuRemoval(info);
     if (this.workerStore?.get(info.userId, info.id)?.incusMigration)
       throw Object.assign(new Error('Finalize retained migration source before permanently deleting this worker'), { statusCode: 409 });
     if (info.runtimeKind === 'incus-vm') {
@@ -4542,6 +4643,7 @@ for p in sys.argv[1:]:
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
     this.assertOrdinaryMutation(info);
+    await this.assertNoPhysicalGpuRemoval(info);
     if (info.runtimeKind === 'incus-vm') {
       if (!this.workerStore) throw new Error('WorkerStore is required before archiving Incus compute');
       const record = this.workerStore.get(info.userId, info.id);
@@ -5326,6 +5428,7 @@ for p in sys.argv[1:]:
     id: string,
   ): Promise<void> {
     assertOrdinaryWorkerIdentity(id, userId);
+    await this.assertNoPhysicalGpuRemoval({ id, userId });
     if (!this.workerStore) throw new Error("WorkerStore not available");
 
     let worker = this.workerStore.get(userId, id);

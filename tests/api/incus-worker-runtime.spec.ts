@@ -1423,15 +1423,22 @@ for path in ("/workspace", "/home/agent/.agent-data"):
 });
 
 
-for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only exact authorized devices and rejects revoked start before native boot`, async () => {
+for (const mode of ['usb', 'gpu-mdev', 'gpu-physical'] as const) test(`${mode} runtime creates only exact authorized devices and rejects revoked start before native boot`, async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-usb-runtime-'));
   try {
+    const kind = mode === 'usb' ? 'usb' : 'gpu';
     const profile = 'i915-GVTg_V5_4';
-    const local = { ...config, dataDir, incusUsbEnabled: kind === 'usb', incusGpuMdevProfile: kind === 'gpu' ? profile : '' };
+    const local = { ...config, dataDir, incusUsbEnabled: kind === 'usb', incusGpuMdevProfile: mode === 'gpu-mdev' ? profile : '',
+      incusGpuPhysicalEnabled: mode === 'gpu-physical' };
     const workers = new WorkerStore(dataDir), groups = new WorkerGroupStore(dataDir);
     await Promise.all([workers.init(), groups.init()]);
     const opts = options();
-    const device: import('../../orchestrator/shared/types').HardwareDeviceCandidate = kind === 'gpu' ? { kind, name: 'Intel GVT-g',
+    const device: import('../../orchestrator/shared/types').HardwareDeviceCandidate = mode === 'gpu-physical' ? {
+      kind, name: 'Physical GPU fixture', selector: 'pci-gpu:10de:2230:10de:1459:fixture-gpu',
+      vendor: '10de', product: '2230', serial: 'fixture-gpu', deviceNodes: [], groupIds: [],
+      incus: { supported: true, mode, reason: 'fixture', evidence: { pciAddress: '0000:02:00.0', driver: 'vfio-pci',
+        bootVga: false, iommuGroup: '17', iommuMembers: ['0000:02:00.0'] } },
+    } : kind === 'gpu' ? { kind, name: 'Intel GVT-g',
       selector: 'drm:pci:0000:00:02.0', vendor: '8086', product: '5917', deviceNodes: ['/dev/dri/renderD128'], groupIds: [],
       incus: { supported: true, mode: 'gpu-mdev', reason: 'fixture', evidence: { driver: 'i915', gvtEnabled: true,
         mediatedProfiles: [profile], mediatedAvailable: { [profile]: 1 }, mediatedInstances: {} } } } : { kind: 'usb' as const, name: 'USB test', selector: 'usb:0403:6001:unique',
@@ -1439,21 +1446,30 @@ for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only e
       incus: { supported: true, mode: 'usb-exclusive' as const, reason: 'fixture' } };
     const hardware = new HardwareDeviceStore(dataDir, async () => [device], groups, workers); await hardware.init();
     const approved = await hardware.approveDevice({ selector: device.selector });
-    await hardware.setEntitlement(opts.userId, approved.id, true);
-    await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
     await workers.upsert({ id: opts.id, userId: opts.userId, displayName: 'USB', status: 'active', runtimeKind: 'incus-vm',
       hardwareDeviceIds: [approved.id], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    if (mode === 'gpu-physical') await hardware.setPhysicalGpuAssignment(approved.id, { userId: opts.userId, workerId: opts.id });
+    else {
+      await hardware.setEntitlement(opts.userId, approved.id, true);
+      await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
+    }
     opts.hardwareDevices = [{ deviceId: approved.id, deviceNodes: ['/dev/forged'], groupIds: [] }];
     const fake = fakeClient();
     fake.client.request = async () => ({ config: { restricted: 'true', ...(kind === 'usb' ? { 'restricted.devices.usb': 'allow' } :
-      { 'restricted.devices.gpu': 'allow', 'user.agentor.gpu-mdev-profile': profile }) } });
+      { 'restricted.devices.gpu': 'allow', 'user.agentor.gpu-mdev-profile': local.incusGpuMdevProfile,
+        'user.agentor.gpu-physical': local.incusGpuPhysicalEnabled ? 'true' : '' }) } });
     (fake.client as any).listInstances = async () => [];
     const runtime = new IncusWorkerRuntime(local, fake.client as any); runtime.setHardwareDiscovery(async () => [device]);
     const instance = await runtime.create(opts);
     expect(Object.values(instance.devices).filter(device => device.type === kind)).toEqual([kind === 'usb'
       ? { type: 'usb', vendorid: '0403', productid: '6001', serial: 'unique', required: 'true' }
+      : mode === 'gpu-physical' ? { type: 'gpu', gputype: 'physical', pci: '0000:02:00.0' }
       : { type: 'gpu', gputype: 'mdev', pci: '0000:00:02.0', mdev: profile }]);
-    if (kind === 'gpu') {
+    if (mode === 'gpu-physical') {
+      expect(fake.events.some(event => event.operation === 'exec' && JSON.stringify(event.args).includes('usermod -aG video,render agent'))).toBe(false);
+      await runtime.preflightRecreation(opts);
+    }
+    if (mode === 'gpu-mdev') {
       const guestSetup = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('usermod -aG video,render agent'));
       const workerStart = fake.events.findIndex(event => event.operation === 'exec' && JSON.stringify(event.args).includes('["systemctl","start","agentor-worker.service"]'));
       expect(guestSetup).toBeGreaterThan(-1);
@@ -1465,12 +1481,53 @@ for (const kind of ['usb', 'gpu'] as const) test(`${kind} runtime creates only e
       await runtime.preflightRecreation(opts);
     }
     expect(fake.events.some(event => event.operation === 'start')).toBe(true);
-    await hardware.setEntitlement(opts.userId, approved.id, false); fake.events.length = 0;
-    await expect(runtime.start(opts)).rejects.toThrow('not assigned');
+    if (mode === 'gpu-physical') await hardware.setPhysicalGpuAssignment(approved.id, undefined, { userId: opts.userId, workerId: opts.id });
+    else await hardware.setEntitlement(opts.userId, approved.id, false);
+    fake.events.length = 0;
+    await expect(runtime.start(opts)).rejects.toThrow(mode === 'gpu-physical' ? 'platform administrator' : 'not assigned');
     expect(fake.events.some(event => ['start', 'file', 'exec'].includes(event.operation))).toBe(false);
     // Revocation must not make owned shutdown/deletion inaccessible.
     await runtime.stop(opts, instance.config['volatile.uuid']);
     expect(fake.events.some(event => event.operation === 'stop')).toBe(true);
+    if (mode === 'gpu-physical') {
+      await hardware.setPhysicalGpuAssignment(approved.id, { userId: opts.userId, workerId: opts.id });
+      const marker = { nonce: randomUUID(), initialCreate: true as const, replacementIncarnation: instance.config['volatile.uuid'] };
+      opts.recreationNonce = marker.nonce;
+      instance.config['user.agentor.recreation'] = marker.nonce;
+      const record = { ...workers.get(opts.userId, opts.id)!, incusRecreation: marker };
+      await workers.upsert(record);
+      const unrelated = { name: 'unrelated-vm', devices: { root: { type: 'disk', pool: 'other-pool' } } };
+      (fake.client as any).listInstances = async () => [unrelated];
+      await fake.client.createCustomVolume(local.incusStoragePool, { name: 'unrelated-data', config: { retained: 'yes' } });
+      const volumesBefore = structuredClone(await Promise.all(['workspace', 'agents'].map(role => fake.client.getCustomVolume(local.incusStoragePool, opts.containerName + '-' + role))));
+      fake.client.getInstanceState = async () => ({ status: 'Stopped' });
+      fake.client.startInstance = async (...args) => {
+        fake.events.push({ operation: 'start', args }); throw new Error('PCI assignment start failed');
+      };
+      fake.events.length = 0;
+      await expect(runtime.start(opts, marker.replacementIncarnation)).rejects.toThrow('PCI assignment start failed');
+      expect(workers.get(opts.userId, opts.id)).toEqual(record);
+      expect(fake.events.filter(event => ['start', 'stop', 'remove', 'file', 'exec', 'volume-create', 'volume-update'].includes(event.operation)))
+        .toEqual([{ operation: 'start', args: [opts.containerName] }]);
+      await expect(runtime.rollbackRecreation(opts, { ...marker, nonce: randomUUID() })).rejects.toThrow('identity changed');
+      expect(fake.events.some(event => event.operation === 'remove')).toBe(false);
+      await expect(runtime.rollbackRecreation(opts, marker)).resolves.toEqual({ status: 'archived' });
+      expect(fake.events.filter(event => event.operation === 'remove')).toEqual([{ operation: 'remove', args: [opts.containerName] }]);
+      expect(await Promise.all(['workspace', 'agents'].map(role => fake.client.getCustomVolume(local.incusStoragePool, opts.containerName + '-' + role)))).toEqual(volumesBefore);
+      expect(await fake.client.getCustomVolume(local.incusStoragePool, 'unrelated-data')).toMatchObject({ config: { retained: 'yes' } });
+      expect(unrelated).toEqual({ name: 'unrelated-vm', devices: { root: { type: 'disk', pool: 'other-pool' } } });
+      expect(workers.get(opts.userId, opts.id)).toEqual(record);
+      const peer = { ...opts, id: randomUUID(), recreationNonce: undefined };
+      peer.containerName = local.containerPrefix + '-' + peer.id;
+      await workers.upsert({ ...record, id: peer.id, incusRecreation: undefined });
+      await expect(runtime.preflightHardware(peer)).rejects.toThrow('platform administrator');
+      // Explicit platform authority cannot bypass an original durable reservation.
+      await hardware.setPhysicalGpuAssignment(approved.id, undefined, { userId: opts.userId, workerId: opts.id });
+      await hardware.setPhysicalGpuAssignment(approved.id, { userId: peer.userId, workerId: peer.id });
+      await expect(runtime.preflightHardware(peer)).rejects.toThrow('exclusively reserved');
+      await workers.upsert({ ...record, status: 'archived', incusRecreation: undefined });
+      expect(Object.values(await runtime.preflightHardware(peer))).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:02:00.0' }]);
+    }
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
 

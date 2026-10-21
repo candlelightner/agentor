@@ -20,7 +20,7 @@ test('production Incus override preserves legacy control plane and grants only i
       INCUS_ENDPOINT: 'https://incus.internal:8443', INCUS_PROJECT: 'agentor-private', INCUS_NETWORK: 'owned-workers',
       INCUS_STORAGE_POOL: 'owned-data', INCUS_CONVERTER_STORAGE_POOL: 'owned-scratch', INCUS_WORKER_IMAGE: 'owned-derived',
       INCUS_CONVERTER_SEED_FINGERPRINT: 'a'.repeat(64), INCUS_NETWORK_HOST_ENDPOINT: 'https://incus.internal:8444',
-      INCUS_INTERNAL_GATEWAY_URL: 'http://10.45.0.1:3079' };
+      INCUS_INTERNAL_GATEWAY_URL: 'http://10.45.0.1:3079', INCUS_GPU_PHYSICAL_ENABLED: 'true' };
     const result = spawnSync('docker', ['compose', '-f', 'docker-compose.prod.yml', '-f', 'docker-compose.incus.yml', 'config', '--format', 'json'],
       { cwd: dir, env, encoding: 'utf8' });
     expect(result.status, result.stderr).toBe(0);
@@ -28,7 +28,9 @@ test('production Incus override preserves legacy control plane and grants only i
     const raw = parse(await readFile(join(dir, 'docker-compose.incus.yml'), 'utf8')).services.orchestrator;
     expect(app.image).toBe(env.AGENTOR_INCUS_ORCHESTRATOR_IMAGE);
     expect(app.environment).toMatchObject({ INCUS_ENABLED: 'true', WORKER_IMAGE_PREFIX: '', WORKER_IMAGE: env.WORKER_IMAGE,
-      INCUS_PROJECT: env.INCUS_PROJECT, INCUS_CONVERTER_SEED_FINGERPRINT: env.INCUS_CONVERTER_SEED_FINGERPRINT });
+      INCUS_PROJECT: env.INCUS_PROJECT, INCUS_CONVERTER_SEED_FINGERPRINT: env.INCUS_CONVERTER_SEED_FINGERPRINT,
+      INCUS_GPU_PHYSICAL_ENABLED: 'true' });
+    expect(raw.environment.INCUS_GPU_PHYSICAL_ENABLED).toBe('${INCUS_GPU_PHYSICAL_ENABLED:-false}');
     expect(app.ports).toEqual(expect.arrayContaining([
       expect.objectContaining({ host_ip: '127.0.0.1', published: '3000', target: 3000 }),
       expect.objectContaining({ host_ip: env.INCUS_WORKER_GATEWAY, published: '3079', target: 3000 }),

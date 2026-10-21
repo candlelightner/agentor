@@ -88,6 +88,21 @@ class CheckerTests(unittest.TestCase):
         project['config']['restricted.virtual-machines.lowlevel'] = 'allow'
         with self.assertRaises(ValueError): CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=profile)
 
+    def test_physical_gpu_policy_requires_exact_opt_in_and_keeps_other_host_devices_blocked(self):
+        for profile in ("", "i915-GVTg_V5_4"):
+            project = self.project()
+            project['config'].update({'restricted.devices.gpu': 'allow', 'user.agentor.gpu-physical': 'true'})
+            if profile: project['config']['user.agentor.gpu-mdev-profile'] = profile
+            CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=profile, gpu_physical_enabled=True)
+            with self.assertRaises(ValueError): CHECKER.project_policy(project, 'agentor-private', 'workers', gpu_mdev_profile=profile)
+            for key, value in (('restricted.devices.gpu', 'block'), ('user.agentor.gpu-physical', ''),
+                               ('user.agentor.gpu-physical', 'false'), ('restricted.devices.pci', 'allow'),
+                               ('restricted.devices.usb', 'allow'), ('restricted.devices.unix-char', 'allow'),
+                               ('restricted.devices.unix-block', 'allow'), ('restricted.virtual-machines.lowlevel', 'allow')):
+                changed = copy.deepcopy(project); changed['config'][key] = value
+                with self.assertRaises(ValueError):
+                    CHECKER.project_policy(changed, 'agentor-private', 'workers', gpu_mdev_profile=profile, gpu_physical_enabled=True)
+
     def test_certificate_is_restricted_to_exact_single_project(self):
         CHECKER.restricted_certificate({"type": "client", "restricted": True, "projects": ["agentor-private"]}, "agentor-private")
         for record in ({"type": "client", "restricted": False, "projects": ["agentor-private"]},

@@ -4,6 +4,7 @@ export interface HardwareDeviceView {
   canManageCatalog: boolean;
   incusUsbEnabled?: boolean;
   incusGpuMdevProfile?: string;
+  incusGpuPhysicalEnabled?: boolean;
   catalog: Array<HardwareDevice & { entitled: boolean; available: boolean; incus?: IncusHardwareCapability; reserved?: boolean; reservedWorkerIds?: string[] }>;
   discovered: HardwareDeviceCandidate[];
   grants: HardwareDeviceGrant[];

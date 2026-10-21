@@ -42,9 +42,9 @@ export interface HostMountGrant {
 
 export type HardwareDeviceKind = "gpu" | "usb";
 
-/** A host device discovered by a hardened, read-only Docker probe. `selector`
- * is stable across device-node renumbering; live node paths are resolved again
- * immediately before Docker creates a worker. */
+/** A host device discovered by a hardened, read-only probe. `selector` is stable
+ * across node renumbering (and PCI renumbering for serial-identified physical
+ * GPUs); live paths/addresses are resolved again before runtime activation. */
 export interface HardwareDevice {
   schemaVersion: 1;
   id: string;
@@ -54,16 +54,21 @@ export interface HardwareDevice {
   vendor?: string;
   product?: string;
   serial?: string;
+  /** Private continuity witness; valid only for the same host boot and kernel PCI object. */
+  physicalIdentity?: { bootId: string; deviceInode: string; deviceNodes?: string[] };
+  /** Platform-admin-only assignment authority for one ordinary NVIDIA VM. */
+  physicalAssignment?: { userId: string; workerId: string; /** Private cold-change recovery receipt. */ incarnation?: string };
   createdAt: string;
   updatedAt: string;
 }
 
 export interface IncusHardwareCapability {
   supported: boolean;
-  mode: "usb-exclusive" | "gpu-mdev" | "unsupported";
+  mode: "usb-exclusive" | "gpu-mdev" | "gpu-physical" | "unsupported";
   reason: string;
   evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
-    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]> };
+    mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]>;
+    pciAddress?: string; iommuMembers?: string[]; iommuBridges?: string[]; resetMethods?: string[]; resetDomainSafe?: boolean };
 }
 
 export interface HardwareDeviceCandidate {
@@ -73,6 +78,7 @@ export interface HardwareDeviceCandidate {
   vendor?: string;
   product?: string;
   serial?: string;
+  physicalIdentity?: HardwareDevice['physicalIdentity'];
   deviceNodes: string[];
   groupIds: number[];
   /** Read-only host discovery evidence, never caller-supplied assignment authority. */

@@ -1,10 +1,10 @@
 # Hardware device permissions
 
-Agentor can pass host GPUs and USB devices into ordinary workers through Docker device mappings. Access starts empty and requires platform approval, account entitlement, and an owner assignment. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
+Agentor can pass host GPUs and USB devices into ordinary workers. USB and Intel mediated GPU access requires platform approval, account entitlement, and an owner assignment. Physical NVIDIA GPUs use the separate platform-admin-only assignment described below. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
 
 ## Discovery and stable identity
 
-The platform **Hardware** dialog runs a short-lived discovery container using the configured worker image. The probe has no network, a read-only root filesystem, all capabilities dropped, `no-new-privileges`, and read-only `/dev` and `/sys` views. It reports DRM render devices and USB devices; it does not open them.
+The platform **Hardware** dialog runs a short-lived discovery container using the configured worker image. The probe has no network, a read-only root filesystem, all capabilities dropped, `no-new-privileges`, and read-only `/dev` and `/sys` views. It reports DRM render devices, physical PCI GPUs and USB devices; it does not open device nodes.
 
 GPU identity uses the PCI address behind a DRM render node, such as `drm:pci:0000:00:02.0`. All matching DRM card/render nodes are resolved at worker build time. USB identity uses vendor, product, and serial when present. Devices without a serial use their physical sysfs port, which is stable only while connected to the same port. Current `/dev/bus/usb` paths are never stored as authority.
 
@@ -45,7 +45,7 @@ Workers with Docker-in-Docker enabled already run as privileged containers, so D
 Passing an Intel GPU accelerates VAAPI/OpenCL/oneAPI or browser workloads that use it. Agentor's current noVNC path still uses Xvfb, x11vnc, and WebSockets, so device access alone does not turn noVNC encoding into a GPU pipeline.
 
 
-## Incus VM hardware (opt-in; physical acceptance pending)
+## Incus VM hardware (opt-in; per-installation hardware acceptance)
 
 The USB VM path accepts only uniquely serial-numbered devices with recognized non-storage interfaces. The existing catalog ID, account entitlement and worker/direct-group assignment remain the authority. Each assignment is exactly `type=usb`, vendor ID, product ID, serial and `required=true`; volatile bus/device numbers and user-supplied device paths never become Incus selectors. Unplugging prevents the next start; replugging the same serial survives node renumbering.
 
@@ -61,9 +61,7 @@ The operator must separately enable the exact profile through `setup-incus-host.
 
 GPU grants use the same fresh catalog/entitlement/worker authorization, stopped-worker reservation, conflicting native/legacy mapping checks, migration preflight and revocation fences as USB. A running worker can revalidate its full profile only when its exact Incus device map, volatile mdev UUID and current host profile-instance listing agree. Recreation releases that allocation through Incus before replacement. Incus owns mdev creation, rollback and stop cleanup; Agentor never writes host sysfs. Isolated restore boots remain hardware-free and add the GPU only at authorized operational promotion. Inside the owned guest, startup adds the agent to guest video/render groups and requires read/write access to an i915 render node before worker service startup. That is device readiness, not a measured accelerated workload.
 
-Physical GPU, SR-IOV and native-context assignment remain unimplemented.
-Supported Intel GVT-g behavior depends on the actual driver, kernel, exposed
-profile and capacity; no host capability is inferred from a model name alone.
+SR-IOV and native-context assignment remain unimplemented. Supported Intel GVT-g behavior depends on the actual driver, kernel, exposed profile and capacity; no host capability is inferred from a model name alone.
 See [Intel mediated GPU preparation](intel-mediated-gpu.md) for maintenance,
 power ordering and disposable acceptance guidance. Physical USB and remaining
 hardware acceptance are tracked in issue #12.
@@ -71,3 +69,89 @@ hardware acceptance are tracked in issue #12.
 Upstream semantics: [Incus 6.0.6 mdev implementation and exact PCI selector](https://github.com/lxc/incus/blob/v6.0.6/internal/server/device/gpu_mdev.go), [Intel historical GVT-g setup guide](https://github.com/intel/gvt-linux/wiki/GVTg_Setup_Guide), [USB devices](https://linuxcontainers.org/incus/docs/main/reference/devices_usb/), [GPU modes](https://linuxcontainers.org/incus/docs/main/reference/devices_gpu/), [restricted projects](https://linuxcontainers.org/incus/docs/main/reference/projects/).
 
 Legacy USB catalog selectors written by the old shell probe may contain one newline-derived trailing space in each sysfs field. Discovery and approval recognize that exact historical encoding without rewriting catalog IDs, grants or serials. A different serial remains a different device, even with the same vendor/product. Duplicate normalized catalog entries are quarantined; duplicate live identities remain blocked. This fixes existing camera/fingerprint grants becoming falsely unavailable after the probe change, and does not authorize storage or controller passthrough.
+
+
+### Physical GPU passthrough (P1, separate opt-in)
+
+Physical NVIDIA GPU assignment uses the existing catalog, exclusive reservations,
+revocation and incarnation fences, with platform-admin-only per-VM authority. It emits only
+`type=gpu`, `gputype=physical`, and the current PCI address resolved from fresh
+sysfs evidence. Worker requests, records, exports and backups keep opaque catalog
+IDs; caller-supplied PCI addresses never authorize assignment. Incus owns VFIO
+activation and cleanup; Agentor never rebinds a host driver or writes host sysfs.
+
+Discovery also enumerates PCI display devices without DRM nodes. Physical
+identity combines vendor/device/subsystem IDs and a trustworthy sysfs/PCI VPD
+serial or directly observed NVIDIA GPU UUID. Non-Intel DRM devices retain their
+legacy selector alongside the physical selector. Missing or duplicate identity,
+an unknown boot-display state, unsafe IOMMU members, and host-driver attachment
+block admission. The group may contain only the GPU and its verified PCI bridge
+ancestors; unrelated bridges, storage and additional endpoints remain blocked.
+The GPU must already be unbound or bound to
+`vfio-pci` through separately approved operator maintenance. VGA boot status must
+be readable; explicit non-VGA 3D/other-display classes may lack `boot_vga`.
+Devices without trustworthy identity evidence remain unsupported. Existing
+DRM/mdev catalog identities keep their current behavior.
+
+For NVIDIA GPUs whose UUID is visible only through the host driver, approval
+captures a private catalog witness of the host boot ID and the kernel's 64-bit
+PCI object inode. Fresh direct UUID observation refreshes this witness. After
+operator-approved driver release, the same UUID may be resolved only while the
+boot, kernel object and PCI identity still match; the PCI address is always read
+fresh. Host reboot, replacement or re-enumeration invalidates that continuity
+proof. A fresh direct UUID observation is required before another release; the
+enclosure identity, old PCI address or cached UUID alone never establishes GPU
+identity. No host driver is rebound by discovery or authorization.
+
+Before initial approval or revalidation, the host driver must report a real GPU
+UUID. After driver rebinding it may temporarily report a placeholder until the
+operator initializes the idle, host-owned GPU with its normal driver utility.
+The probe never initializes or opens a GPU device; placeholder UUIDs fail closed.
+
+The operator enables the installation with its existing exact setup arguments
+plus `--enable-physical-gpu`, sets `INCUS_GPU_PHYSICAL_ENABLED=true`, and runs the
+checker with `--enable-physical-gpu`. Setup records
+`user.agentor.gpu-physical=true` beside `restricted.devices.gpu=allow`. Raw PCI,
+unix devices and low-level VM overrides stay blocked. Incus has a category-wide
+GPU permission; the trusted control plane enforces the exact catalog device.
+Physical and mdev policy can coexist, with each explicitly enabled. Changing
+project policy or production GPU ownership still requires operator approval.
+
+Only a global platform administrator can assign or release a physical NVIDIA
+GPU. The Hardware dialog provides one VM selector per approved GPU; the same
+operations are available through platform-admin MCP as
+`hardware-devices.gpu.list`, `hardware-devices.gpu.assign` and
+`hardware-devices.gpu.release`, or `GET/PUT /api/hardware-devices/gpu`.
+Assignment uses a catalog binding to one explicit ordinary Incus VM, independent
+of account/group grants. Owner grants, delegated grants, portable imports,
+clones and generic worker settings cannot create, move or remove this binding.
+Existing Intel mediated GPU and USB permissions remain unchanged. Other
+physical GPU vendors are not enabled by this interface.
+
+Stop the VM before assigning or releasing its GPU. Agentor changes only the
+captured stopped VM's device configuration, retaining its ordinary root image,
+workspace and persistent volumes. Start it through the existing worker
+controls. No host driver is detached and no running VM is stopped implicitly.
+An uncertain change leaves the worker fenced for recovery; repeat the authorized
+operation after checking the stopped VM. An assigned VM cannot be archived or
+deleted until a platform administrator releases its GPU.
+
+A stopped active worker retains its physical reservation until explicit admin
+release. A retained Incus instance device assignment still blocks a peer,
+even if that instance is stopped. BDF renumbering resolves the same serial at
+recreation; starting an old layout requires rebuild instead of silently changing
+its PCI mapping. Missing devices and uncertain rollback retain existing recovery
+fences. No new worker image, guest driver installer, scheduler or GPU job API is
+included in P1.
+
+Live acceptance for each Agentor installation requires an approved,
+disposable ordinary VM: confirm discovery reads its stable serial and isolation,
+exercise admin assign/start/restart/rebuild/stop/release and revocation, verify
+conflicting owners are refused, run guest driver and CUDA checks including large
+64-bit BAR allocation, and verify clean release and recovery after failure. Review
+ownership in other Incus projects and host consumers separately: the restricted
+Agentor client inventories only its dedicated project. Recheck storage and
+unrelated guest health before and after the cycle. When upstream PCIe bridges
+must stay awake during testing, use only temporary operator-approved settings and
+restore them afterward; install no permanent power policy. Keep actual identities,
+addresses, topology, diagnostics and acceptance receipts private and untracked.

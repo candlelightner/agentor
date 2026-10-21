@@ -1,4 +1,5 @@
 import { HARDWARE_DEVICE_PROBE } from "./hardware-device-probe";
+import { physicalGpuIdentityReceipts } from './hardware-device-store';
 import { TMUX_TERMINAL_CLIPBOARD_SETUP } from './tmux-terminal-clipboard';
 import Docker from 'dockerode';
 import { assertBackupRestoreRuntimePrincipal, type BackupRestoreRuntimePrincipal } from './backup-restore-runtime-authority';
@@ -228,6 +229,8 @@ export class DockerService {
      * baked entrypoint/env). Ignored for the standard image. */
     imageConfig?: ImageConfigOverride;
   }): Promise<Docker.Container> {
+    if (opts.hardwareDevices?.some(device => device.candidate?.selector.startsWith('pci-gpu:')))
+      throw Object.assign(new Error('Physical GPU passthrough requires an Incus VM worker'), { statusCode: 409 });
     const env: string[] = [];
 
     // When running an imported image (no baked config), seed the base env
@@ -417,10 +420,11 @@ export class DockerService {
     return container;
   }
 
-  /** Enumerate host DRM render devices and USB devices without granting the
+  /** Enumerate host GPUs and USB devices without granting the
    * orchestrator container broad /dev access. The short-lived probe is isolated,
    * read-only, networkless, and has no Linux capabilities. */
   async discoverHardwareDevices(): Promise<HardwareDeviceCandidate[]> {
+    const identities = await physicalGpuIdentityReceipts(this.config.dataDir);
     const image = this.config.workerImagePrefix + this.config.workerImage;
     await this.ensureImage(image);
     const name = `agentor-hardware-probe-${randomUUID()}`;
@@ -430,14 +434,17 @@ export class DockerService {
         (operationSignal) => this.docker.createContainer({
           Image: image,
           name,
+          // Dockerode otherwise repeats the probe script in the request URL.
+          _query: { name },
           User: '0:0',
           Entrypoint: ['python3', '-c'],
           Cmd: [HARDWARE_DEVICE_PROBE],
+          Env: ['AGENTOR_GPU_IDENTITIES=' + JSON.stringify(identities)],
           Tty: true,
           NetworkDisabled: true,
           HostConfig: {
             NetworkMode: 'none',
-            Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro'],
+            Binds: ['/dev:/host/dev:ro', '/sys:/host/sys:ro', '/proc/sys/kernel/random/boot_id:/host/boot_id:ro'],
             ReadonlyRootfs: true,
             CapDrop: ['ALL'],
             SecurityOpt: ['no-new-privileges:true'],
@@ -448,7 +455,7 @@ export class DockerService {
           },
           Labels: { 'agentor.hardware-probe': 'true' },
           abortSignal: operationSignal,
-        }),
+        } as Docker.ContainerCreateOptions & { _query: { name: string }; abortSignal: AbortSignal }),
         DOCKER_LIFECYCLE_TIMEOUT_MS,
         'Docker hardware probe creation',
       );

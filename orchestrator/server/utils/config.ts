@@ -44,6 +44,7 @@ export interface Config {
   betterAuthRpId: string;
   incusUsbEnabled?: boolean;
   incusGpuMdevProfile?: string;
+  incusGpuPhysicalEnabled?: boolean;
   incusEnabled: boolean;
   incusEndpoint: string;
   incusProject: string;
@@ -175,6 +176,7 @@ export function loadConfig(): Config {
     betterAuthRpId: process.env.BETTER_AUTH_RP_ID?.trim() || '',
     incusUsbEnabled: process.env.INCUS_USB_ENABLED === 'true',
     incusGpuMdevProfile: process.env.INCUS_GPU_MDEV_PROFILE || '',
+    incusGpuPhysicalEnabled: process.env.INCUS_GPU_PHYSICAL_ENABLED === 'true',
     incusEnabled: process.env.INCUS_ENABLED === 'true',
     incusEndpoint: process.env.INCUS_ENDPOINT || '',
     incusProject: process.env.INCUS_PROJECT || 'agentor',

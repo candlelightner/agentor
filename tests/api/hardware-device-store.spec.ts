@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HardwareDeviceStore, hardwareDeviceSelector } from '../../orchestrator/server/utils/hardware-device-store';
+import { HardwareDeviceStore, hardwareDeviceSelector, physicalGpuIdentityReceipts } from '../../orchestrator/server/utils/hardware-device-store';
 import { ManagementHardwareDeviceDomain } from '../../orchestrator/server/utils/management-hardware-device-domain';
 import { ManagementWorkerDomain } from '../../orchestrator/server/utils/management-worker-domain';
 
@@ -14,10 +14,55 @@ async function fixture() {
   const groups = [group('root', undefined, ['root-worker']), group('child', 'root', ['child-worker']), group('sibling', undefined, ['sibling-worker'])];
   const workers = new Set(['root-worker', 'child-worker', 'sibling-worker']);
   let connected = true; let candidates = [candidate] as any[];
-  const store = new HardwareDeviceStore(dir, async () => connected ? candidates : [], { listForUser: () => groups, get: (_u: string, id: string) => groups.find((item) => item.id === id) } as any, { get: (u: string, id: string) => u === owner && workers.has(id) ? { id, userId: u, status: 'active' } : undefined } as any);
+  const workerStore = { get: (u: string, id: string) => u === owner && workers.has(id) ? { id, userId: u, status: 'active', runtimeKind: 'incus-vm' } : undefined } as any;
+  const groupStore = { listForUser: () => groups, get: (_u: string, id: string) => groups.find((item) => item.id === id) } as any;
+  const store = new HardwareDeviceStore(dir, async () => connected ? candidates : [], groupStore, workerStore);
   await store.init();
-  return { dir, store, inventory: (value: any[]) => { candidates = value; }, disconnect: () => { connected = false; } };
+  return { dir, store, workerStore, groupStore, inventory: (value: any[]) => { candidates = value; }, disconnect: () => { connected = false; } };
 }
+
+test('NVIDIA physical GPUs require one exact catalog binding and reject legacy owner/group grants or selection removal', async () => {
+  const f = await fixture(); try {
+    const nvidia = { ...candidate, vendor: '10de', selector: 'pci-gpu:10de:1234:10de:0000:synthetic-serial', serial: 'synthetic-serial', deviceNodes: [] };
+    f.inventory([nvidia]); const device = await f.store.approveDevice({ selector: nvidia.selector });
+    await f.store.setEntitlement(owner, device.id, true);
+    for (const targetType of ['all', 'group', 'worker'] as const)
+      await expect(f.store.createOwnerGrant(owner, { deviceId: device.id, targetType, targetId: targetType === 'group' ? 'root' : targetType === 'worker' ? 'root-worker' : undefined })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(f.store.createGroupDelegation(owner, 'root', { deviceId: device.id, targetType: 'worker', targetId: 'child-worker' })).rejects.toMatchObject({ statusCode: 403 });
+    expect(f.store.canWorkerUseDevice(owner, 'root-worker', device.id, 'root')).toBe(false);
+    await f.store.setPhysicalGpuAssignment(device.id, { userId: owner, workerId: 'root-worker' });
+    expect(f.store.authorizeDeviceIds(owner, 'root-worker', [device.id])).toEqual([device.id]);
+    for (const ids of [undefined, []]) expect(() => f.store.authorizeDeviceIds(owner, 'root-worker', ids)).toThrow('platform administrator');
+    expect(() => f.store.authorizeDeviceIds(owner, 'child-worker', [device.id])).toThrow('platform administrator');
+    expect(f.store.effectiveDevicesForWorker(owner, 'root-worker').map(item => item.id)).toContain(device.id);
+    expect(f.store.devicesForNewWorker(owner, 'root').map(item => item.id)).not.toContain(device.id);
+    await f.store.setEntitlement(owner, device.id, false);
+    expect(f.store.canWorkerUseDevice(owner, 'root-worker', device.id)).toBe(true);
+    await expect(f.store.deleteDevice(device.id)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(f.store.setPhysicalGpuAssignment(device.id, undefined, { userId: owner, workerId: 'child-worker' })).rejects.toMatchObject({ statusCode: 409 });
+    await f.store.setPhysicalGpuAssignment(device.id, undefined, { userId: owner, workerId: 'root-worker' });
+    expect(f.store.authorizeDeviceIds(owner, 'root-worker', [])).toBeUndefined();
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('catalog assignment CAS serializes independent stale stores and new physical assignment excludes non-NVIDIA devices', async () => {
+  const f = await fixture(); try {
+    const nvidia = { ...candidate, vendor: '10de', selector: 'pci-gpu:10de:1234:10de:0000:synthetic-serial', deviceNodes: [] };
+    const other = { ...nvidia, vendor: '1002', selector: 'pci-gpu:1002:1234:1002:0000:other-serial' };
+    f.inventory([nvidia, other]);
+    const device = await f.store.approveDevice({ selector: nvidia.selector }), unsupported = await f.store.approveDevice({ selector: other.selector });
+    const stale = new HardwareDeviceStore(f.dir, async () => [], f.groupStore, f.workerStore); await stale.init();
+    const results = await Promise.allSettled([
+      f.store.setPhysicalGpuAssignment(device.id, { userId: owner, workerId: 'root-worker' }),
+      stale.setPhysicalGpuAssignment(device.id, { userId: owner, workerId: 'child-worker' }),
+    ]);
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const disk = JSON.parse(await readFile(join(f.dir, 'admin/hardware-devices.v1.json'), 'utf8'));
+    expect(disk.find((item: any) => item.id === device.id).physicalAssignment).toEqual({ userId: owner, workerId: 'root-worker' });
+    await expect(f.store.setPhysicalGpuAssignment(unsupported.id, { userId: owner, workerId: 'child-worker' })).rejects.toMatchObject({ statusCode: 400 });
+    await expect(f.store.createOwnerGrant(owner, { deviceId: unsupported.id, targetType: 'all' })).rejects.toMatchObject({ statusCode: 403 });
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
 
 test('hardware catalog approves only discovered stable selectors and resolves live nodes', async () => {
   const { dir, store, disconnect } = await fixture();
@@ -31,6 +76,52 @@ test('hardware catalog approves only discovered stable selectors and resolves li
     disconnect();
     await expect(store.resolveAuthorizedDevices(owner, 'root-worker', [device.id], 'root')).rejects.toThrow(/unavailable/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('physical UUID continuity is captured and refreshed only for the same unambiguous catalog identity', async () => {
+  const f = await fixture(); try {
+    const gpu = { ...candidate, selector: 'pci-gpu:1234:5678:abcd:ef01:GPU-11111111-2222-3333-4444-555555555555',
+      vendor: '1234', product: '5678', serial: 'GPU-11111111-2222-3333-4444-555555555555', deviceNodes: [], groupIds: [],
+      physicalIdentity: { bootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', deviceInode: '9007199254740993' } };
+    f.inventory([gpu]); const device = await f.store.approveDevice({ selector: gpu.selector });
+    expect(await physicalGpuIdentityReceipts(f.dir)).toEqual([{ selector: gpu.selector, physicalIdentity: gpu.physicalIdentity }]);
+    const refreshed = { ...gpu, physicalIdentity: { ...gpu.physicalIdentity, deviceInode: '9007199254740994' } };
+    f.inventory([refreshed]); await f.store.listDiscoveredDevices();
+    expect(f.store.getDevice(device.id)?.physicalIdentity).toEqual(refreshed.physicalIdentity);
+    expect(await physicalGpuIdentityReceipts(f.dir)).toEqual([{ selector: gpu.selector, physicalIdentity: refreshed.physicalIdentity }]);
+    f.inventory([{ ...gpu, selector: gpu.selector + '-replacement' }]); await f.store.listDiscoveredDevices();
+    expect(f.store.getDevice(device.id)?.physicalIdentity).toEqual(refreshed.physicalIdentity);
+    f.inventory([gpu, gpu]); await f.store.listDiscoveredDevices();
+    expect(f.store.getDevice(device.id)?.physicalIdentity).toEqual(refreshed.physicalIdentity);
+    await writeFile(join(f.dir, 'admin/hardware-devices.v1.json'), JSON.stringify([{ ...device,
+      physicalIdentity: { bootId: gpu.physicalIdentity.bootId, deviceInode: 123 } }]));
+    await expect(physicalGpuIdentityReceipts(f.dir)).rejects.toThrow('Invalid persisted');
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('stale independent catalog witness refresh cannot lose approvals or resurrect deleted devices', async () => {
+  const f = await fixture(); try {
+    const gpu = { ...candidate, selector: 'pci-gpu:1234:5678:abcd:ef01:GPU-11111111-2222-3333-4444-555555555555',
+      physicalIdentity: { bootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', deviceInode: '100' } };
+    f.inventory([gpu]); const device = await f.store.approveDevice({ selector: gpu.selector });
+    let inode = '200';
+    const stale = new HardwareDeviceStore(f.dir, async () => [{ ...gpu,
+      physicalIdentity: { ...gpu.physicalIdentity, deviceInode: inode } }], {} as any, {} as any);
+    await stale.init();
+    f.inventory([candidate]); const other = await f.store.approveDevice({ selector: candidate.selector });
+    await f.store.updateDevice(device.id, { name: 'Updated name' });
+    await stale.listDiscoveredDevices();
+    let disk = JSON.parse(await readFile(join(f.dir, 'admin/hardware-devices.v1.json'), 'utf8'));
+    expect(disk).toContainEqual(expect.objectContaining({ id: other.id }));
+    expect(disk).toContainEqual(expect.objectContaining({ id: device.id, name: 'Updated name',
+      physicalIdentity: expect.objectContaining({ deviceInode: '200' }) }));
+    await f.store.deleteDevice(device.id);
+    inode = '300';
+    await stale.listDiscoveredDevices();
+    await expect(stale.updateDevice(device.id, { name: 'Resurrected' })).rejects.toMatchObject({ statusCode: 404 });
+    disk = JSON.parse(await readFile(join(f.dir, 'admin/hardware-devices.v1.json'), 'utf8'));
+    expect(disk.map((item: any) => item.id)).toEqual([other.id]);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
 test('device grants delegate only downward from an explicit group grant', async () => {

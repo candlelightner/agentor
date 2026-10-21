@@ -17,7 +17,7 @@ operator storage.
   conversion, custom images and verified native default-image promotion.
 - Dedicated administrative VMs with private management networking, short-lived
   scoped MCP credentials and identity refresh that preserves healthy terminals.
-- Authorized serial USB and supported Intel mediated GPU grants, ownership and
+- Authorized serial USB, Intel mediated and opt-in physical GPU grants, ownership and
   revocation checks, and rejection of host-storage passthrough.
 - Portable and whole-instance backup/restore support, bounded diagnostics and
   server-log downloads, and per-archive indexed pathname verification.
@@ -46,6 +46,8 @@ Keep the following acceptance work explicit:
 - Real CLI/browser copy and terminal behavior: issues #7, #14 and #15.
 - Representative end-to-end backup throughput and resource use: issue #10.
 - Physical USB attach/detach/revocation and remaining hardware criteria: issue #12.
+- Agentor-managed physical GPU grant, lifecycle and recovery acceptance: issue #39;
+  see the physical GPU section of the hardware guide for the separate opt-in.
 - Native administrative encrypted disaster recovery and compound updater/recovery
   scenarios: issue #13.
 - Administrative loading/lifecycle feedback under delayed requests: issue #18.
