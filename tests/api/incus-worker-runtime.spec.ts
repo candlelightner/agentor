@@ -1446,10 +1446,13 @@ for (const mode of ['usb', 'gpu-mdev', 'gpu-physical'] as const) test(`${mode} r
       incus: { supported: true, mode: 'usb-exclusive' as const, reason: 'fixture' } };
     const hardware = new HardwareDeviceStore(dataDir, async () => [device], groups, workers); await hardware.init();
     const approved = await hardware.approveDevice({ selector: device.selector });
-    await hardware.setEntitlement(opts.userId, approved.id, true);
-    await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
     await workers.upsert({ id: opts.id, userId: opts.userId, displayName: 'USB', status: 'active', runtimeKind: 'incus-vm',
       hardwareDeviceIds: [approved.id], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    if (mode === 'gpu-physical') await hardware.setPhysicalGpuAssignment(approved.id, { userId: opts.userId, workerId: opts.id });
+    else {
+      await hardware.setEntitlement(opts.userId, approved.id, true);
+      await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
+    }
     opts.hardwareDevices = [{ deviceId: approved.id, deviceNodes: ['/dev/forged'], groupIds: [] }];
     const fake = fakeClient();
     fake.client.request = async () => ({ config: { restricted: 'true', ...(kind === 'usb' ? { 'restricted.devices.usb': 'allow' } :
@@ -1478,15 +1481,16 @@ for (const mode of ['usb', 'gpu-mdev', 'gpu-physical'] as const) test(`${mode} r
       await runtime.preflightRecreation(opts);
     }
     expect(fake.events.some(event => event.operation === 'start')).toBe(true);
-    await hardware.setEntitlement(opts.userId, approved.id, false); fake.events.length = 0;
-    await expect(runtime.start(opts)).rejects.toThrow('not assigned');
+    if (mode === 'gpu-physical') await hardware.setPhysicalGpuAssignment(approved.id, undefined, { userId: opts.userId, workerId: opts.id });
+    else await hardware.setEntitlement(opts.userId, approved.id, false);
+    fake.events.length = 0;
+    await expect(runtime.start(opts)).rejects.toThrow(mode === 'gpu-physical' ? 'platform administrator' : 'not assigned');
     expect(fake.events.some(event => ['start', 'file', 'exec'].includes(event.operation))).toBe(false);
     // Revocation must not make owned shutdown/deletion inaccessible.
     await runtime.stop(opts, instance.config['volatile.uuid']);
     expect(fake.events.some(event => event.operation === 'stop')).toBe(true);
     if (mode === 'gpu-physical') {
-      await hardware.setEntitlement(opts.userId, approved.id, true);
-      await hardware.createOwnerGrant(opts.userId, { deviceId: approved.id, targetType: 'all' });
+      await hardware.setPhysicalGpuAssignment(approved.id, { userId: opts.userId, workerId: opts.id });
       const marker = { nonce: randomUUID(), initialCreate: true as const, replacementIncarnation: instance.config['volatile.uuid'] };
       opts.recreationNonce = marker.nonce;
       instance.config['user.agentor.recreation'] = marker.nonce;
@@ -1516,6 +1520,10 @@ for (const mode of ['usb', 'gpu-mdev', 'gpu-physical'] as const) test(`${mode} r
       const peer = { ...opts, id: randomUUID(), recreationNonce: undefined };
       peer.containerName = local.containerPrefix + '-' + peer.id;
       await workers.upsert({ ...record, id: peer.id, incusRecreation: undefined });
+      await expect(runtime.preflightHardware(peer)).rejects.toThrow('platform administrator');
+      // Explicit platform authority cannot bypass an original durable reservation.
+      await hardware.setPhysicalGpuAssignment(approved.id, undefined, { userId: opts.userId, workerId: opts.id });
+      await hardware.setPhysicalGpuAssignment(approved.id, { userId: peer.userId, workerId: peer.id });
       await expect(runtime.preflightHardware(peer)).rejects.toThrow('exclusively reserved');
       await workers.upsert({ ...record, status: 'archived', incusRecreation: undefined });
       expect(Object.values(await runtime.preflightHardware(peer))).toEqual([{ type: 'gpu', gputype: 'physical', pci: '0000:02:00.0' }]);
