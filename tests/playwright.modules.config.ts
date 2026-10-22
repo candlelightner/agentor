@@ -26,6 +26,7 @@ export default defineConfig({
   testDir: ".",
   testMatch: [
     "api/orchestrator-update-network.spec.ts",
+    "ui/update-notification-isolated.spec.ts",
     "api/legacy-group-mcp-fixture.spec.ts",
     "api/docker-build-filter.spec.ts",
     "api/docker-build-cache.spec.ts",
@@ -38,7 +39,6 @@ export default defineConfig({
     "api/physical-gpu-selection.spec.ts",
     "api/physical-gpu-access.spec.ts",
     "ui/physical-gpu-isolated.spec.ts",
-    "ui/update-notification-isolated.spec.ts",
     "api/terminal-copy.spec.ts",
     "api/management-logs-domain.spec.ts",
     "api/management-status-domain.spec.ts",
