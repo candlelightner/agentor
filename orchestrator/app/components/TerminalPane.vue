@@ -30,6 +30,25 @@ const terminals = shallowReactive(new Map<
 const activeCopyTerminal = computed(() => activeWindowIndex.value == null ? undefined : terminals.get(activeWindowIndex.value)?.instance);
 const copyRequest = computed(() => activeCopyTerminal.value?.copyRequest.value);
 const copyMessage = computed(() => activeCopyTerminal.value?.copyMessage.value);
+const mobileKeysVisible = ref(false);
+const mobileModifiers = computed(() => activeCopyTerminal.value?.mobileModifiers.value ?? { ctrl: false, shift: false, alt: false });
+
+function toggleMobileModifier(modifier: 'ctrl' | 'shift' | 'alt') {
+  activeCopyTerminal.value?.toggleMobileModifier(modifier);
+}
+
+function sendMobileKey(key: string) {
+  activeCopyTerminal.value?.sendMobileKey(key);
+}
+
+function toggleMobileKeys() {
+  if (mobileKeysVisible.value) {
+    for (const { instance } of terminals.values()) instance.clearMobileModifiers();
+    mobileKeysVisible.value = false;
+  } else {
+    mobileKeysVisible.value = true;
+  }
+}
 
 // Template refs for terminal containers
 const terminalRefs = new Map<number, HTMLElement>();
@@ -158,6 +177,7 @@ watch(
 
 // When active tab changes: connect if needed, then refit
 watch(activeWindowIndex, (index) => {
+  for (const { instance } of terminals.values()) instance.clearMobileModifiers();
   if (index == null) return;
   nextTick(() => {
     const entry = terminals.get(index);
@@ -250,6 +270,47 @@ onUnmounted(() => {
         :ref="(el) => setTerminalRef(w.index, el)"
         class="absolute inset-0"
       />
+    </div>
+
+    <div class="mobile-terminal-keys shrink-0 sm:hidden" style="padding-bottom: env(safe-area-inset-bottom);">
+      <div class="flex justify-end border-t border-slate-700 bg-slate-900 px-2 py-1">
+        <button
+          type="button"
+          class="min-h-9 rounded px-3 text-xs text-slate-200"
+          aria-controls="mobile-terminal-key-toolbar"
+          :aria-expanded="mobileKeysVisible"
+          @pointerdown.prevent
+          @click="toggleMobileKeys"
+        >{{ mobileKeysVisible ? 'Hide terminal keys' : 'Terminal keys' }}</button>
+      </div>
+      <div
+        v-if="mobileKeysVisible"
+        id="mobile-terminal-key-toolbar"
+        class="flex min-h-12 items-center gap-1 overflow-x-auto overscroll-x-contain border-t border-slate-700 bg-slate-900 px-2 py-1"
+        role="toolbar"
+        aria-label="Mobile terminal keys"
+      >
+        <button
+          v-for="modifier in (['ctrl', 'shift', 'alt'] as const)"
+          :key="modifier"
+          type="button"
+          class="min-h-10 min-w-12 rounded border border-slate-600 px-3 text-sm text-slate-100 aria-pressed:bg-blue-800"
+          :aria-pressed="mobileModifiers[modifier]"
+          :disabled="!activeCopyTerminal"
+          @pointerdown.prevent
+          @click="toggleMobileModifier(modifier)"
+        >{{ modifier === 'ctrl' ? 'Ctrl' : modifier === 'shift' ? 'Shift' : 'Alt' }}</button>
+        <button
+          v-for="key in [{ label: 'Tab', value: 'Tab' }, { label: 'Esc', value: 'Escape' }, { label: '↑', value: 'ArrowUp' }, { label: '↓', value: 'ArrowDown' }, { label: '←', value: 'ArrowLeft' }, { label: '→', value: 'ArrowRight' }, { label: 'Backspace', value: 'Backspace' }, { label: 'Enter', value: 'Enter' }]"
+          :key="key.value"
+          type="button"
+          class="min-h-10 shrink-0 rounded border border-slate-600 px-3 text-sm text-slate-100"
+          :aria-label="key.label === '↑' ? 'Arrow Up' : key.label === '↓' ? 'Arrow Down' : key.label === '←' ? 'Arrow Left' : key.label === '→' ? 'Arrow Right' : key.label"
+          :disabled="!activeCopyTerminal"
+          @pointerdown.prevent
+          @click="sendMobileKey(key.value)"
+        >{{ key.label }}</button>
+      </div>
     </div>
   </div>
 </template>

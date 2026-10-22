@@ -1,6 +1,14 @@
 export default defineNuxtConfig({
   modules: ['@nuxt/ui'],
 
+  app: {
+    head: {
+      meta: [
+        { name: 'viewport', content: 'width=device-width, initial-scale=1, interactive-widget=resizes-content' },
+      ],
+    },
+  },
+
   ssr: false,
 
   colorMode: {

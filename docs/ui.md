@@ -25,6 +25,8 @@ VS Code-style editor groups with recursive splits. Tabs can be dragged to any ed
 
 **Terminal resize**: `ResizeObserver` on the terminal container element handles all resize scenarios (window resize, sidebar drag, pane separator drag) — no manual callback propagation needed.
 
+**Mobile terminal controls**: below the 640px breakpoint, the terminal pane offers a toggleable bottom key bar for Ctrl, Shift, Alt, Tab, Escape, arrows, Backspace, and Enter. Modifier buttons apply to the next key and clear when the bar is hidden or the tmux window changes. Vertical touch drags feed xterm's wheel path, which scrolls local history or reaches tmux when mouse reporting is active; taps and long-press selection remain available. The viewport requests layout resizing when the mobile keyboard opens so the terminal can be refitted. Firefox on Android and real-device soft-keyboard acceptance remain pending.
+
 ## Tmux Tab Integration
 
 Web-native tab bar inside the terminal pane — each tab represents a tmux window in the container's tmux session. Replaces manual tmux keyboard shortcuts with clickable tabs.

@@ -15,6 +15,36 @@ interface TerminalState {
   writeRafId: number | null;
 }
 
+export type TerminalToolbarModifier = 'ctrl' | 'shift' | 'alt';
+type TerminalToolbarModifiers = Record<TerminalToolbarModifier, boolean>;
+
+function encodeToolbarKey(key: string, modifiers: TerminalToolbarModifiers): string | null {
+  if (key.length === 1) {
+    let value = key;
+    if (modifiers.shift) {
+      value = ({ '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?', '`': '~' } as Record<string, string>)[value] ?? value.toUpperCase();
+    }
+    if (modifiers.ctrl) {
+      const upper = value.toUpperCase();
+      if (upper >= 'A' && upper <= 'Z') value = String.fromCharCode(upper.charCodeAt(0) - 64);
+      else value = ({ ' ': '\0', '@': '\0', '[': '\x1b', '\\': '\x1c', ']': '\x1d', '^': '\x1e', '_': '\x1f', '?': '\x7f' } as Record<string, string>)[value] ?? '';
+      if (!value) return null;
+    }
+    return (modifiers.alt ? '\x1b' : '') + value;
+  }
+
+  if (key === 'Tab') return modifiers.shift ? '\x1b[Z' : modifiers.ctrl ? '\x1b[1;5I' : (modifiers.alt ? '\x1b' : '') + '\t';
+  if (key === 'Enter') return modifiers.shift ? '\x1b[13;2u' : modifiers.ctrl ? '\x1b[13;5u' : (modifiers.alt ? '\x1b' : '') + '\r';
+  if (key === 'Escape') return '\x1b';
+  if (key === 'Backspace') return (modifiers.alt ? '\x1b' : '') + (modifiers.ctrl ? '\x08' : '\x7f');
+  const arrows: Record<string, string> = { ArrowUp: 'A', ArrowDown: 'B', ArrowRight: 'C', ArrowLeft: 'D' };
+  if (arrows[key]) {
+    const modifier = 1 + Number(modifiers.shift) + 2 * Number(modifiers.alt) + 4 * Number(modifiers.ctrl);
+    return modifier === 1 ? `\x1b[${arrows[key]}` : `\x1b[1;${modifier}${arrows[key]}`;
+  }
+  return null;
+}
+
 const DARK_THEME: ITheme = {
   background: '#0d1117',
   foreground: '#c9d1d9',
@@ -50,6 +80,26 @@ export function useTerminal() {
   const activeTerminal = shallowRef<TerminalState | null>(null);
   const copyRequest = ref<{ text: string; error: string } | null>(null);
   const copyMessage = ref('');
+  const mobileModifiers = ref<TerminalToolbarModifiers>({ ctrl: false, shift: false, alt: false });
+
+  function clearMobileModifiers() {
+    mobileModifiers.value = { ctrl: false, shift: false, alt: false };
+  }
+
+  function toggleMobileModifier(modifier: TerminalToolbarModifier) {
+    mobileModifiers.value = { ...mobileModifiers.value, [modifier]: !mobileModifiers.value[modifier] };
+    activeTerminal.value?.term.focus();
+  }
+
+  function sendMobileKey(key: string) {
+    const terminal = activeTerminal.value;
+    if (!terminal || terminal.ws.readyState !== WebSocket.OPEN) return;
+    const data = encodeToolbarKey(key, mobileModifiers.value);
+    if (data === null) return;
+    terminal.ws.send(data);
+    clearMobileModifiers();
+    terminal.term.focus();
+  }
 
   async function copyTerminalRequest() {
     const requested = copyRequest.value;
@@ -118,6 +168,72 @@ export function useTerminal() {
     term.open(containerEl);
     fitAddon.fit();
 
+    let lastTouchAt = 0;
+    let touchGesture: { startX: number; startY: number; startAt: number; lastY: number; axis: 'vertical' | 'horizontal' | null } | null = null;
+    const terminalRoot = term.element;
+    let touchCleanup = () => {};
+    if (terminalRoot) {
+      // Keep the browser from scrolling the page; route vertical gestures through
+      // xterm so both local scrollback and tmux mouse reporting use their normal paths.
+      terminalRoot.style.touchAction = 'pan-x pinch-zoom';
+      terminalRoot.style.overscrollBehavior = 'contain';
+      const onTouchStart = (event: TouchEvent) => {
+        lastTouchAt = Date.now();
+        if (event.touches.length !== 1 || term.hasSelection()) { touchGesture = null; return; }
+        const touch = event.touches[0]!;
+        touchGesture = { startX: touch.clientX, startY: touch.clientY, startAt: Date.now(), lastY: touch.clientY, axis: null };
+      };
+      const onTouchMove = (event: TouchEvent) => {
+        if (event.touches.length !== 1 || !touchGesture) {
+          touchGesture = null;
+          event.stopImmediatePropagation();
+          return;
+        }
+        const touch = event.touches[0]!;
+        // A long press belongs to native text selection. Do not turn its drag into scrolling.
+        if (!touchGesture.axis && Date.now() - touchGesture.startAt >= 400) {
+          touchGesture = null;
+          event.stopImmediatePropagation();
+          return;
+        }
+        const deltaX = touch.clientX - touchGesture.startX;
+        const deltaY = touch.clientY - touchGesture.startY;
+        if (!touchGesture.axis && Math.max(Math.abs(deltaX), Math.abs(deltaY)) >= 8) {
+          touchGesture.axis = Math.abs(deltaY) > Math.abs(deltaX) ? 'vertical' : 'horizontal';
+        }
+        if (touchGesture.axis !== 'vertical') {
+          event.stopImmediatePropagation();
+          return;
+        }
+
+        const scrollDelta = touchGesture.lastY - touch.clientY;
+        touchGesture.lastY = touch.clientY;
+        event.stopImmediatePropagation();
+        if (scrollDelta !== 0) {
+          const wheel = new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            deltaY: scrollDelta,
+            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            clientX: touch.clientX,
+            clientY: touch.clientY,
+          });
+          terminalRoot.dispatchEvent(wheel);
+        }
+      };
+      const onTouchEnd = () => { lastTouchAt = Date.now(); touchGesture = null; };
+      terminalRoot.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+      terminalRoot.addEventListener('touchmove', onTouchMove, { capture: true, passive: true });
+      terminalRoot.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
+      terminalRoot.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true });
+      touchCleanup = () => {
+        terminalRoot.removeEventListener('touchstart', onTouchStart, true);
+        terminalRoot.removeEventListener('touchmove', onTouchMove, true);
+        terminalRoot.removeEventListener('touchend', onTouchEnd, true);
+        terminalRoot.removeEventListener('touchcancel', onTouchEnd, true);
+      };
+    }
+
     // Force xterm.js to use native text selection for click/drag.
     // xterm.js's shouldForceSelection() checks altKey+macOptionClickForcesSelection
     // on Mac, or shiftKey on other platforms. We override the relevant modifier
@@ -126,6 +242,7 @@ export function useTerminal() {
     const isMac = /mac/i.test(navigator.platform);
     const forceSelectionKey = isMac ? 'altKey' : 'shiftKey';
     const overrideKey = (e: Event) => {
+      if ((typeof PointerEvent !== 'undefined' && e instanceof PointerEvent && e.pointerType === 'touch') || Date.now() - lastTouchAt < 400) return;
       Object.defineProperty(e, forceSelectionKey, { value: true });
     };
     const eventTypes = ['pointerdown', 'pointermove', 'pointerup', 'mousedown', 'mousemove', 'mouseup'] as const;
@@ -141,6 +258,7 @@ export function useTerminal() {
     });
     let pasteCleanup = () => {};
     const eventCleanup = () => {
+      touchCleanup();
       for (const type of eventTypes) {
         containerEl.removeEventListener(type, overrideKey, { capture: true });
       }
@@ -218,6 +336,8 @@ export function useTerminal() {
       else if (res.text !== undefined) term.paste(res.text);
     };
     const onNativePaste = (event: ClipboardEvent) => {
+      imeInputPending = false;
+      clearMobileModifiers();
       const data = event.clipboardData;
       if (!data) return;
       const hasImage = Array.from(data.items).some((item) => item.kind === 'file' && item.type.startsWith('image/'));
@@ -256,8 +376,14 @@ export function useTerminal() {
     // original Ctrl+V so existing behaviour is no worse. Per-target concurrency
     // guard prevents racing rapid presses. Existing Shift+Enter and all other
     // keys are preserved.
+    let imeInputPending = false;
     term.attachCustomKeyEventHandler((event) => {
-      if (event.key === 'Enter' && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      if (event.type === 'keydown' && event.isComposing) {
+        imeInputPending = true;
+        return true;
+      }
+      if (event.key === 'Enter' && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey &&
+          !mobileModifiers.value.ctrl && !mobileModifiers.value.shift && !mobileModifiers.value.alt) {
         if (event.type === 'keydown' && ws.readyState === WebSocket.OPEN) {
           ws.send('\x1b[13;2u');
         }
@@ -267,10 +393,14 @@ export function useTerminal() {
       // Ctrl+V (non-Mac) or Cmd+V (Mac). Match the keydown only; keyup is
       // swallowed too so xterm never performs its own paste.
       const isPasteKey = event.key === 'v' || event.key === 'V';
-      const isCtrlOrCmd = event.ctrlKey || event.metaKey;
-      if (isPasteKey && isCtrlOrCmd && !event.altKey) {
+      const isCtrlOrCmd = event.ctrlKey || event.metaKey || mobileModifiers.value.ctrl;
+      if (isPasteKey && isCtrlOrCmd && !event.altKey && !mobileModifiers.value.alt) {
+        const virtualPaste = mobileModifiers.value.ctrl && !event.ctrlKey && !event.metaKey;
+        if (event.type === 'keydown' && (mobileModifiers.value.ctrl || mobileModifiers.value.shift || mobileModifiers.value.alt)) clearMobileModifiers();
+        imeInputPending = false;
+        if (event.type === 'keydown' && !event.ctrlKey && !event.metaKey) event.preventDefault();
         const hasClipboard = clipboardReadAvailable();
-        const preferNativePaste = /firefox/i.test(navigator.userAgent) || !hasClipboard;
+        const preferNativePaste = !virtualPaste && (/firefox/i.test(navigator.userAgent) || !hasClipboard);
         if (preferNativePaste) {
           if (event.type === 'keydown') {
             nativePastePending = true;
@@ -296,6 +426,27 @@ export function useTerminal() {
         return false;
       }
 
+      // Android IMEs may emit both a legacy keypress and a committed input event.
+      // Keep xterm's composition helper in control; onData applies the modifier to its committed text.
+
+      if (event.type === 'keydown' && (mobileModifiers.value.ctrl || mobileModifiers.value.shift || mobileModifiers.value.alt)) {
+        if (event.key === 'Unidentified' || event.key === 'Process' || event.keyCode === 229) {
+          imeInputPending = true;
+          return true;
+        }
+        const modifiers = {
+          ctrl: mobileModifiers.value.ctrl || event.ctrlKey,
+          shift: mobileModifiers.value.shift || event.shiftKey,
+          alt: mobileModifiers.value.alt || event.altKey,
+        };
+        const data = encodeToolbarKey(event.key, modifiers);
+        if (data !== null) {
+          event.preventDefault();
+          if (ws.readyState === WebSocket.OPEN) ws.send(data);
+          clearMobileModifiers();
+          return false;
+        }
+      }
       return true;
     });
 
@@ -308,6 +459,24 @@ export function useTerminal() {
       if (ws.readyState === WebSocket.OPEN) {
         const m = data.match(SGR_MOUSE_RE);
         if (m && parseInt(m[1]!, 10) < 64) return;
+        if (imeInputPending && !m) {
+          imeInputPending = false;
+          const modifiers = mobileModifiers.value;
+          if (data.length === 1 && /[vV]/.test(data) && modifiers.ctrl && !modifiers.alt) {
+            clearMobileModifiers();
+            if (!isPasteInFlight('terminal')) {
+              runGuarded('terminal', () => bridgeTerminalPaste(containerId)).then(applyPasteResult);
+            }
+            return;
+          }
+          const input = data.length === 1 && data >= ' ' && data <= '~' ? encodeToolbarKey(data, mobileModifiers.value) : null;
+          if (input !== null) {
+            ws.send(input);
+            clearMobileModifiers();
+            return;
+          }
+          clearMobileModifiers();
+        }
         ws.send(data);
       }
     });
@@ -345,6 +514,7 @@ export function useTerminal() {
     t.ws?.close();
     t.term?.dispose();
     activeTerminal.value = null;
+    clearMobileModifiers();
   }
 
   function destroy() {
@@ -359,6 +529,10 @@ export function useTerminal() {
     copyMessage,
     copyTerminalRequest,
     dismissCopyRequest,
+    mobileModifiers,
+    clearMobileModifiers,
+    toggleMobileModifier,
+    sendMobileKey,
     openTerminal,
     closeTerminal,
     fitTerminal,
