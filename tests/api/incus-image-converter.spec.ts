@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { IncusClient, IncusError, type IncusInstance, type IncusInstanceCreateSpec } from '../../orchestrator/server/utils/incus-client';
 import { IncusImageConverter, readCanonicalIncusBootstrap, incusConversionRecipeId,
   type IncusImageConverterReceipt, type IncusImageConversionInput } from '../../orchestrator/server/utils/incus-image-converter';
+import { ImageCatalogCore } from '../../orchestrator/server/utils/image-catalog-core';
 
 const sourceId = 'sha256:' + 'a'.repeat(64), seed = 'b'.repeat(64);
 type ConverterDocker = ConstructorParameters<typeof IncusImageConverter>[2];
@@ -32,13 +33,15 @@ async function fixture(run: (f: {
   converter: IncusImageConverter; input: IncusImageConversionInput; directory: string; assets: string;
   events: string[]; receipts: IncusImageConverterReceipt[]; commands: string[][];
   client: IncusClient; execTimeouts: Array<number | undefined>;
+  logs: string[];
   fail: (at: string) => void; revoke: () => void;
-}) => Promise<void>, converterPool?: string) {
+}) => Promise<void>, converterPool?: string, readiness?: () => { timeoutMs: number; signal?: AbortSignal }) {
   const directory = await mkdtemp(join(tmpdir(), 'agentor-isolated-converter-')), assets = join(directory, 'assets');
   await packageAssets(assets);
   const jobId = randomUUID(), installationId = randomUUID(), incarnation = randomUUID();
   const events: string[] = [], receipts: IncusImageConverterReceipt[] = [], commands: string[][] = [];
   const execTimeouts: Array<number | undefined> = [];
+  const logs: string[] = [];
   let instance: IncusInstance | undefined, failure: string | undefined, revoked = false;
   const expectedPool = converterPool || 'images';
   const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-images' });
@@ -129,12 +132,13 @@ async function fixture(run: (f: {
   } } as ConverterDocker;
   const input: IncusImageConversionInput = { jobId, ownerId: 'converter-owner', installationId, sourceImageId: sourceId, seedFingerprint: seed,
     validateAuthority: async () => { if (revoked) throw new Error('Source permission revoked'); },
+    log: async message => { logs.push(message); },
     acknowledge: async receipt => {
       receipts.push(structuredClone(receipt)); events.push('ack:' + (receipt.pending?.kind ?? (receipt.removed ? 'removed' : 'settled')));
     } };
   const converter = new IncusImageConverter({ dataDir: directory, incusStoragePool: 'images',
-    incusConverterStoragePool: converterPool, incusNetwork: 'image-network' }, client, docker, assets);
-  try { await run({ converter, input, directory, assets, events, receipts, commands, client, execTimeouts,
+    incusConverterStoragePool: converterPool, incusNetwork: 'image-network' }, client, docker, assets, readiness);
+  try { await run({ converter, input, directory, assets, events, receipts, commands, client, execTimeouts, logs,
     fail: at => { failure = at; }, revoke: () => { revoked = true; } }); }
   finally { client.dispose(); await rm(directory, { recursive: true, force: true }); }
 }
@@ -306,6 +310,9 @@ test('stalled readiness probe uses remaining budget and settles cancellation bef
     expect(f.events.indexOf('ready-settled')).toBeLessThan(f.events.indexOf('ready-closed'));
     expect(f.events.indexOf('ready-closed')).toBeLessThan(f.events.indexOf('stop'));
     expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect(f.logs.some(value => value.includes(cancel ? 'Conversion cancelled' : 'Readiness expired'))).toBe(true);
+    expect(f.logs.at(-1)).toContain('cleanup completed');
+    expect(f.logs.join('\n')).not.toContain(f.input.jobId);
   });
 });
 
@@ -313,26 +320,209 @@ test('readiness expiry avoids another probe and retry delay is abortable within 
   for (const outcome of ['expired', 'sleep-expiry', 'sleep-abort']) await fixture(async f => {
     const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
     const exec = f.client.execStream.bind(f.client), controller = new AbortController();
-    let started = false, offset = 0, shifted = false, cancellation: ReturnType<typeof setTimeout> | undefined;
+    let started = false, offset = 0, shifted = false, began = 0, aborted = 0, cancellation: ReturnType<typeof setTimeout> | undefined;
     f.client.startInstance = async (...args) => { await start(...args); started = true; };
     f.client.getInstance = async (...args) => {
       const current = await getInstance(...args);
-      if (started && !shifted) { shifted = true; offset = outcome === 'expired' ? 120_001 : 119_950; }
+      if (started && !shifted) { shifted = true; began = originalNow(); offset = outcome === 'expired' ? 120_001 : outcome === 'sleep-abort' ? 0 : 119_950; }
       return current;
     };
     f.client.execStream = async (...args) => {
       await exec(...args);
-      if (outcome === 'sleep-abort') cancellation = setTimeout(() => controller.abort(), 5);
+      if (outcome === 'sleep-abort') cancellation = setTimeout(() => { aborted = originalNow(); controller.abort(); }, 5);
       throw new Error('Guest agent unavailable');
     };
-    const began = originalNow();
     try {
       Date.now = () => originalNow() + offset;
       await expect(f.converter.convert({ ...f.input, signal: controller.signal })).rejects.toThrow(outcome === 'sleep-abort' ? /abort/i : 'guest agent did not become ready');
     } finally { Date.now = originalNow; clearTimeout(cancellation); }
-    expect(originalNow() - began).toBeLessThan(400);
+    expect(originalNow() - (outcome === 'sleep-abort' ? aborted : began)).toBeLessThan(400);
     expect(f.execTimeouts).toHaveLength(outcome === 'expired' ? 0 : 1);
     expect(f.receipts.at(-1)?.removed).toBe(true);
+  });
+});
+
+test('converter readiness settings validate, persist and reload without a restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-converter-settings-'));
+  try {
+    const catalog = new ImageCatalogCore(directory); await catalog.init();
+    expect(catalog.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 120 });
+    for (const value of [undefined, null, 0, -1, 1.5, 3601, Infinity, NaN, '120', true])
+      await expect(catalog.setConverterSettings({ agentReadyTimeoutSeconds: value })).rejects.toMatchObject({ statusCode: 400 });
+    const before = catalog.converterReadiness();
+    await catalog.setConverterSettings({ agentReadyTimeoutSeconds: 240 });
+    expect(before.signal.aborted).toBe(true);
+    expect(catalog.converterReadiness().timeoutMs).toBe(240_000);
+    const reloaded = new ImageCatalogCore(directory); await reloaded.init();
+    expect(reloaded.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 240 });
+    await reloaded.setConverterSettings({ agentReadyTimeoutSeconds: 1 });
+    expect(reloaded.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 1 });
+    await reloaded.setConverterSettings({ agentReadyTimeoutSeconds: 3600 });
+    expect(reloaded.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 3600 });
+    const state = JSON.parse(await readFile(join(directory, 'image-catalog.json'), 'utf8'));
+    state.converterSettings.agentReadyTimeoutSeconds = null;
+    await writeFile(join(directory, 'image-catalog.json'), JSON.stringify(state));
+    await expect(new ImageCatalogCore(directory).init()).rejects.toMatchObject({ statusCode: 400 });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('pending or failed settings persistence never exposes or signals an uncommitted timeout', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agentor-converter-settings-rollback-'));
+  let writing: (() => Promise<void>) | undefined;
+  const catalog = new ImageCatalogCore(directory, async () => writing?.());
+  try {
+    await catalog.init();
+    let entered!: () => void, reject!: (error: Error) => void;
+    const pendingWrite = new Promise<void>((_resolve, no) => { reject = no; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    writing = () => { entered(); return pendingWrite; };
+    const before = catalog.converterReadiness();
+    const pending = catalog.setConverterSettings({ agentReadyTimeoutSeconds: 300 });
+    const rejected = expect(pending).rejects.toThrow('Persistence failed');
+    await started;
+    expect(catalog.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 120 });
+    expect(before.signal.aborted).toBe(false);
+    reject(new Error('Persistence failed')); await rejected;
+    expect(catalog.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 120 });
+    expect(catalog.converterReadiness().signal).toBe(before.signal);
+    expect(before.signal.aborted).toBe(false);
+    writing = undefined;
+    await catalog.setConverterSettings({ agentReadyTimeoutSeconds: 240 });
+    expect(catalog.getConverterSettings()).toEqual({ agentReadyTimeoutSeconds: 240 });
+    expect(before.signal.aborted).toBe(true);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('a committed timeout increase or reduction reschedules an active readiness probe from its original start', async () => {
+  for (const extend of [true, false]) {
+    let timeoutMs = extend ? 120_000 : 240_000, change = new AbortController();
+    await fixture(async f => {
+      const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
+      const exec = f.client.execStream.bind(f.client);
+      let offset = 0, started = false, shifted = false, probes = 0;
+      f.client.startInstance = async (...args) => { await start(...args); started = true; };
+      f.client.getInstance = async (...args) => {
+        const current = await getInstance(...args);
+        if (started && !shifted) { shifted = true; offset = 119_000; }
+        return current;
+      };
+      f.client.execStream = async (...args) => {
+        const session = await exec(...args);
+        if (args[1][0] !== 'true') return session;
+        probes++;
+        if (probes === 1) {
+          session.result = new Promise<number>((_resolve, reject) => {
+            args[2]!.signal!.addEventListener('abort', () => {
+              f.events.push('settings-aborted');
+              setTimeout(() => { f.events.push('settings-settled'); reject(new Error('Setting changed')); }, 10);
+            }, { once: true });
+          });
+          session.close = () => { f.events.push('settings-closed'); };
+          setTimeout(() => {
+            const previous = change; change = new AbortController();
+            timeoutMs = extend ? 240_000 : 60_000;
+            offset = 121_000;
+            previous.abort();
+          }, 5);
+        } else {
+          expect(extend).toBe(true);
+          expect(f.events).toContain('settings-closed');
+          expect(args[2]!.timeoutMs).toBeGreaterThan(118_000);
+          expect(args[2]!.timeoutMs).toBeLessThanOrEqual(119_000);
+        }
+        return session;
+      };
+      try {
+        Date.now = () => originalNow() + offset;
+        await expect(f.converter.convert(f.input)).rejects.toThrow(extend ? 'RAW size' : 'guest agent did not become ready');
+      } finally { Date.now = originalNow; }
+      expect(probes).toBe(extend ? 2 : 1);
+      expect(f.events.indexOf('settings-settled')).toBeLessThan(f.events.indexOf('settings-closed'));
+      expect(f.events.indexOf('settings-closed')).toBeLessThan(f.events.indexOf('stop'));
+      expect(f.receipts.at(-1)?.removed).toBe(true);
+      expect(f.logs.some(value => value.includes('Readiness timeout updated') && value.includes(extend ? '240000ms' : '60000ms'))).toBe(true);
+      expect(f.logs.some(value => value.includes(extend ? 'Guest agent ready' : 'Readiness expired'))).toBe(true);
+      expect(f.logs.at(-1)).toContain('cleanup completed');
+    }, undefined, () => ({ timeoutMs, signal: change.signal }));
+  }
+});
+
+test('converter settings HTTP access requires platform admin before initialization or body reads', async () => {
+  test.setTimeout(120_000);
+  const { useImageCatalogManager } = await import('../../orchestrator/server/utils/image-catalog');
+  const manager = useImageCatalogManager();
+  const original = { init: manager.init, get: manager.getConverterSettings, set: manager.setConverterSettings };
+  const globals = globalThis as any;
+  let initializations = 0, reads = 0, writes = 0;
+  const values = { defineRouteMeta() {}, defineEventHandler: (handler: unknown) => handler,
+    getRouterParam: () => 'settings', readBody: async (event: any) => { reads++; return event.body; } };
+  const descriptors = Object.fromEntries(Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globals, key)]));
+  try {
+    manager.init = async () => { initializations++; };
+    manager.getConverterSettings = () => ({ agentReadyTimeoutSeconds: 120 });
+    manager.setConverterSettings = async (input: any) => { writes++; return input; };
+    Object.assign(globals, values);
+    const route = (await import('../../orchestrator/server/api/image-builder/[...path]')).default as any;
+    const event = (role: string, method: string) => ({ method, body: { agentReadyTimeoutSeconds: 240 },
+      context: { auth: { user: { id: 'fixture-user', role }, session: {} } } });
+    for (const method of ['GET', 'PUT'])
+      await expect(route(event('user', method))).rejects.toMatchObject({ statusCode: 403 });
+    await expect(route({ method: 'GET', context: {} })).rejects.toMatchObject({ statusCode: 401 });
+    expect(initializations).toBe(0); expect(reads).toBe(0); expect(writes).toBe(0);
+    expect(await route(event('admin', 'GET'))).toEqual({ agentReadyTimeoutSeconds: 120 });
+    expect(await route(event('admin', 'PUT'))).toEqual({ agentReadyTimeoutSeconds: 240 });
+    expect(initializations).toBe(2); expect(reads).toBe(1); expect(writes).toBe(1);
+  } finally {
+    manager.init = original.init; manager.getConverterSettings = original.get; manager.setConverterSettings = original.set;
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (descriptor) Object.defineProperty(globals, key, descriptor); else delete globals[key];
+    }
+  }
+});
+
+test('a timeout extended during ownership inspection cannot expire using the previous deadline', async () => {
+  const change = new AbortController();
+  let setting = { timeoutMs: 120_000, signal: change.signal };
+  await fixture(async f => {
+    const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
+    let started = false, changed = false, offset = 0;
+    f.client.startInstance = async (...args) => { await start(...args); started = true; };
+    f.client.getInstance = async (...args) => {
+      const instance = await getInstance(...args);
+      if (started && !changed) {
+        changed = true;
+        await new Promise<void>(resolve => setTimeout(() => {
+          setting = { timeoutMs: 240_000, signal: new AbortController().signal };
+          offset = 121_000;
+          // Exercise a real settings-change signal, not only a different callback value.
+          change.abort();
+          resolve();
+        }, 5));
+      }
+      return instance;
+    };
+    try {
+      Date.now = () => originalNow() + offset;
+      await expect(f.converter.convert(f.input)).rejects.toThrow('RAW size');
+    } finally { Date.now = originalNow; }
+    expect(f.commands.filter(command => command[0] === 'true')).toHaveLength(1);
+    expect(f.logs.some(value => value.includes('Guest agent ready'))).toBe(true);
+    expect(f.execTimeouts[0]).toBeGreaterThan(118_000);
+    expect(f.execTimeouts[0]).toBeLessThanOrEqual(119_000);
+  }, undefined, () => setting);
+});
+
+test('failed readiness logging preserves the conversion failure and exact cleanup outcome', async () => {
+  await fixture(async f => {
+    const warn = console.warn, warnings: string[] = [];
+    console.warn = message => { warnings.push(String(message)); };
+    f.input.log = async () => { throw new Error('Diagnostic write failed'); };
+    f.fail('docker-load');
+    try { await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-load failed'); }
+    finally { console.warn = warn; }
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings.every(value => value === '[converter] Build diagnostic persistence failed; safety checks and exact cleanup remain active.')).toBe(true);
   });
 });
 
@@ -350,6 +540,7 @@ test('same-name foreign incarnation cannot be used or removed during isolated co
     f.fail('foreign-uuid'); await expect(f.converter.convert(f.input)).rejects.toThrow('cleanup is unconfirmed');
     expect(f.commands).toEqual([]); expect(f.events).not.toContain('stop'); expect(f.events).not.toContain('delete');
     expect(f.receipts.at(-1)?.incarnation).toBeTruthy(); expect(f.receipts.at(-1)?.removed).not.toBe(true);
+    expect(f.logs.at(-1)).toContain('explicit recovery is required');
   });
 });
 

@@ -26,6 +26,7 @@ export interface IncusImageConversionInput {
   validateAuthority: () => Promise<void>;
   acknowledge: (receipt: Readonly<IncusImageConverterReceipt>) => Promise<void>;
   signal?: AbortSignal;
+  log?: (message: string) => Promise<void>;
 }
 export interface CanonicalIncusBootstrapFile { name: string; mode: number; size: number; sha256: string; bytes: Buffer }
 export interface IncusConvertedRaw {
@@ -218,7 +219,8 @@ async function mutateConverter(current: () => IncusImageConverterReceipt,
  * metadata construction/import/publication remain trusted parent operations. */
 export class IncusImageConverter {
   constructor(private config: ConverterConfig,
-    private client: IncusClient, private docker: Pick<Docker, 'getImage'>, private bootstrapDirectory: string) {}
+    private client: IncusClient, private docker: Pick<Docker, 'getImage'>, private bootstrapDirectory: string,
+    private readiness: () => { timeoutMs: number; signal?: AbortSignal } = () => ({ timeoutMs: 120_000 })) {}
 
   /** Explicit cleanup never resumes unknown work or touches imported images,
    * source OCI data, custom volumes or local conversion scratch. */
@@ -251,6 +253,10 @@ export class IncusImageConverter {
 
   async convert(input: IncusImageConversionInput): Promise<IncusConvertedRaw> {
     const request = { ...input };
+    const log = async (message: string) => {
+      try { await request.log?.(message); }
+      catch { console.warn('[converter] Build diagnostic persistence failed; safety checks and exact cleanup remain active.'); }
+    };
     const pool = this.config.incusConverterStoragePool || this.config.incusStoragePool;
     if (!UUID.test(request.jobId) || !UUID.test(request.installationId) || !HEX.test(request.seedFingerprint) ||
         !/^sha256:[a-f0-9]{64}$/.test(request.sourceImageId) || assertSafeUserId(request.ownerId).length > 128 ||
@@ -338,24 +344,45 @@ export class IncusImageConverter {
         await persist({ ...receipt, incarnation: uuid });
       });
       await check(); await submit('start', accepted => this.client.startInstance(receipt.name, accepted));
-      const deadline = Date.now() + 120_000; let ready = false;
-      while (Date.now() < deadline) {
-        const current = await check(); if (current.status !== 'Running') throw new Error('Converter is not running');
+      // A live finite budget prevents an unavailable agent from wedging conversion.
+      const started = Date.now(); let ready = false, previousTimeout: number | undefined;
+      while (true) {
+        const setting = this.readiness(), deadline = started + setting.timeoutMs;
+        if (previousTimeout === undefined)
+          await log(`Readiness started with a ${setting.timeoutMs}ms limit to bound unavailable-agent waits.`);
+        else if (previousTimeout !== setting.timeoutMs)
+          await log(`Readiness timeout updated after ${Date.now() - started}ms: limit ${setting.timeoutMs}ms, remaining ${Math.max(0, deadline - Date.now())}ms; prior probe settled.`);
+        previousTimeout = setting.timeoutMs;
+        if (setting.signal?.aborted) continue;
+        if (Date.now() >= deadline) break;
+        const current = await check();
+        if (setting.signal?.aborted) continue;
+        if (current.status !== 'Running') throw new Error('Converter is not running');
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;
+        const signal = AbortSignal.any([request.signal, setting.signal].filter((value): value is AbortSignal => !!value));
         try {
           await withOperationDeadline(signal => execute('agent-ready', ['true'], undefined,
-            { signal, timeoutMs: remaining }), remaining, 'Converter agent readiness', request.signal);
+            { signal, timeoutMs: remaining }), remaining, 'Converter agent readiness', signal);
+          if (setting.signal?.aborted) continue;
+          await log(`Guest agent ready after ${Date.now() - started}ms; continuing conversion.`);
           ready = true; break;
         } catch (error) {
           // Abort the probe, then settle its transport before exact guest cleanup or retry.
           await (error as OperationFailureWithSettlement)?.[operationSettlement];
           await active();
         }
+        if (setting.signal?.aborted) continue;
         const pause = Math.min(500, deadline - Date.now());
-        if (pause > 0) await delay(pause, undefined, { signal: request.signal });
+        if (pause > 0) {
+          try { await delay(pause, undefined, { signal }); }
+          catch { await active(); }
+        }
       }
-      if (!ready) throw new Error('Converter guest agent did not become ready');
+      if (!ready) {
+        await log(`Readiness expired after ${Date.now() - started}ms against a ${previousTimeout}ms limit; conversion stopped before guest preparation.`);
+        throw new Error('Converter guest agent did not become ready');
+      }
       await execute('guest-tools', ['/bin/bash', '-ec', PREPARE_GUEST]);
       for (const file of files) {
         await check(); await this.client.pushFile(receipt.name, '/root/agentor-convert/' + file.name, file.bytes,
@@ -415,12 +442,18 @@ exit "$converter_exit"
       await removeConverter(); await active();
       return { rawPath, rawBytes: bytes, rawIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size }, sourceImageId: request.sourceImageId, recipeId };
     } catch (error) {
+      await log(request.signal?.aborted ? 'Conversion cancelled; evaluating exact owned-guest cleanup.'
+        : 'Conversion failed; evaluating exact owned-guest cleanup.');
       // Known exec/stream failure can stop/remove only the captured isolated
       // guest. Unknown accepted native mutations/UUIDs remain quarantined.
       if (receipt.incarnation && !receipt.pending && !receipt.removed) {
-        try { await removeConverter(); }
-        catch (cleanup) { throw new AggregateError([error, cleanup], 'Isolated converter cleanup is unconfirmed; retain private ImageBuild', { cause: error }); }
-      }
+        try { await removeConverter(); await log('Exact owned converter cleanup completed; conversion remains stopped.'); }
+        catch (cleanup) {
+          await log('Converter cleanup is unconfirmed; conversion stopped and explicit recovery is required.');
+          throw new AggregateError([error, cleanup], 'Isolated converter cleanup is unconfirmed; retain private ImageBuild', { cause: error });
+        }
+      } else await log(receipt.removed ? 'Converter compute was already removed; conversion remains stopped.'
+        : 'Converter identity or native operation is unsettled; no cleanup replay attempted, explicit recovery is required.');
       throw error;
     } finally { await raw?.close(); }
   }
