@@ -320,7 +320,9 @@ test('readiness expiry avoids another probe and retry delay is abortable within 
   for (const outcome of ['expired', 'sleep-expiry', 'sleep-abort']) await fixture(async f => {
     const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
     const exec = f.client.execStream.bind(f.client), controller = new AbortController();
-    let started = false, offset = 0, shifted = false, began = 0, aborted = 0, cancellation: ReturnType<typeof setTimeout> | undefined;
+    let started = false, offset = 0, shifted = false, began = 0, aborted = 0, clock = 0, readinessStarted = 0,
+      cancellation: ReturnType<typeof setTimeout> | undefined;
+    const admissions: number[] = [];
     f.client.startInstance = async (...args) => { await start(...args); started = true; };
     f.client.getInstance = async (...args) => {
       const current = await getInstance(...args);
@@ -328,16 +330,29 @@ test('readiness expiry avoids another probe and retry delay is abortable within 
       return current;
     };
     f.client.execStream = async (...args) => {
+      // Use the converter's budget-admission clock; another read can cross a final 1ms budget.
+      admissions.push(clock);
       await exec(...args);
       if (outcome === 'sleep-abort') cancellation = setTimeout(() => { aborted = originalNow(); controller.abort(); }, 5);
       throw new Error('Guest agent unavailable');
     };
     try {
-      Date.now = () => originalNow() + offset;
+      Date.now = () => {
+        clock = originalNow() + offset;
+        if (started && !readinessStarted) readinessStarted = clock;
+        return clock;
+      };
       await expect(f.converter.convert({ ...f.input, signal: controller.signal })).rejects.toThrow(outcome === 'sleep-abort' ? /abort/i : 'guest agent did not become ready');
     } finally { Date.now = originalNow; clearTimeout(cancellation); }
     expect(originalNow() - (outcome === 'sleep-abort' ? aborted : began)).toBeLessThan(400);
-    expect(f.execTimeouts).toHaveLength(outcome === 'expired' ? 0 : 1);
+    if (outcome === 'sleep-expiry') {
+      expect(f.execTimeouts.length).toBeGreaterThan(0);
+      for (const [index, budget] of f.execTimeouts.entries()) {
+        expect(budget).toBeGreaterThan(0);
+        expect(budget).toBeLessThanOrEqual(index ? f.execTimeouts[index - 1]! : 50);
+        expect(admissions[index]).toBeLessThan(readinessStarted + 120_000);
+      }
+    } else expect(f.execTimeouts).toHaveLength(outcome === 'expired' ? 0 : 1);
     expect(f.receipts.at(-1)?.removed).toBe(true);
   });
 });
