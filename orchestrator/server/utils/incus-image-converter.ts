@@ -255,7 +255,7 @@ export class IncusImageConverter {
     const request = { ...input };
     const log = async (message: string) => {
       try { await request.log?.(message); }
-      catch { console.warn('[converter] Build diagnostic persistence failed; safety checks and exact cleanup remain active.'); }
+      catch { console.warn(`[converter] Build diagnostic persistence failed: ${message.slice(0, 1024)}`); }
     };
     const pool = this.config.incusConverterStoragePool || this.config.incusStoragePool;
     if (!UUID.test(request.jobId) || !UUID.test(request.installationId) || !HEX.test(request.seedFingerprint) ||

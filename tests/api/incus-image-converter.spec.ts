@@ -537,7 +537,12 @@ test('failed readiness logging preserves the conversion failure and exact cleanu
     finally { console.warn = warn; }
     expect(f.receipts.at(-1)?.removed).toBe(true);
     expect(warnings.length).toBeGreaterThan(0);
-    expect(warnings.every(value => value === '[converter] Build diagnostic persistence failed; safety checks and exact cleanup remain active.')).toBe(true);
+    const prefix = '[converter] Build diagnostic persistence failed: ';
+    expect(warnings.every(value => value.startsWith(prefix) && value.length <= prefix.length + 1024)).toBe(true);
+    expect(warnings).toContain(prefix + 'Conversion failed; evaluating exact owned-guest cleanup.');
+    expect(warnings).toContain(prefix + 'Exact owned converter cleanup completed; conversion remains stopped.');
+    for (const privateValue of [f.input.jobId, f.input.installationId, f.input.sourceImageId, f.input.ownerId,
+      'Diagnostic write failed', 'OCI-load failed']) expect(warnings.join('\n')).not.toContain(privateValue);
   });
 });
 
