@@ -6,11 +6,12 @@ import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config';
 import { IncusClient, IncusError, IncusRequestRejected, type IncusInstance, type IncusInstanceCreateSpec } from './incus-client';
 import { assertSafeUserId } from './user-id';
-import { withOperationDeadline } from './operation-deadline';
+import { withOperationDeadline, operationSettlement, type OperationFailureWithSettlement } from './operation-deadline';
 
 /** Private acknowledgement in the EXISTING ImageBuild, never portable image
  * metadata or a second operation store. Pending authority survives uncertainty. */
@@ -288,11 +289,13 @@ export class IncusImageConverter {
       operation: (acknowledged: (path?: string) => Promise<void>) => Promise<unknown>) =>
       mutateConverter(() => receipt, persist, kind, operation);
     const removeConverter = () => IncusImageConverter.cleanup(this.config, this.client, receipt, async () => {}, persist);
-    const execute = async (phase: 'agent-ready' | 'guest-tools' | 'guest-space' | 'OCI-load' | 'OCI-identity' | 'raw-convert', command: string[], stream?: NodeJS.ReadableStream) => {
+    const execute = async (phase: 'agent-ready' | 'guest-tools' | 'guest-space' | 'OCI-load' | 'OCI-identity' | 'raw-convert', command: string[], stream?: NodeJS.ReadableStream,
+      execution = { signal: request.signal, timeoutMs: 45 * 60_000 }) => {
       await check();
+      execution.signal?.throwIfAborted();
       const session = await this.client.execStream(receipt.name, command, { command: [], user: 0, group: 0,
         cwd: '/', environment: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL: 'C' },
-        signal: request.signal, timeoutMs: 45 * 60_000 });
+        ...execution });
       session.stdout.resume(); let stderr = Buffer.alloc(0);
       session.stderr.on('data', (chunk: Buffer) => { stderr = chunk.length >= 8192 ? Buffer.from(chunk.subarray(-8192))
         : Buffer.concat([stderr, chunk]).subarray(-8192); });
@@ -338,8 +341,19 @@ export class IncusImageConverter {
       const deadline = Date.now() + 120_000; let ready = false;
       while (Date.now() < deadline) {
         const current = await check(); if (current.status !== 'Running') throw new Error('Converter is not running');
-        try { await execute('agent-ready', ['true']); ready = true; break; } catch { await active(); }
-        await new Promise(resolve => setTimeout(resolve, 500));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        try {
+          await withOperationDeadline(signal => execute('agent-ready', ['true'], undefined,
+            { signal, timeoutMs: remaining }), remaining, 'Converter agent readiness', request.signal);
+          ready = true; break;
+        } catch (error) {
+          // Abort the probe, then settle its transport before exact guest cleanup or retry.
+          await (error as OperationFailureWithSettlement)?.[operationSettlement];
+          await active();
+        }
+        const pause = Math.min(500, deadline - Date.now());
+        if (pause > 0) await delay(pause, undefined, { signal: request.signal });
       }
       if (!ready) throw new Error('Converter guest agent did not become ready');
       await execute('guest-tools', ['/bin/bash', '-ec', PREPARE_GUEST]);

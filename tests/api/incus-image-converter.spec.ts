@@ -31,12 +31,14 @@ async function packageAssets(directory: string) {
 async function fixture(run: (f: {
   converter: IncusImageConverter; input: IncusImageConversionInput; directory: string; assets: string;
   events: string[]; receipts: IncusImageConverterReceipt[]; commands: string[][];
+  client: IncusClient; execTimeouts: Array<number | undefined>;
   fail: (at: string) => void; revoke: () => void;
 }) => Promise<void>, converterPool?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'agentor-isolated-converter-')), assets = join(directory, 'assets');
   await packageAssets(assets);
   const jobId = randomUUID(), installationId = randomUUID(), incarnation = randomUUID();
   const events: string[] = [], receipts: IncusImageConverterReceipt[] = [], commands: string[][] = [];
+  const execTimeouts: Array<number | undefined> = [];
   let instance: IncusInstance | undefined, failure: string | undefined, revoked = false;
   const expectedPool = converterPool || 'images';
   const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-images' });
@@ -93,6 +95,7 @@ async function fixture(run: (f: {
     expect(Buffer.isBuffer(bytes)).toBe(true); expect(options).toMatchObject({ uid: 0, gid: 0 });
   };
   client.execStream = async (_name, command, options) => {
+    execTimeouts.push(options?.timeoutMs);
     commands.push(command); expect(options?.environment && Object.keys(options.environment)).toEqual(command[0] === '/usr/bin/cat' ? undefined : ['PATH', 'LC_ALL']);
     if (command[0] === '/usr/bin/docker' && failure?.startsWith('stdin-')) {
       const stdout = new PassThrough(), stderr = new PassThrough(); stdout.resume();
@@ -131,7 +134,7 @@ async function fixture(run: (f: {
     } };
   const converter = new IncusImageConverter({ dataDir: directory, incusStoragePool: 'images',
     incusConverterStoragePool: converterPool, incusNetwork: 'image-network' }, client, docker, assets);
-  try { await run({ converter, input, directory, assets, events, receipts, commands,
+  try { await run({ converter, input, directory, assets, events, receipts, commands, client, execTimeouts,
     fail: at => { failure = at; }, revoke: () => { revoked = true; } }); }
   finally { client.dispose(); await rm(directory, { recursive: true, force: true }); }
 }
@@ -268,6 +271,71 @@ test('missing OCI exec result is bounded and cancellation interrupts the diagnos
   });
 });
 
+test('stalled readiness probe uses remaining budget and settles cancellation before exact cleanup', async () => {
+  for (const cancel of [false, true]) await fixture(async f => {
+    const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
+    const exec = f.client.execStream.bind(f.client), controller = new AbortController();
+    let offset = 0, started = false, shifted = false, cancellation: ReturnType<typeof setTimeout> | undefined;
+    f.client.startInstance = async (...args) => { await start(...args); started = true; };
+    f.client.getInstance = async (...args) => {
+      const current = await getInstance(...args);
+      if (started && !shifted) { shifted = true; offset = 119_900; }
+      return current;
+    };
+    f.client.execStream = async (...args) => {
+      const session = await exec(...args);
+      expect(args[1]).toEqual(['true']);
+      const signal = args[2]!.signal!;
+      session.result = new Promise<number>((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          f.events.push('ready-aborted');
+          setTimeout(() => { f.events.push('ready-settled'); reject(new Error('Probe cancelled')); }, 10);
+        }, { once: true });
+      });
+      session.close = () => { f.events.push('ready-closed'); };
+      if (cancel) cancellation = setTimeout(() => controller.abort(new Error('Readiness cancelled')), 5);
+      return session;
+    };
+    try {
+      Date.now = () => originalNow() + offset;
+      await expect(f.converter.convert({ ...f.input, signal: controller.signal })).rejects.toThrow(cancel ? 'Readiness cancelled' : 'guest agent did not become ready');
+    } finally { Date.now = originalNow; clearTimeout(cancellation); }
+    expect(f.execTimeouts).toHaveLength(1);
+    expect(f.execTimeouts[0]).toBeGreaterThan(0); expect(f.execTimeouts[0]).toBeLessThanOrEqual(100);
+    expect(f.events.indexOf('ready-aborted')).toBeLessThan(f.events.indexOf('ready-settled'));
+    expect(f.events.indexOf('ready-settled')).toBeLessThan(f.events.indexOf('ready-closed'));
+    expect(f.events.indexOf('ready-closed')).toBeLessThan(f.events.indexOf('stop'));
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+  });
+});
+
+test('readiness expiry avoids another probe and retry delay is abortable within its remaining budget', async () => {
+  for (const outcome of ['expired', 'sleep-expiry', 'sleep-abort']) await fixture(async f => {
+    const originalNow = Date.now, getInstance = f.client.getInstance.bind(f.client), start = f.client.startInstance.bind(f.client);
+    const exec = f.client.execStream.bind(f.client), controller = new AbortController();
+    let started = false, offset = 0, shifted = false, cancellation: ReturnType<typeof setTimeout> | undefined;
+    f.client.startInstance = async (...args) => { await start(...args); started = true; };
+    f.client.getInstance = async (...args) => {
+      const current = await getInstance(...args);
+      if (started && !shifted) { shifted = true; offset = outcome === 'expired' ? 120_001 : 119_950; }
+      return current;
+    };
+    f.client.execStream = async (...args) => {
+      await exec(...args);
+      if (outcome === 'sleep-abort') cancellation = setTimeout(() => controller.abort(), 5);
+      throw new Error('Guest agent unavailable');
+    };
+    const began = originalNow();
+    try {
+      Date.now = () => originalNow() + offset;
+      await expect(f.converter.convert({ ...f.input, signal: controller.signal })).rejects.toThrow(outcome === 'sleep-abort' ? /abort/i : 'guest agent did not become ready');
+    } finally { Date.now = originalNow; clearTimeout(cancellation); }
+    expect(originalNow() - began).toBeLessThan(400);
+    expect(f.execTimeouts).toHaveLength(outcome === 'expired' ? 0 : 1);
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+  });
+});
+
 test('unknown accepted create/start results retain exact private acknowledgement and never adopt/get/stop a guessed UUID', async () => {
   for (const phase of ['create', 'start']) await fixture(async f => {
     f.fail(phase + '-observer'); await expect(f.converter.convert(f.input)).rejects.toThrow('Lost accepted');
@@ -347,6 +415,9 @@ test('SAME raw-only bootstrap script produces no guest QCOW/metadata authority a
     expect(f.commands[identity]?.at(-1)).toBe(sourceId); expect(f.commands[identity]?.[2]).toContain('head -n 32');
     expect(f.commands[identity]?.[2]).not.toMatch(/docker pull|docker tag/);
     expect(f.commands.at(-1)).toEqual(['/usr/bin/cat', '/root/agentor-convert/output/disk.raw']);
+    expect(f.execTimeouts[0]).toBeGreaterThan(0); expect(f.execTimeouts[0]).toBeLessThanOrEqual(120_000);
+    expect(f.execTimeouts.slice(1, -1)).toEqual(Array(5).fill(45 * 60_000));
+    expect(f.execTimeouts.at(-1)).toBe(30 * 60_000);
     expect(f.receipts.at(-1)?.removed).toBe(true);
     const raw = join(f.directory, 'incus-image-converters/incus-image-' + f.input.jobId + '/disk.raw');
     expect((await lstat(raw)).size).toBe(65536); expect((await lstat(raw)).mode & 0o777).toBe(0o600);
