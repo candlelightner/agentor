@@ -535,6 +535,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         const record = structuredClone(input), ack = this.patch(record, acknowledge), instance = await this.assertOwned(record);
         if (instance.status === 'Running' || force && instance.status !== 'Stopped')
             await this.mutation(record, 'stop', ack, accepted => this.client.stopInstance(instance.name, force ? { force: true, timeout: 0 } : { timeout: 15 }, accepted));
+        if (force && (await this.assertOwned(record)).status !== "Stopped")
+            throw failure("Administrative emergency stop is not confirmed; refresh status before retrying");
         await this.register(record);
     }
     /** Explicit recovery may settle only an acknowledged terminal operation

@@ -119,7 +119,7 @@ test('legacy admin emergency stop refuses foreign labels and stops only the insp
     State: { Running: true, Paused: true }, Config: { Labels: { 'agentor.administrative': 'true', 'agentor.admin.workspace-id': record.id } } };
   const calls: unknown[] = [];
   runtime.docker = { getContainer: (id: string) => ({ inspect: async () => structuredClone(inspection),
-    kill: async (options: unknown) => { calls.push([id, options]); },
+    kill: async (options: unknown) => { calls.push([id, options]); inspection.State.Running = false; },
     stop: async () => { throw Error('Must bypass graceful stop'); } }) };
   runtime.registerServices = async () => {};
   await runtime.stop(record, undefined, true);
@@ -127,7 +127,15 @@ test('legacy admin emergency stop refuses foreign labels and stops only the insp
   runtime.docker.getContainer = () => ({ inspect: async () => structuredClone(inspection),
     kill: async () => { throw Object.assign(Error('Container immutable-admin is not running'), { statusCode: 409 }); } });
   await expect(runtime.stop(record, undefined, true)).resolves.toBeUndefined();
+  inspection.State.Running = true;
+  await expect(runtime.stop(record, undefined, true)).rejects.toMatchObject({ statusCode: 503 });
+  await expect(runtime.observeStatus(record)).rejects.toMatchObject({ statusCode: 503 });
+  inspection.State.Paused = false;
+  await expect(runtime.observeStatus(record)).resolves.toBe('running');
+  inspection.State.Running = false;
+  await expect(runtime.observeStatus(record)).resolves.toBe('stopped');
   inspection.Config.Labels['agentor.admin.workspace-id'] = 'foreign-admin';
   await expect(runtime.stop(record, undefined, true)).rejects.toMatchObject({ statusCode: 409 });
+  await expect(runtime.observeStatus(record)).rejects.toMatchObject({ statusCode: 409 });
   expect(calls).toHaveLength(1);
 });

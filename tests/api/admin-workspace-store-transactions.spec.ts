@@ -514,7 +514,7 @@ test("global admin status and duplicate actions return promptly while a lifecycl
 
 for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} admin memory settings reject unbounded values, persist desired limits and do not mutate runtime`, async () => {
   const global = new AdminWorkspaceStore('/unused', async () => {});
-  global.setRuntimeAdapter(runtime());
+  global.setRuntimeAdapter(runtime({ observeStatus: async () => { throw Error('Configured memory must not inspect runtime'); } }));
   await global.ensure();
   const fake = new FakeGroups(), { group } = groupRecord('memory-owner', 'memory-group');
   group.adminWorkspace!.runtimeKind = 'incus-vm';
@@ -581,4 +581,40 @@ test('emergency stops never provision absent administrative workspaces and pass 
   await groups.setStatus(groupId, 'stopped', undefined, true, workspace.id);
   expect(stopCalls).toEqual([true]);
   expect(fake.findById(groupId)?.adminWorkspace?.status).toBe('stopped');
+});
+
+
+for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} configured memory reads preserve pending native and lifecycle fences without runtime observation`, async () => {
+  const global = new AdminWorkspaceStore('/unused', async () => {});
+  const fake = new FakeGroups(), { group } = groupRecord('memory-fence-owner', 'memory-fence-group');
+  group.adminWorkspace!.runtimeKind = 'incus-vm';
+  fake.records.set(group.id, group);
+  const groups = new GroupAdminWorkspaceStore(fake as any, async (_owner, operation) => operation());
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const adapter = runtime({ stop: () => held, observeStatus: async () => { throw Error('Configured memory must not inspect runtime'); } });
+  global.setRuntimeAdapter(adapter); groups.setRuntimeAdapter(adapter);
+  await global.ensure();
+  const get = () => scoped ? groups.getResources(group.id) : global.getResources();
+  const set = () => scoped ? groups.setResources(group.id, '8GiB') : global.setResources('8GiB');
+  const record = () => scoped ? fake.records.get(group.id)!.adminWorkspace! : (global as any).record;
+  for (const native of [{ pending: { kind: 'stop' } }, { deleting: true }, { selectedOperation: { volumeId: 'pending-volume' } }]) {
+    record().nativeRuntime = native;
+    const before = structuredClone(record());
+    await expect(get()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(set()).rejects.toMatchObject({ statusCode: 503 });
+    expect(record()).toEqual(before);
+  }
+  delete record().nativeRuntime;
+  record().nativeMigration = { phase: 'planned' };
+  await expect(get()).rejects.toMatchObject({ statusCode: 503 });
+  await expect(set()).rejects.toMatchObject({ statusCode: 503 });
+  delete record().nativeMigration;
+  await expect(get()).resolves.toMatchObject({ memoryLimit: '4GiB' });
+  const stopping = scoped ? groups.setStatus(group.id, 'stopped') : global.setStatus('stopped');
+  try {
+    await expect(get()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(set()).rejects.toMatchObject({ statusCode: 409 });
+  } finally { release(); await stopping; }
+  await expect(get()).resolves.toMatchObject({ memoryLimit: '4GiB' });
 });

@@ -530,28 +530,47 @@ export class DockerAdminWorkspaceRuntime
     }
   }
 
+  private async inspectStopTarget(record: Readonly<AdministrativeWorkspaceRecord>, id?: string) {
+    const names = this.resources(record);
+    const inspection = await this.read("admin workspace inspect", this.docker.getContainer(id ?? names.container).inspect());
+    const labels = inspection.Config?.Labels ?? {};
+    if (id && inspection.Id !== id || inspection.Name !== `/${names.container}` ||
+        labels['agentor.administrative'] !== 'true' || labels['agentor.admin.workspace-id'] !== record.id ||
+        labels['agentor.admin.group-id'] !== names.groupId || record.imageDigest && inspection.Image !== record.imageDigest)
+      throw Object.assign(new Error("Administrative Docker ownership changed"), { statusCode: 409 });
+    return inspection;
+  }
+
+  async observeStatus(record: Readonly<AdministrativeWorkspaceRecord>): Promise<"running" | "stopped"> {
+    try {
+      const inspection = await this.inspectStopTarget(record);
+      if (inspection.State.Paused || inspection.State.Restarting)
+        throw Object.assign(new Error("Administrative runtime status is not settled; refresh status"), { statusCode: 503 });
+      return inspection.State.Running ? "running" : "stopped";
+    } catch (error: any) {
+      if (error?.statusCode === 404) return "stopped";
+      throw error;
+    }
+  }
+
   async stop(_record: Readonly<AdministrativeWorkspaceRecord>, _acknowledge?: AdminNativeAcknowledge, force = false): Promise<void> {
     try {
-      const container = this.docker.getContainer(
-        this.resources(_record).container,
-      );
-      const inspection = await this.read("admin workspace inspect", container.inspect());
-      if (force) {
-        const names = this.resources(_record), labels = inspection.Config?.Labels ?? {};
-        if (inspection.Name !== `/${names.container}` || labels['agentor.administrative'] !== 'true' ||
-            labels['agentor.admin.workspace-id'] !== _record.id || labels['agentor.admin.group-id'] !== names.groupId ||
-            _record.imageDigest && inspection.Image !== _record.imageDigest)
-          throw Object.assign(new Error("Administrative Docker ownership changed"), { statusCode: 409 });
+      let container = this.docker.getContainer(this.resources(_record).container);
+      const inspection = force ? await this.inspectStopTarget(_record)
+        : await this.read("admin workspace inspect", container.inspect());
+      if (force) container = this.docker.getContainer(inspection.Id);
+      if (inspection.State.Running) {
+        try {
+          await this.lifecycle("admin workspace stop", force ? container.kill({ signal: 'SIGKILL' }) : container.stop({ t: 15 }));
+        } catch (error: any) {
+          if (!(force && error?.statusCode === 409 && /container .* is not running/i.test(error.message ?? ''))) throw error;
+        }
       }
-      if (inspection.State.Running)
-        await this.lifecycle("admin workspace stop", force
-          ? this.docker.getContainer(inspection.Id).kill({ signal: 'SIGKILL' })
-          : container.stop({ t: 15 }));
+      if (force && (await this.inspectStopTarget(_record, inspection.Id)).State.Running)
+        throw Object.assign(new Error("Administrative emergency stop is not confirmed; refresh status before retrying"), { statusCode: 503 });
       await this.registerServices(_record, container);
     } catch (error: any) {
-      if (error?.statusCode !== 404 && error?.statusCode !== 304 &&
-          !(force && error?.statusCode === 409 && /container .* is not running/i.test(error.message ?? '')))
-        throw error;
+      if (error?.statusCode !== 404 && (force || error?.statusCode !== 304)) throw error;
     }
   }
 

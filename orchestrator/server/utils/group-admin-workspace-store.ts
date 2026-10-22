@@ -7,6 +7,7 @@ import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import type {
   AdminWorkspaceIdentityMaterializationIntent,
   AdminWorkspaceRuntimeAdapter,
+  AdminWorkspaceEmergencyRuntime,
   AdminWorkspaceStartupScriptRuntimeStatus,
   AdministrativeWorkspaceRecord,
 } from "./admin-workspace-store";
@@ -20,6 +21,7 @@ import type { WorkerGroup, WorkerGroupStore } from "./worker-group-store";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
 import {
   operationSettlement,
+  withOperationDeadline,
   type OperationFailureWithSettlement,
 } from "./operation-deadline";
 
@@ -38,6 +40,7 @@ type OwnerSerializer = <T>(
 
 export class GroupAdminWorkspaceStore {
   private runtime?: AdminWorkspaceRuntimeAdapter;
+  private emergencyRuntime?: AdminWorkspaceEmergencyRuntime;
   private identityMaterializer?: (
     record: GroupAdministrativeWorkspaceRecord,
     intent: AdminWorkspaceIdentityMaterializationIntent,
@@ -56,6 +59,9 @@ export class GroupAdminWorkspaceStore {
   ) {}
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
+  }
+  setEmergencyRuntimeAdapter(runtime: AdminWorkspaceEmergencyRuntime) {
+    this.emergencyRuntime = runtime;
   }
   setIdentityMaterializer(
     materializer: (
@@ -227,7 +233,9 @@ export class GroupAdminWorkspaceStore {
         throw Object.assign(new Error('Group administrative workspace operation is not settled; retry'), { statusCode: 503 });
       if (!record)
         throw Object.assign(new Error('Group administrative workspace not provisioned'), { statusCode: 404 });
-      const status = await this.runtime?.observeStatus?.(record) ?? record.status;
+      const runtime = this.runtime ?? this.emergencyRuntime;
+      if (!runtime) this.requireRuntime();
+      const status = await runtime?.observeStatus?.(record) ?? record.status;
       authorize?.();
       if (this.running.has(groupId) || this.pendingCommits.has(groupId) || !isDeepStrictEqual(record, this.record(groupId)))
         throw Object.assign(new Error('Group administrative workspace changed during status inspection; refresh status'), { statusCode: 503 });
@@ -297,10 +305,12 @@ export class GroupAdminWorkspaceStore {
     force = false,
     expectedId?: string,
   ) {
-    return this.run(groupId, () =>
+    const emergency = force && status === "stopped";
+    const result = this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
-        this.requireRuntime();
+        const runtime = this.runtime ?? (emergency ? this.emergencyRuntime : undefined);
+        if (!runtime) this.requireRuntime();
         if (expectedId && this.record(groupId)?.id !== expectedId)
           throw Object.assign(new Error("Group administrative workspace identity changed"), { statusCode: 409 });
         const operation = force ? "emergency-stop" : `status:${status}`;
@@ -319,7 +329,7 @@ export class GroupAdminWorkspaceStore {
           throw Object.assign(new Error("Group administrative workspace is not provisioned"), { statusCode: 404 });
         if (!this.record(groupId)) await this.ensureLocked(group);
         const record = this.record(groupId)!;
-        if (this.runtime) {
+        if (runtime) {
           if (status === "running") {
             if (this.identityMaterializer)
               await this.identityMaterializer(
@@ -328,21 +338,22 @@ export class GroupAdminWorkspaceStore {
               );
             this.applyImage(
               record,
-              await this.runtime.start(structuredClone(record), this.nativeAcknowledge(record)),
+              await (runtime as AdminWorkspaceRuntimeAdapter).start(structuredClone(record), this.nativeAcknowledge(record)),
             );
             await this.identityMaterializer?.(
               structuredClone(record),
               "refresh-running",
             );
-          } else await this.runtime.stop(structuredClone(record), this.nativeAcknowledge(record), force);
+          } else await runtime.stop(structuredClone(record), this.nativeAcknowledge(record), force);
         }
         record.status = status;
         record.updatedAt = new Date().toISOString();
-        if (this.runtime) await this.commitExternal(operation, record);
+        if (runtime) await this.commitExternal(operation, record);
         else await this.save(record);
         return this.publicRecord(record);
       }),
     );
+    return emergency ? withOperationDeadline(result, 15_000, "Group administrative emergency stop") : result;
   }
   async rebuild(groupId: string, ownerId?: string, authorize?: () => void) {
     return this.run(groupId, () =>

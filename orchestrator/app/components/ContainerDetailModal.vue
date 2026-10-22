@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import type { ContainerInfo, PortMapping, DomainMapping, RepoConfig, MountConfig, UpdateContainerSettingsRequest } from '~/types';
 import type { AppInstanceInfo } from '../../shared/types';
+import { effectiveIncusWorkerMemoryLimit, incusWorkerMemoryLimit, type WorkerMemoryPolicy } from '../../shared/worker-memory';
+import { formatBytes } from '../utils/format';
 
 type BadgeColor = 'primary' | 'secondary' | 'success' | 'info' | 'warning' | 'error' | 'neutral';
 
@@ -23,11 +25,29 @@ const open = defineModel<boolean>('open', { default: false });
 
 const { gitProviders } = useGitProviders();
 const { environments, defaultEnvironmentId } = useEnvironments();
+const { data: workerMemoryPolicy } = useFetch<WorkerMemoryPolicy>('/api/worker-memory-policy');
 const { initScripts } = useInitScripts();
 const hostMounts = useHostMounts();
 const hardwareDevices = useHardwareDevices();
 
 const displayLabel = computed(() => props.container.displayName || shortName(props.container.id));
+const configuredRam = computed(() => {
+  const environmentId = props.container.environmentId || defaultEnvironmentId.value;
+  const environment = environments.value.find((item) => item.id === environmentId);
+  const policy = workerMemoryPolicy.value;
+  if (!environment || !policy) return 'Unavailable';
+
+  try {
+    const cap = environment.memoryLimit || policy.defaultMemoryLimit || undefined;
+    const memory = props.container.runtimeKind === 'incus-vm'
+      ? effectiveIncusWorkerMemoryLimit(cap, policy.incusDefaultMemoryLimit)
+      : incusWorkerMemoryLimit(cap);
+    if (!memory) return 'Uncapped';
+    return /^\d+$/.test(memory) ? formatBytes(Number(memory), true) : memory;
+  } catch {
+    return 'Unavailable';
+  }
+});
 
 // ─── Editable settings form ──────────────────────────────────────────────
 // `displayName` is a live edit (applied without rebuild). `environmentId`,
@@ -335,6 +355,14 @@ const formattedCreatedAt = computed(() => {
                 <UBadge color="warning" variant="subtle" size="xs">requires rebuild</UBadge>
               </div>
               <USelect v-model="form.environmentId" :items="environmentOptions" class="w-full" />
+            </div>
+
+            <div data-testid="worker-configured-ram">
+              <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Configured RAM</label>
+              <p class="text-sm text-gray-900 dark:text-white">{{ configuredRam }}</p>
+              <p class="mt-1 text-xs text-gray-500">
+                Saved environment setting; RAM changes apply on create or rebuild.
+              </p>
             </div>
 
             <!-- Repositories (rebuild) -->

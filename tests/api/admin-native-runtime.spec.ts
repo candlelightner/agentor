@@ -1174,6 +1174,9 @@ test('emergency administrative stop forces frozen compute and preserves native o
         expect(calls).toEqual([{ force: true, timeout: 0 }]);
         expect(f.record.nativeRuntime?.pending).toBeUndefined();
         expect(f.instance.status).toBe('Stopped');
+        f.instance.status = 'Running';
+        f.client.stopInstance = async () => {};
+        await expect(f.runtime.stop(f.record, f.ack, true)).rejects.toThrow('not confirmed');
         f.record.nativeRuntime!.pending = { kind: 'start' };
         await expect(f.runtime.stop(f.record, f.ack, true)).rejects.toThrow();
         expect(calls).toHaveLength(1);

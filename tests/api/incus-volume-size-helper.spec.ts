@@ -169,9 +169,13 @@ test('offline mount preflight rejects dirty ext4, journal recovery and writable 
       const fixture = `systemctl(){ return 1; }; blockdev(){ echo ${condition === 'writable' ? '0' : '1'}; }; blkid(){ echo ext4; };
 dumpe2fs(){ printf 'Filesystem state:     ${state}\\nFilesystem features:  ${features}\\n'; };
 mkdir(){ :; }; mount(){ echo mounted; }; mountpoint(){ :; }; findmnt(){ echo ro,noload; };\n`;
-      // CI does not grant a real test block device. Replace only device-kind
-      // checks; execute the production clean/journal/RO gates unchanged.
-      const script = fixture + INCUS_OFFLINE_SCAN_MOUNT.replace('/dev/disk/by-id/*incus_docker*', JSON.stringify(fakeDevice)).replaceAll('test -b', 'test -f');
+      // CI does not grant a real test block device, and this fixture runs on a
+      // provisioned worker. Isolate only those environment observations;
+      // execute the production clean/journal/RO gates unchanged.
+      const script = fixture + INCUS_OFFLINE_SCAN_MOUNT
+        .replace('test ! -e /run/agentor/provisioned\n', ': # fixture models an unprovisioned guest\n')
+        .replace('/dev/disk/by-id/*incus_docker*', JSON.stringify(fakeDevice))
+        .replaceAll('test -b', 'test -f');
       let code = 0, output = '';
       try { output = execFileSync('bash', ['-ec', script, 'offline-test', 'block', 'console.log("scanned")']).toString(); }
       catch (error: any) { code = error.status; output = error.stdout.toString(); }

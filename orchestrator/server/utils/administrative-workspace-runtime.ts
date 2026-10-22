@@ -41,7 +41,7 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
         return { name: record.imageName ?? '', digest: container.Image };
     }
     async observeStatus(record: Readonly<AdministrativeWorkspaceRecord>) {
-        return this.isNative(record) ? this.native.observeStatus(record) : record.status;
+        return this.isNative(record) ? this.native.observeStatus(record) : this.legacy.observeStatus(record);
     }
     async getCpuSettings(record: Readonly<AdministrativeWorkspaceRecord>) {
         if (!this.isNative(record)) return this.migrationRequired();

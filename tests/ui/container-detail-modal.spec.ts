@@ -151,11 +151,14 @@ test.describe.serial('Worker Settings Modal', () => {
     await expect(reopenedLock).toContainText('off');
   });
 
-  test('does NOT show environment-specific sections', async ({ page }) => {
+  test('shows configured RAM read-only without exposing environment resource editors', async ({ page }) => {
     const dialog = await openModal(page);
-    // CPU/Memory/Docker/Network/Capabilities/etc. belong to the environment modal
+    const ram = dialog.getByTestId('worker-configured-ram');
+    await expect(ram).toBeVisible();
+    await expect(ram.locator('input')).toHaveCount(0);
+    await expect(ram.locator('select')).toHaveCount(0);
+    // Other CPU/Docker/Network/Capabilities settings remain in the environment editor.
     await expect(dialog.getByText('CPU Limit', { exact: true })).toHaveCount(0);
-    await expect(dialog.getByText('Memory Limit', { exact: true })).toHaveCount(0);
     await expect(dialog.getByText('Network', { exact: true })).toHaveCount(0);
     await expect(dialog.getByText('Setup Script', { exact: true })).toHaveCount(0);
     await expect(dialog.getByText('Exposed Worker APIs', { exact: true })).toHaveCount(0);
