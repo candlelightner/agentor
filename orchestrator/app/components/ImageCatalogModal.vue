@@ -27,6 +27,9 @@ const selected = ref(""),
   actionError = ref(""),
   rebuildBase = ref("agentor-worker:approved-latest");
 const editingId = ref("");
+const clock = ref(Date.now());
+let elapsedTimer: ReturnType<typeof setInterval> | undefined;
+function stopElapsedTimer() { clearInterval(elapsedTimer); elapsedTimer = undefined; }
 const expandedLogs = reactive<Record<string, boolean>>({});
 const testJobs = reactive<
   Record<string, { status?: string; workerId?: string; message?: string }>
@@ -95,12 +98,15 @@ async function saveReadinessTimeout() {
 watch(open, (shown) => {
   if (shown) {
     api.start();
+    clock.value = Date.now();
+    stopElapsedTimer();
+    elapsedTimer = setInterval(() => { clock.value = Date.now(); }, 1000);
     readinessTimeoutDraft.value = null;
     readinessTimeoutSaved.value = false;
     void loadReadinessTimeout();
-  } else api.stop();
+  } else { api.stop(); stopElapsedTimer(); }
 });
-onBeforeUnmount(api.stop);
+onBeforeUnmount(() => { api.stop(); stopElapsedTimer(); });
 const current = computed(
   () =>
     api.definitions.value.find((d) => d.id === selected.value) ||
@@ -352,6 +358,29 @@ function versionState(v: any) {
   if (raw.includes("cancel"))
     return { key: "cancelled", label: "Cancelled", icon: "×" };
   return { key: "ready", label: "Ready", icon: "✓" };
+}
+const nativeStageLabels: Record<string, string> = {
+  'checking-source': 'Checking source image', 'creating-converter': 'Creating isolated converter',
+  'starting-converter': 'Starting converter', 'waiting-for-agent': 'Waiting for converter agent',
+  'preparing-tools': 'Preparing conversion tools', 'copying-bootstrap': 'Copying worker bootstrap',
+  'checking-space': 'Checking converter disk space', 'transferring-source': 'Transferring source image',
+  'checking-source-image': 'Checking transferred image', 'converting-disk': 'Converting worker disk',
+  'receiving-disk': 'Receiving converted disk', 'removing-converter': 'Removing converter',
+  'normalizing-image': 'Normalizing VM image', 'preparing-image-metadata': 'Preparing VM metadata',
+  'importing-vm': 'Importing VM image', 'publishing-image': 'Publishing verified image',
+};
+function nativeStage(phase: string) { return nativeStageLabels[phase] || phase; }
+function elapsed(start?: string, end?: string) {
+  if (!start || !Number.isFinite(Date.parse(start))) return 'unavailable';
+  const stop = end ? Date.parse(end) : clock.value;
+  if (!Number.isFinite(stop)) return 'unavailable';
+  const seconds = Math.max(0, Math.floor((stop - Date.parse(start)) / 1000));
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+function nativeElapsed(b: any) {
+  // Terminal jobs must never keep accumulating elapsed time after a reopen.
+  if (!['queued', 'running'].includes(b.status) && !b.completedAt) return 'unavailable';
+  return elapsed(b.startedAt, b.completedAt);
 }
 function buildState(b: any) {
   const phase = String(b?.phase || "").toLowerCase(),
@@ -1107,8 +1136,19 @@ function close() {
               <div class="flex justify-between" aria-live="polite">
                 <b :data-testid="`image-build-status-${b.id}`"
                   ><span aria-hidden="true">{{ buildState(b).icon }}</span>
-                  {{ buildState(b).label }} · {{ b.phase }}</b
+                  {{ b.nativeActivity && b.status === 'succeeded' ? 'Image prepared' : buildState(b).label }} · {{ b.nativeActivity ? nativeStage(b.phase) : b.phase }}</b
                 ><span>{{ b.durationMs ? `${b.durationMs} ms` : "" }}</span>
+              </div>
+              <div v-if="b.nativeActivity" class="text-xs mt-2" data-testid="native-image-activity">
+                <p>Native image preparation · Elapsed: {{ nativeElapsed(b) }}</p>
+                <template v-if="['queued', 'running'].includes(b.status)">
+                  <progress aria-label="Native image preparation in progress" class="w-full" />
+                  <p>Current stage: {{ nativeStage(b.nativeActivity.phase) }} · {{ elapsed(b.nativeActivity.phaseStartedAt) }}</p>
+                  <p>Progress is indeterminate; no measured converter activity is reported.</p>
+                  <p v-if="b.nativeActivity.waitingAt">Controller still waiting as of {{ new Date(b.nativeActivity.waitingAt).toLocaleTimeString() }}. This confirms the controller is waiting, not that conversion advanced.</p>
+                </template>
+                <p v-else-if="b.status === 'succeeded'">Image prepared. Worker startup is a separate operation.</p>
+                <p v-else>Last observed stage: {{ nativeStage(b.nativeActivity.phase) }}. {{ b.recovery === 'restart-failed-safe' ? 'Interrupted by server restart; refresh status and review logs before recovery.' : 'Review logs before retrying; cleanup may be needed.' }}</p>
               </div>
               <p v-if="b.error" class="text-red-600">{{ b.error }}</p>
               <p

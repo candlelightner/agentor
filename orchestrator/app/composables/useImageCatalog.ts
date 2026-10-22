@@ -89,6 +89,10 @@ export interface ImageBuild {
   digest?: string;
   error?: string;
   durationMs?: number;
+  startedAt?: string;
+  completedAt?: string;
+  recovery?: string;
+  nativeActivity?: { progressMode: 'indeterminate'; phase: string; phaseStartedAt: string; waitingAt?: string };
   cache?: { enabled: boolean; hits: number };
   dockerAttempted?: boolean;
   imageCreated?: boolean;

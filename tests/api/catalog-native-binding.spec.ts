@@ -16,12 +16,12 @@ const definitionInput = { name: 'Controlled source', description: '', baseImage:
 
 async function fixture(cold = false) {
   const root = await mkdtemp(join(tmpdir(), 'catalog-native-binding-'));
-  let failWrite = false, revoked = false, inspections = 0, actualImageId = digest, holdWrite: Promise<void> | undefined;
+  let writes = 0, failWrite = false, revoked = false, inspections = 0, actualImageId = digest, holdWrite: Promise<void> | undefined;
   const path = join(root, 'image-catalog.json');
   const manager = new (cold ? ImageCatalogCore : ImageCatalogManager)(root, async state => {
     if (holdWrite) await holdWrite;
     if (failWrite) throw new Error('Controlled private catalog persistence failure');
-    await writeFile(path, JSON.stringify(state), { mode: 0o600 });
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 }); writes++;
   });
   await manager.init();
   const owner = 'fixture-owner', definition = await manager.create(owner, definitionInput);
@@ -51,7 +51,7 @@ async function fixture(cold = false) {
     await manager.acknowledgeNativeImageImport(id, { pending: false, operation, fingerprint: identity.fingerprint }, validate);
   };
   return { manager, owner, definition, state, context, identity, path, root, validate, authorize, receipt, imported,
-    fail: (value: boolean) => { failWrite = value; }, revoke: () => { revoked = true; }, inspections: () => inspections,
+    writes: () => writes, fail: (value: boolean) => { failWrite = value; }, revoke: () => { revoked = true; }, inspections: () => inspections,
     actualImage: (value: string) => { actualImageId = value; },
     holdWrite: (value: Promise<void> | undefined) => { holdWrite = value; },
     cleanup: () => rm(root, { recursive: true, force: true }) };
@@ -99,6 +99,7 @@ test('operator failed-abandonment survives catalog reload, permits authorized re
 
 test('failed native conversion retains bounded sanitized cause logs and unchanged exact acknowledgements', async () => {
   const f = await fixture(true); try {
+    f.manager.setNativeDiagnosticLogger({ info() { throw Error('Private log sink failure'); }, warn() { throw Error('Private log sink failure'); } });
     const source = await f.authorize(); let id = '', acknowledged: IncusImageConverterReceipt | undefined;
     const failure = new Error('Isolated converter raw-convert failed (exit 37):\nAPI_KEY=PRIVATE_API_SENTINEL PASSWORD=PRIVATE_PASSWORD_SENTINEL ' +
       'authorization: Bearer PRIVATE_BEARER_SENTINEL authorization: Basic PRIVATE_BASIC_SENTINEL /var/run/docker.sock https://reader:PRIVATE_URL_SENTINEL@private.example/path ' +
@@ -535,4 +536,136 @@ test('application recovery reads existing installation identity without creating
     await expect(readFile(join(f.root, 'backup-installation-id'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(calls).toBe(0);
   } finally { Object.assign(config, previous); IncusImageConverter.cleanup = original; await f.cleanup(); }
+});
+
+
+test('native phases and bounded waiting are durable indeterminate observations, with owner-scoped public projections and official logs', async () => {
+  const f = await fixture(true);
+  const { Logger } = await import('../../orchestrator/server/utils/logger');
+  const entries: any[] = [], broadcast: any[] = [];
+  const logger = new Logger({ logLevel: 'info' } as any, { append: entry => entries.push(entry) } as any,
+    { broadcast: entry => broadcast.push(entry) } as any); logger.setReady();
+  f.manager.setNativeDiagnosticLogger(logger);
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.manager.reportNativeImagePhase(id, 'converting-disk');
+    const build = f.manager.build(id, f.owner, false);
+    const phaseStartedAt = new Date(Date.now() - 20_000).toISOString();
+    build.nativeActivity!.phaseStartedAt = phaseStartedAt;
+    const beforeWaiting = f.writes();
+    await f.manager.noteNativeImageWaiting(id);
+    const activity = structuredClone(build.nativeActivity);
+    expect(activity).toEqual({ progressMode: 'indeterminate', phase: 'converting-disk', phaseStartedAt,
+      waitingAt: expect.any(String) });
+    expect(f.writes()).toBe(beforeWaiting + 1);
+    const written = f.writes();
+    await f.manager.noteNativeImageWaiting(id);
+    await f.manager.reportNativeImagePhase(id, 'converting-disk');
+    for (let i = 0; i < 3; i++) f.manager.publicBuild(id, f.owner, false);
+    expect(f.writes()).toBe(written); // Reads/repeated observations do not create activity or writes.
+    expect(f.manager.publicBuild(id, f.owner, false)).toMatchObject({ status: 'running', phase: 'converting-disk', nativeActivity: activity });
+    expect(f.manager.publicBuild(id, f.owner, false)).not.toHaveProperty('progress');
+    expect(f.manager.publicBuild(id, f.owner, false)).not.toHaveProperty('nativeDerivation');
+    expect(f.manager.publicBuild(id, f.owner, false)).not.toHaveProperty('logs');
+    expect(() => f.manager.publicBuild(id, 'foreign-owner', false)).toThrow();
+    expect(f.manager.publicBuilds('foreign-owner', false)).toEqual([]);
+    expect(f.manager.publicBuild(id, 'operator', true).nativeActivity).toEqual(activity);
+    expect(JSON.parse(await readFile(f.path, 'utf8')).builds.find(item => item.id === id).nativeActivity).toEqual(activity);
+    expect(entries).toEqual(broadcast);
+    expect(entries.map(entry => entry.message).join('\n')).toContain(`job=${id} phase=converting-disk elapsedMs=`);
+    expect(entries.at(-1).message).toContain('Controller still waiting; no measured converter progress is available.');
+    expect(f.manager.logs(id, f.owner, false)).toContain('Entered stage: converting-disk; progress is indeterminate.');
+    await f.manager.reportNativeImagePhase(id, 'receiving-disk');
+    expect(f.manager.build(id, f.owner, false).nativeActivity).not.toHaveProperty('waitingAt');
+    await f.imported(id);
+    await f.manager.reportNativeImagePhase(id, 'publishing-image');
+    await f.manager.publishNativeImageBinding(id, f.identity, 'agentor-storage-ownership-v1', f.validate);
+    const settled = structuredClone(f.manager.publicBuild(id, f.owner, false)), settledWrites = f.writes();
+    await f.manager.reportNativeImagePhase(id, 'waiting-for-agent');
+    await f.manager.noteNativeImageWaiting(id);
+    expect(f.manager.publicBuild(id, f.owner, false)).toEqual(settled);
+    expect(f.writes()).toBe(settledWrites);
+    expect(settled).not.toHaveProperty('progress');
+    expect(entries.at(-1).message).toContain('worker startup is a separate operation');
+  } finally { await f.cleanup(); }
+});
+
+test('phase persistence rollback and restart retain exact authority without resuming or inventing completed work', async () => {
+  const f = await fixture(true);
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.manager.acknowledgeNativeConverter(id, { ...f.receipt(id), removed: undefined });
+    const before = structuredClone(f.manager.build(id, f.owner, false)), bytes = await readFile(f.path, 'utf8');
+    f.fail(true);
+    await expect(f.manager.reportNativeImagePhase(id, 'converting-disk')).rejects.toThrow('persistence failure');
+    expect(f.manager.build(id, f.owner, false)).toEqual(before);
+    expect(await readFile(f.path, 'utf8')).toBe(bytes);
+    f.fail(false);
+    await f.manager.reportNativeImagePhase(id, 'converting-disk');
+    const activity = structuredClone(f.manager.publicBuild(id, f.owner, false).nativeActivity);
+    const loaded = new ImageCatalogCore(f.root); await loaded.init();
+    expect(loaded.publicBuild(id, f.owner, false)).toMatchObject({ status: 'failed', phase: 'failed',
+      recovery: 'restart-failed-safe', completedAt: expect.any(String), nativeActivity: activity });
+    expect(loaded.publicBuild(id, f.owner, false)).not.toHaveProperty('progress');
+    expect(loaded.build(id, f.owner, false).nativeDerivation).toEqual(before.nativeDerivation);
+    const after = structuredClone(loaded.publicBuild(id, f.owner, false));
+    await loaded.reportNativeImagePhase(id, 'receiving-disk'); await loaded.noteNativeImageWaiting(id);
+    expect(loaded.publicBuild(id, f.owner, false)).toEqual(after);
+  } finally { await f.cleanup(); }
+});
+
+test('malformed or ordinary-build telemetry is discarded without weakening strict native receipt validation', async () => {
+  const f = await fixture(true);
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    const original = JSON.parse(await readFile(f.path, 'utf8'));
+    const valid = { progressMode: 'indeterminate', phase: 'converting-disk', phaseStartedAt: stamp };
+    for (const activity of [{ ...valid, phase: 'guest-selected-stage\nSECRET' },
+      { ...valid, phaseStartedAt: 'invalid' }, { ...valid, phaseStartedAt: '2026-02-30T00:00:00.000Z' },
+      { ...valid, waitingAt: '2026-10-05T00:00:00.000Z' }, { ...valid, progressMode: 'percent', percent: 99 }]) {
+      const state = structuredClone(original);
+      state.builds.find(item => item.id === id).nativeActivity = activity;
+      state.builds[0].nativeActivity = valid;
+      await writeFile(f.path, JSON.stringify(state));
+      const loaded = new ImageCatalogCore(f.root); await loaded.init();
+      expect(loaded.publicBuild(id, f.owner, false).nativeActivity).toBeUndefined();
+      expect(loaded.publicBuild(state.builds[0].id, f.owner, false).nativeActivity).toBeUndefined();
+      expect(loaded.build(id, f.owner, false).nativeDerivation).toEqual(original.builds.find(item => item.id === id).nativeDerivation);
+    }
+  } finally { await f.cleanup(); }
+});
+
+test('actual authenticated REST status and MCP status preserve indeterminate telemetry and never expose private receipts', async () => {
+  const f = await fixture(true);
+  const { useImageCatalogManager } = await import('../../orchestrator/server/utils/image-catalog');
+  const { ManagementImageBackupDomain } = await import('../../orchestrator/server/utils/management-image-backup-domain');
+  const manager = useImageCatalogManager(), originalInit = manager.init, originalPublic = manager.publicBuild;
+  const globals = globalThis as any;
+  const values = { defineRouteMeta: () => {}, defineEventHandler: (handler: unknown) => handler,
+    getRouterParam: (event: any) => event.path,
+    createError: (value: any) => Object.assign(Error(value.statusMessage), value) };
+  const descriptors = Object.fromEntries(Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globals, key)]));
+  Object.assign(globals, values); manager.init = async () => {}; manager.publicBuild = f.manager.publicBuild.bind(f.manager);
+  try {
+    const source = await f.authorize(), id = await f.manager.openNativeImageDerivation(source, f.context, f.validate);
+    await f.manager.reportNativeImagePhase(id, 'converting-disk');
+    const route = (await import('../../orchestrator/server/api/image-builds/[...path]')).default as any;
+    const event = { method: 'GET', path: id, context: { auth: { user: { id: f.owner, role: 'user' }, session: {} } } };
+    await expect(route({ ...event, context: {} })).rejects.toMatchObject({ statusCode: 401 });
+    await expect(route({ ...event, context: { auth: { user: { id: 'foreign-owner', role: 'user' }, session: {} } } })).rejects.toMatchObject({ statusCode: 403 });
+    const rest = await route(event);
+    const mcp = (await new ManagementImageBackupDomain().execute('images.build-status', { ownerId: f.owner, buildId: id })).result;
+    for (const result of [rest, mcp]) {
+      expect(result).toMatchObject({ id, status: 'running', nativeActivity: { progressMode: 'indeterminate', phase: 'converting-disk' } });
+      expect(result).not.toHaveProperty('progress'); expect(result).not.toHaveProperty('nativeDerivation'); expect(result).not.toHaveProperty('logs');
+    }
+    expect(mcp.nextActions.status.arguments).toEqual({ buildId: id });
+    expect(mcp.nextActions.logs.arguments).toEqual({ buildId: id });
+  } finally {
+    manager.init = originalInit; manager.publicBuild = originalPublic;
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (descriptor) Object.defineProperty(globals, key, descriptor); else delete globals[key];
+    }
+    await f.cleanup();
+  }
 });

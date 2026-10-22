@@ -106,3 +106,78 @@ test('failed settings load shows no default and can be retried', async ({ page }
   await expect(input).toHaveValue('240');
   await expect(settings.getByRole('alert')).toHaveCount(0);
 });
+
+const nativeBuild = (startedAt: string) => ({ id: 'native-build', definitionId: 'controlled-definition', status: 'running',
+  phase: 'waiting-for-agent', startedAt, nativeActivity: { progressMode: 'indeterminate', phase: 'waiting-for-agent', phaseStartedAt: startedAt } });
+
+async function mockNativeBuild(page: any, current: () => any) {
+  await mockCatalog(page);
+  await page.route('**/api/image-builder/settings', route => route.fulfill({ json: { agentReadyTimeoutSeconds: 120 } }));
+  await page.route('**/api/image-builds', route => route.fulfill({ json: [current()] }));
+  await page.route('**/api/image-builds/native-build', route => route.fulfill({ json: current() }));
+  await page.route('**/api/image-builds/native-build/logs?**', route => route.fulfill({ json: {
+    text: '[native converter] Controller still waiting; no measured converter progress is available.', nextCursor: 1,
+  } }));
+}
+
+test('actual catalog shows trusted stages and waiting separately, refreshes logs, and recovers the same job after reopen', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-10-22T12:02:00.000Z') });
+  let build: any = nativeBuild('2026-10-22T12:00:00.000Z');
+  await mockNativeBuild(page, () => build);
+  await page.goto(url);
+  const job = page.getByTestId('image-build'), activity = job.getByTestId('native-image-activity');
+  await expect(job).toHaveCount(1);
+  await expect(activity).toContainText('Elapsed: 2m 0s');
+  await expect(activity).toContainText('Current stage: Waiting for converter agent');
+  const progress = job.getByRole('progressbar', { name: 'Native image preparation in progress' });
+  await expect(progress).toHaveCount(1);
+  expect(await progress.getAttribute('value')).toBeNull();
+  await expect(activity).toContainText('Progress is indeterminate');
+  await expect(activity).not.toContainText('%');
+  await page.clock.fastForward(3000);
+  await expect(activity).toContainText('Elapsed: 2m 3s');
+  build = { ...build, phase: 'converting-disk', nativeActivity: { progressMode: 'indeterminate', phase: 'converting-disk',
+    phaseStartedAt: '2026-10-22T12:02:03.000Z', waitingAt: '2026-10-22T12:02:18.000Z' } };
+  await page.clock.fastForward(16_000);
+  await expect(activity).toContainText('Current stage: Converting worker disk');
+  await expect(activity).toContainText('Controller still waiting as of');
+  await expect(activity).toContainText('not that conversion advanced');
+  await job.getByRole('button', { name: 'Show logs for native-build' }).click();
+  await expect(job.locator('pre')).toContainText('no measured converter progress');
+  await page.evaluate(() => (window as any).showImageCatalog(false));
+  await expect(job).toHaveCount(0);
+  build = { ...build, phase: 'importing-vm', nativeActivity: { progressMode: 'indeterminate', phase: 'importing-vm',
+    phaseStartedAt: '2026-10-22T12:02:19.000Z' } };
+  await page.clock.fastForward(5000);
+  await page.evaluate(() => (window as any).showImageCatalog(true));
+  await expect(job).toHaveCount(1);
+  await expect(activity).toContainText('Current stage: Importing VM image');
+  await expect(activity).not.toContainText('Controller still waiting');
+  await expect(page.getByTestId('image-build-status-native-build')).toContainText('Importing VM image');
+});
+
+test('image success freezes elapsed and does not claim worker readiness; restart failure keeps last stage without a running bar', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-10-22T12:20:00.000Z') });
+  let build: any = { ...nativeBuild('2026-10-22T12:00:00.000Z'), status: 'succeeded', phase: 'complete',
+    completedAt: '2026-10-22T12:03:10.000Z', nativeActivity: { progressMode: 'indeterminate', phase: 'publishing-image',
+      phaseStartedAt: '2026-10-22T12:03:00.000Z' } };
+  await mockNativeBuild(page, () => build);
+  await page.goto(url);
+  const job = page.getByTestId('image-build'), activity = job.getByTestId('native-image-activity');
+  await expect(activity).toContainText('Elapsed: 3m 10s');
+  await expect(activity).toContainText('Image prepared. Worker startup is a separate operation.');
+  await expect(page.getByTestId('image-build-status-native-build')).toContainText('Image prepared');
+  await expect(job.getByRole('progressbar')).toHaveCount(0);
+  await page.clock.fastForward(60_000);
+  await expect(activity).toContainText('Elapsed: 3m 10s');
+  await page.evaluate(() => (window as any).showImageCatalog(false));
+  build = { ...build, status: 'failed', phase: 'failed', recovery: 'restart-failed-safe',
+    error: 'Native derivation interrupted; acknowledged converter/import authority is retained.',
+    nativeActivity: { progressMode: 'indeterminate', phase: 'converting-disk', phaseStartedAt: '2026-10-22T12:01:00.000Z' } };
+  await page.evaluate(() => (window as any).showImageCatalog(true));
+  await expect(activity).toContainText('Last observed stage: Converting worker disk');
+  await expect(activity).toContainText('Interrupted by server restart; refresh status and review logs before recovery.');
+  await expect(activity).toContainText('Elapsed: 3m 10s');
+  await expect(job.getByRole('progressbar')).toHaveCount(0);
+  await expect(activity).not.toContainText('%');
+});
