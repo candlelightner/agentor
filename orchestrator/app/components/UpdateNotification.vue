@@ -46,6 +46,38 @@ const imageList = computed<{ info: ImageUpdateInfo; key: UpdatableImage }[]>(() 
 );
 
 const anyApplyingImage = computed(() => applyingImages.value.size > 0);
+function imageHelp(info: ImageUpdateInfo, key: UpdatableImage): string {
+  const localReasonText: Record<string, string> = {
+    timeout: 'the check timed out',
+    'permission-denied': 'permission was denied',
+    'transport-error': 'Docker could not be reached',
+  };
+  const local = info.localDigestStatus === 'missing'
+    ? (key === 'traefik'
+        ? 'Traefik is not present locally; Agentor pulls it when it needs to start port or domain routing.'
+        : 'This image is confirmed absent from the local Docker image store.')
+    : info.localDigestStatus === 'unavailable'
+      ? `Local image presence could not be checked (${localReasonText[info.localDigestReason ?? ''] ?? 'inspection failed'}).`
+      : info.localDigestStatus === 'present' && !info.localDigest
+        ? 'Docker reports this image is present, but no digest or image ID is available for version comparison.'
+        : !info.localDigestStatus && !info.localDigest
+          ? 'Local image status is unknown; this response does not include a confirmed inspection result.'
+          : '';
+  const remote = info.remoteCheckStatus === 'disabled'
+    ? 'Remote registry checks are disabled; a local digest does not mean this image is current.'
+    : info.remoteCheckStatus === 'pending'
+      ? 'The remote registry check has not completed.'
+      : info.remoteCheckStatus === 'unavailable'
+        ? 'The remote registry could not be checked, so update status is unknown.'
+      : info.error
+        ? 'Image update status could not be completed.'
+        : info.remoteCheckStatus === 'checked' && !info.remoteDigest
+          ? 'The registry check completed without a comparable digest.'
+          : !info.remoteCheckStatus && info.localDigest
+            ? 'Remote check status is unknown; the local digest does not confirm that this image is current.'
+            : '';
+  return [local, remote].filter(Boolean).join(' ');
+}
 </script>
 
 <template>
@@ -84,19 +116,29 @@ const anyApplyingImage = computed(() => applyingImages.value.size > 0);
                 <template v-else>Update</template>
               </button>
             </template>
-            <template v-else-if="info.error">
-              <span class="text-red-500 text-[10px]">error</span>
-            </template>
             <template v-else-if="info.localDigest">
               <span class="text-gray-400 dark:text-gray-500 font-mono text-[10px]">{{ shortDigest(info.localDigest) }}</span>
               <span
-                v-if="isProductionMode"
+                v-if="isProductionMode && !info.error && info.remoteCheckStatus === 'checked' && !!info.remoteDigest"
                 class="text-green-600 dark:text-green-500 text-[10px]"
               >&#10003;</span>
             </template>
             <template v-else>
-              <span class="text-gray-400 dark:text-gray-600 text-[10px] italic">not found</span>
+              <span class="text-gray-400 dark:text-gray-600 text-[10px] italic">
+                <template v-if="info.localDigestStatus === 'missing'">not present</template>
+                <template v-else-if="info.localDigestStatus === 'unavailable'">presence unknown</template>
+                <template v-else-if="info.localDigestStatus === 'present'">version unavailable</template>
+                <template v-else>status unknown</template>
+              </span>
             </template>
+            <UTooltip v-if="imageHelp(info, key)" :text="imageHelp(info, key)">
+              <button
+                type="button"
+                class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-[10px]"
+                :aria-label="`Image status details for ${imageName(info.name)}`"
+              >ⓘ</button>
+            </UTooltip>
+            <span v-if="info.error || info.remoteCheckStatus === 'unavailable'" class="text-red-500 text-[10px]">update status unavailable</span>
           </div>
         </template>
       </div>

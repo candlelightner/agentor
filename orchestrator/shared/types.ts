@@ -363,6 +363,10 @@ export interface ImageUpdateInfo {
   /** OCI may be current while the native bootstrap still needs Apply. */
   nativeUpdateRequired?: boolean;
   error?: string;
+  /** Optional for compatibility with older orchestrators and cached responses. */
+  localDigestStatus?: "present" | "missing" | "unavailable";
+  localDigestReason?: "not-found" | "timeout" | "permission-denied" | "transport-error" | "inspection-error" | "version-unknown";
+  remoteCheckStatus?: "pending" | "disabled" | "checked" | "unavailable";
 }
 
 export type UpdatableImage = "orchestrator" | "worker" | "traefik";

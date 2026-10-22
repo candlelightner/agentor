@@ -196,3 +196,62 @@ test('a reset Docker response cannot advance the handoff', async () => {
   expect(result.exitCode).toBe(1);
   expect(result.calls).toHaveLength(1);
 });
+
+test('local image status distinguishes typed absence from inspection failures and unknown versions', async () => {
+  await fixture(async ({ checker }) => {
+    const outcomes: string[] = [];
+    const previousLogger = (globalThis as any).useLogger;
+    (globalThis as any).useLogger = () => ({ info(message: string) { outcomes.push(message); }, warn() {}, error() {} });
+    const names = ['agentor-orchestrator:latest', 'agentor-worker:latest', 'traefik:v3'];
+    const responses: any[] = [
+      Object.assign(new Error('No such image: private-image-name'), { statusCode: 404 }),
+      new Error('No such image: private-image-name'),
+      { Id: '', RepoDigests: [] },
+    ];
+    Object.assign((checker as any).config, { workerImagePrefix: '', baseDomains: [], orchestratorImage: names[0], workerImage: names[1], traefikImage: names[2] });
+    (checker as any).docker.getImage = (name: string) => ({ inspect: async () => {
+      const response = responses[names.indexOf(name)];
+      if (response instanceof Error) throw response;
+      return response;
+    } });
+    try {
+      await checker.init();
+      const status = checker.getStatus();
+      expect(status.orchestrator).toMatchObject({ localDigest: '', localDigestStatus: 'missing', localDigestReason: 'not-found', remoteCheckStatus: 'disabled' });
+      expect(status.worker).toMatchObject({ localDigest: '', localDigestStatus: 'unavailable', localDigestReason: 'inspection-error' });
+      expect(status.traefik).toMatchObject({ localDigest: '', localDigestStatus: 'present', localDigestReason: 'version-unknown' });
+      expect(outcomes.join('\n')).not.toContain('private-image-name');
+      expect(outcomes).toContain('[update-checker] local image inspection outcome=missing reason=not-found');
+      expect(outcomes).toContain('[update-checker] local image inspection outcome=unavailable reason=inspection-error');
+    } finally {
+      (globalThis as any).useLogger = previousLogger;
+    }
+  });
+});
+
+test('local image digest resolution keeps Docker Hub qualified digests and local image IDs', async () => {
+  await fixture(async ({ checker }) => {
+    const names = ['agentor-orchestrator:latest', 'agentor-worker:latest', 'traefik:v3'];
+    Object.assign((checker as any).config, { workerImagePrefix: '', baseDomains: [], orchestratorImage: names[0], workerImage: names[1], traefikImage: names[2] });
+    (checker as any).docker.getImage = (name: string) => ({ inspect: async () => name === names[0]
+      ? { RepoDigests: ['docker.io/library/agentor-orchestrator@sha256:qualified'], Id: 'sha256:id-one' }
+      : name === names[1]
+        ? { RepoDigests: [], Id: 'sha256:local-id' }
+        : { RepoDigests: [], Id: '' } });
+    await checker.init();
+    expect(checker.getStatus().orchestrator).toMatchObject({ localDigest: 'sha256:qualified', localDigestStatus: 'present' });
+    expect(checker.getStatus().worker).toMatchObject({ localDigest: 'sha256:local-id', localDigestStatus: 'present' });
+    expect(checker.getStatus().traefik).toMatchObject({ localDigestStatus: 'present', localDigestReason: 'version-unknown' });
+  });
+});
+
+test('local inspection timeouts and permission failures are unavailable, not missing', async () => {
+  await fixture(async ({ checker }) => {
+    (checker as any).docker.getImage = () => ({ inspect: async () => { throw Object.assign(new Error('private Docker message'), { statusCode: 504 }); } });
+    await expect((checker as any).getLocalDigest('agentor-worker:latest')).resolves.toMatchObject({ digest: '', status: 'unavailable', reason: 'timeout' });
+    (checker as any).docker.getImage = () => ({ inspect: async () => { throw Object.assign(new Error('private Docker message'), { code: 'ETIMEDOUT' }); } });
+    await expect((checker as any).getLocalDigest('agentor-worker:latest')).resolves.toMatchObject({ digest: '', status: 'unavailable', reason: 'timeout' });
+    (checker as any).docker.getImage = () => ({ inspect: async () => { throw Object.assign(new Error('private Docker message'), { statusCode: 403 }); } });
+    await expect((checker as any).getLocalDigest('agentor-worker:latest')).resolves.toMatchObject({ digest: '', status: 'unavailable', reason: 'permission-denied' });
+  });
+});
