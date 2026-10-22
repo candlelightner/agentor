@@ -1,6 +1,6 @@
 # Hardware device permissions
 
-Agentor can pass host GPUs and USB devices into ordinary workers. USB and Intel mediated GPU access requires platform approval, account entitlement, and an owner assignment. Physical NVIDIA GPUs use the separate platform-admin-only assignment described below. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
+Agentor can pass host GPUs and USB devices into ordinary workers. USB and Intel mediated GPU access requires platform approval, account entitlement, and an owner assignment. Physical PCI GPUs and native vGPU profiles use the separate platform-admin-only assignment described below. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
 
 ## Discovery and stable identity
 
@@ -159,6 +159,9 @@ addresses, topology, diagnostics and acceptance receipts private and untracked.
 
 
 ### Native vGPU profiles in Hardware
+
+For host preparation, guest driver compatibility and a disposable CUDA lifecycle
+check, see [NVIDIA vGPU setup](nvidia-vgpu.md).
 
 The existing platform GPU opt-in also enables per-worker native mdev assignment.
 The Hardware popup lists dynamically discovered profile names, framebuffer sizes

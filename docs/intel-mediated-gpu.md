@@ -1,8 +1,10 @@
 # Intel mediated GPU host preparation
 
 Agentor supports the Intel GVT-g mediated-device path when the host exposes a
-compatible profile. It does not implement physical GPU/PCI assignment, SR-IOV
-or native-context assignment. Device grants still require the catalog,
+compatible profile. This guide covers Intel GVT-g; see [hardware permissions](hardware-devices.md)
+for the separate physical GPU path and [NVIDIA vGPU setup](nvidia-vgpu.md) for native
+NVIDIA profiles. Direct SR-IOV and native-context assignment remain unsupported.
+Intel device grants still require the catalog,
 entitlement and worker/group authorization described in [hardware permissions](hardware-devices.md).
 
 ## Host preparation
