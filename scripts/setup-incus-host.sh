@@ -20,6 +20,7 @@ ZABBLY_FINGERPRINT = "4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
 ZABBLY_URL = "https://pkgs.zabbly.com/incus/lts-6.0"
 EMPTY_SHARE_ROOT = Path("/var/lib/agentor-incus")
 OPERATOR_ROOT = Path("/etc/agentor/incus")
+SYSTEMD_SYSTEM = Path("/etc/systemd/system")
 ROUTING_LOCK_WAIT_SECONDS = 30
 D2VM_URL = "https://github.com/linka-cloud/d2vm/releases/download/v0.4.0/d2vm_v0.4.0_linux_amd64.tar.gz"
 D2VM_ARCHIVE_SHA = "9f2096bc7850367d063cbcf2da8ded6c5a23e70a9b0ecfdde150b2fbc9b8bd2f"
@@ -330,13 +331,18 @@ def route_rules(network, bridge, docker_subnet, primary, address, uplink, marker
     ]
 
 
-def routing(config):
+def operator_directory(config):
     require(UUID.fullmatch(config["installation"]), "Routing needs its exact installation namespace")
     directory = OPERATOR_ROOT / config["installation"]
     SOURCES.directory_identity(str(directory)); info = directory.lstat(); owner = directory / "owner"; marker = owner.lstat()
     require(info.st_uid == os.geteuid() and not info.st_mode & 0o077 and stat.S_ISREG(marker.st_mode)
             and marker.st_uid == os.geteuid() and stat.S_IMODE(marker.st_mode) == 0o600 and marker.st_size <= 128
             and owner.read_text().strip() == config["installation"], "Routing namespace is foreign or unprotected; preserve it")
+    return directory
+
+
+def routing(config):
+    directory = operator_directory(config)
     fd = os.open(directory / "routing.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         lock = os.fstat(fd)
@@ -395,29 +401,123 @@ def unit_argument(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
 
 
+def bridge_ready_timeout(config):
+    value = config.get("bridgeReadyTimeoutSeconds", 120)
+    require(type(value) is int and 1 <= value <= 3600,
+            "bridgeReadyTimeoutSeconds must be integer seconds from 1 to 3600; startup policy was not changed")
+    return value
+
+
+def bridge_ready(config):
+    print("Waiting for the exact owned Incus bridge callback address before Docker restores containers.", flush=True)
+    try:
+        operator_directory(config)
+        require(installation_id(config["dataDir"]) == config["installation"], "Canonical installation identity changed; preserve it")
+        deadline = time.monotonic() + bridge_ready_timeout(config)
+        reason = "Incus bridge observation is unavailable"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: break
+            try:
+                network = json.loads(command("incus", "--force-local", "query", "/1.0/networks/" + quote(config["network"]), timeout=min(10, remaining)))
+            except (SetupFailure, subprocess.SubprocessError):
+                network = None; reason = "Incus bridge observation is unavailable"
+            if network is not None:
+                owned(network, config["installation"], config["network"])
+                require(network.get("managed") is True and network.get("type") == "bridge", "Owned primary network is not a managed bridge; preserve it")
+                interface = ipaddress.IPv4Interface(network["config"]["ipv4.address"])
+                require(interface.ip.is_private and not interface.ip.is_unspecified
+                        and config["internalUrl"] == "http://" + str(interface.ip) + ":" + str(config["internalPort"]),
+                        "Owned bridge gateway differs from the configured callback binding; preserve it")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: break
+                try:
+                    links = json.loads(command("ip", "-j", "-4", "address", "show", "dev", config["network"], timeout=min(10, remaining)))
+                except (SetupFailure, subprocess.SubprocessError): links = []
+                if time.monotonic() >= deadline: break
+                if len(links) == 1 and links[0].get("ifname") == config["network"] and "UP" in links[0].get("flags", []) and any(
+                    address.get("family") == "inet" and address.get("local") == str(interface.ip) and address.get("prefixlen") == interface.network.prefixlen
+                    for address in links[0].get("addr_info", [])):
+                    print("Exact owned bridge callback address is ready; Docker startup may proceed. No network, container or storage changes were made.", flush=True)
+                    return
+                reason = "the exact owned bridge callback address is not up on its kernel interface"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: break
+            time.sleep(min(0.2, remaining))
+        raise SetupFailure("Bridge readiness deadline exceeded: " + reason)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        print("Bridge readiness failed; Docker startup remains blocked to prevent a failed callback-port restore. No resources were changed; correct Incus/owned configuration, then retry Docker startup.", file=sys.stderr, flush=True)
+        raise
+
+
+def verify_startup_order(name, body, dropin):
+    try:
+        docker = command("systemctl", "cat", "docker.service", timeout=15)
+        with tempfile.TemporaryDirectory(prefix="agentor-startup-order-") as temporary:
+            staged = Path(temporary)
+            (staged / "docker.service").write_bytes(docker + b"\n" + dropin.encode())
+            (staged / name).write_text(body)
+            for boot in (False, True):
+                result = subprocess.run(["systemd-analyze", "verify", "--man=no", "--generators=no", str(staged / "docker.service"), str(staged / name),
+                    *(["default.target"] if boot else [])], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                    env={**os.environ, "LC_ALL": "C", "SYSTEMD_LOG_LEVEL": "warning", "SYSTEMD_LOG_TARGET": "console"})
+                # Boot queues After-only intermediaries too. Ignore unrelated boot
+                # validation failures, but never systemd's exit-zero cycle recovery.
+                require((boot or result.returncode == 0) and len(result.stdout) + len(result.stderr) <= 4 * 1024 * 1024
+                        and b"ordering cycle" not in result.stderr.lower() and b"dependency cycle" not in result.stderr.lower(),
+                        "Startup dependency validation failed; inspect Incus/Docker ordering and operator drop-ins privately")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print("Startup ordering preflight failed; installed scripts, units and Docker drop-ins were not changed, and Docker was not restarted.", file=sys.stderr)
+        raise
+
+
 def install_units(config, directory, library):
     short = config["installation"].replace("-", "")[:8]; prefix = "agentor-incus-" + short
     scripts = ("setup-incus-host.sh", "check-incus-host.sh", "recover-incus-job.py", "agentor-incus-network-service.py", "incus-managed-network-policy.py", "incus-admin-network-policy.py", "incus-host-mount-policy.py", "incus-host-mount-sources.py", "incus-gpu-mdev.py")
-    namespace(library, config["installation"])
-    for script in scripts: write_file(library / script, (ROOT / script).read_bytes(), 0o700 if script.endswith(".sh") else 0o600, True)
     policy = ["/usr/bin/python3", str(library / "agentor-incus-network-service.py"), "--data-dir", config["dataDir"], "--installation", config["installation"],
               "--project", config["project"], "--primary", config["network"], "--bind", config["listen"], "--port", str(config["policyPort"]),
               "--server-cert", str(directory / "policy.crt"), "--server-key", str(directory / "policy.key"), "--client-cert", str(directory / "client.crt"), "--host-mounts",
               "--admin-pool", config["pool"], "--orchestrator-container", config["container"]]
     route = [str(library / "setup-incus-host.sh"), "--routing", "--config", str(directory / "config.json")]
+    ready = ["/usr/bin/bash", str(library / "setup-incus-host.sh"), "--bridge-ready", "--config", str(directory / "config.json")]
+    budget = bridge_ready_timeout(config)
     header = "# Agentor installation " + config["installation"] + "\n"
     units = {
+        prefix + "-bridge-ready.service": header + "[Unit]\nWants=incus.service\nAfter=incus.service\nBefore=docker.service\nRequiresMountsFor=" + unit_argument(config["dataDir"])
+            + "\n[Service]\nType=oneshot\nExecStart=" + " ".join(map(unit_argument, ready))
+            + "\nTimeoutStartSec=" + str(budget + 15) + "\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\n",
         prefix + "-policy.service": header + "[Unit]\nAfter=network-online.target incus.service docker.service\n[Service]\nType=simple\nUser=root\nExecStart=" + " ".join(map(unit_argument, policy))
             + "\nRestart=on-failure\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\n[Install]\nWantedBy=multi-user.target\n",
         prefix + "-routing.service": header + "[Unit]\nAfter=docker.service incus.service\n[Service]\nType=oneshot\nExecStart=" + " ".join(map(unit_argument, route)) + "\n",
         prefix + "-routing.timer": header + "[Unit]\nAfter=docker.service incus.service\n[Timer]\nOnBootSec=15s\nOnUnitActiveSec=30s\nUnit=" + prefix + "-routing.service\n[Install]\nWantedBy=timers.target\n",
     }
-    for name, body in units.items():
-        path = Path("/etc/systemd/system") / name
-        if path.exists(): require(path.read_text().startswith(header), "Existing systemd unit is foreign; preserve it")
+    dropin_directory = SYSTEMD_SYSTEM / "docker.service.d"
+    dropin_path = dropin_directory / ("50-" + prefix + "-bridge.conf")
+    dropin = header + "[Unit]\nRequires=" + prefix + "-bridge-ready.service\nAfter=" + prefix + "-bridge-ready.service\n"
+    files = {**{SYSTEMD_SYSTEM / name: body for name, body in units.items()}, dropin_path: dropin}
+    SOURCES.directory_identity(str(SYSTEMD_SYSTEM))
+    if os.path.lexists(dropin_directory):
+        SOURCES.directory_identity(str(dropin_directory))
+        info = dropin_directory.lstat()
+        require(info.st_uid == os.geteuid() and not info.st_mode & 0o022, "Docker drop-in directory is not owned/protected; startup policy was not changed")
+    for path in files:
+        if os.path.lexists(path):
+            info = path.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o644 and info.st_size <= 65536
+                    and path.read_text().startswith(header), "Existing systemd unit/drop-in is foreign; preserve it; startup policy was not changed")
+    verify_startup_order(prefix + "-bridge-ready.service", units[prefix + "-bridge-ready.service"], dropin)
+    namespace(library, config["installation"])
+    for script in scripts: write_file(library / script, (ROOT / script).read_bytes(), 0o700 if script.endswith(".sh") else 0o600, True)
+    dropin_directory.mkdir(mode=0o755, exist_ok=True)
+    SOURCES.directory_identity(str(dropin_directory))
+    if "bridgeReadyTimeoutSeconds" not in config:
+        config["bridgeReadyTimeoutSeconds"] = budget
+        write_file(directory / "config.json", json.dumps(config, sort_keys=True) + "\n", replace=True)
+    for path, body in files.items():
         write_file(path, body, 0o644, True)
     command("systemctl", "daemon-reload"); command("systemctl", "enable", "--now", prefix + "-policy.service", prefix + "-routing.timer")
     command("systemctl", "restart", prefix + "-policy.service")
+    print("Owned Docker startup ordering installed; future Docker starts require exact Incus bridge readiness. Docker was not restarted; unrelated operator drop-ins were preserved.")
 
 
 def configured_default_source(container, explicit=""):
@@ -545,6 +645,7 @@ def main():
     parser.add_argument("--install-lts", action="store_true", help="Explicitly offer fingerprint-pinned signed Zabbly Incus 6.0 LTS packages")
     parser.add_argument("--update-policy", action="store_true", help="Update installed host policy/scripts using --config; no resource provisioning, image conversion or routing changes")
     parser.add_argument("--routing", action="store_true", help="Installed systemd use only: refresh this installation's exact routing")
+    parser.add_argument("--bridge-ready", action="store_true", help="Installed systemd use only: verify the owned callback bridge before Docker starts")
     parser.add_argument("--config", help="Installed root-owned /etc/agentor/incus/<installationUUID>/config.json")
     parser.add_argument("--trusted-worker-image", default=os.environ.get("AGENTOR_TRUSTED_WORKER_IMAGE", ""),
                         help="Explicit matching current DEFAULT OCI reference. Running setup trusts that operator-authored default; NEVER choose user/catalog OCI for host-mounted conversion")
@@ -557,22 +658,24 @@ def main():
     for argument, default in (("https-port", 8443), ("policy-port", 8444), ("internal-port", 3079)): parser.add_argument("--" + argument, type=int, default=default)
     args = parser.parse_args(); require(os.geteuid() == 0, "Run this operator installer with sudo")
     os.umask(0o077)
-    require(not (args.routing and args.update_policy), "Choose either --routing or --update-policy")
-    if args.routing or args.update_policy:
+    require(sum((args.routing, args.update_policy, args.bridge_ready)) <= 1, "Choose only one installed routing, policy-update or bridge-readiness mode")
+    if args.routing or args.update_policy or args.bridge_ready:
         require(args.config and re.fullmatch(r"/etc/agentor/incus/[a-f0-9-]{36}/config.json", args.config), "Routing requires its exact installed operator config")
         path = Path(args.config); SOURCES.directory_identity(str(path.parent))
         info = path.lstat(); require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 16384, "Routing config is not private/owned/regular")
         config = json.loads(path.read_text()); require(UUID.fullmatch(config["installation"]) and path.parent.name == config["installation"], "Routing installation identity differs")
         require(config["sourceTable"] == "agentor_source_" + config["installation"].replace("-", "")[:8]
                 and re.fullmatch(r"[A-Za-z0-9_-]{1,15}", config["network"]), "Installed routing namespace is invalid")
-        if args.update_policy:
+        if args.bridge_ready:
+            bridge_ready(config)
+        elif args.update_policy:
             require(installation_id(config["dataDir"]) == config["installation"], "Installation identity changed")
             install_units(config, path.parent, Path("/usr/local/lib/agentor-incus") / config["installation"])
             print("Owned host policy updated and restarted; no VM, image, routing or canonical data changes.")
         else:
             routing(config); print("Owned routing refreshed; no worker/data changes.")
         return
-    require(not args.config, "--config requires the installed bounded --routing or --update-policy mode")
+    require(not args.config, "--config requires an installed routing, policy-update or bridge-readiness mode")
     release = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
     require(release.get("ID", "").strip('"') == "ubuntu" and release.get("VERSION_ID", "").strip('"') == "24.04" and os.uname().machine == "x86_64", "Supported Ubuntu24 amd64 host required")
     require(stat.S_ISCHR(os.stat("/dev/kvm").st_mode), "KVM is unavailable; enable host virtualization before setup")
@@ -589,9 +692,11 @@ def main():
     require(not SOURCES.overlaps(work, data), "Image conversion scratch must not modify canonical DATA or its ancestors")
     config = {"usbEnabled": args.enable_usb, "gpuMdevProfile": args.gpu_mdev_profile, "gpuPhysicalEnabled": args.enable_physical_gpu, "installation": installation, "dataDir": data, "project": args.project, "network": network, "pool": pool, "container": args.orchestrator_container,
               "dockerNetwork": docker_network, "tlsName": args.tls_name, "httpsPort": args.https_port, "policyPort": args.policy_port, "internalPort": args.internal_port,
-              "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work}
+              "listen": gateway, "sourceTable": "agentor_source_" + short, "imageWorkDir": work,
+              "bridgeReadyTimeoutSeconds": prior.get("bridgeReadyTimeoutSeconds", 120)}
+    bridge_ready_timeout(config)
     if (directory / "config.json").exists():
-        require(all(prior.get(key, value if key == "imageWorkDir" else False if key in ("usbEnabled", "gpuPhysicalEnabled") else "" if key == "gpuMdevProfile" else None) == value
+        require(all(prior.get(key, value if key == "imageWorkDir" else 120 if key == "bridgeReadyTimeoutSeconds" else False if key in ("usbEnabled", "gpuPhysicalEnabled") else "" if key == "gpuMdevProfile" else None) == value
                     or key in ("usbEnabled", "gpuMdevProfile", "gpuPhysicalEnabled") and not prior.get(key) and bool(value)
                     for key, value in config.items()), "Installed operator configuration differs; preserve and reconcile manually")
         if "defaultImage" in prior: config["defaultImage"] = prior["defaultImage"]
