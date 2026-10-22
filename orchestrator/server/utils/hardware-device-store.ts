@@ -20,8 +20,11 @@ export function isPhysicalGpuDevice(device: Pick<HardwareDevice, 'kind' | 'selec
   return device?.kind === 'gpu' && device.selector.startsWith('pci-gpu:');
 }
 
-export function isNvidiaPhysicalGpuDevice(device: Pick<HardwareDevice, 'kind' | 'selector' | 'vendor'> | undefined): boolean {
-  return isPhysicalGpuDevice(device) && device?.vendor === '10de' && device.selector.startsWith('pci-gpu:10de:');
+export function gpuAssignments(device: Pick<HardwareDevice, 'physicalAssignment' | 'mdevAssignments'> | undefined) {
+  return [...(device?.physicalAssignment ? [device.physicalAssignment] : []), ...(device?.mdevAssignments ?? [])];
+}
+export function gpuAssignmentFor(device: HardwareDevice | undefined, userId: string, workerId: string) {
+  return gpuAssignments(device).find(binding => binding.userId === userId && binding.workerId === workerId);
 }
 
 export async function physicalGpuIdentityReceipts(dataDir: string | undefined) {
@@ -112,29 +115,44 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
    * A single catalog write makes cross-account authority indivisible. Native
    * release must be confirmed before clearing a binding or selecting a peer. */
   async setPhysicalGpuAssignment(deviceId: string, target?: HardwareDevice['physicalAssignment'],
-    expected?: HardwareDevice['physicalAssignment']) {
+    expected?: HardwareDevice['physicalAssignment'], profile?: string) {
+    const previous = target && gpuAssignmentFor(this.getDevice(deviceId), target.userId, target.workerId);
+    const inventory = target && profile && (!previous || !('profile' in previous) || previous.profile !== profile) ? await this.listDiscoveredDevices() : [];
     let updated!: HardwareDevice;
     await this.mutateCatalog(catalog => {
       const current = catalog.get(deviceId);
-      if (!isNvidiaPhysicalGpuDevice(current)) throw statusError(400, 'Direct physical GPU assignment supports NVIDIA devices only');
-      if (!target && current!.physicalAssignment && (!expected ||
-          current!.physicalAssignment.userId !== expected.userId || current!.physicalAssignment.workerId !== expected.workerId ||
-          expected.incarnation !== undefined && current!.physicalAssignment.incarnation !== expected.incarnation))
-        throw statusError(409, 'Physical GPU release authority changed; preserve the current assignment');
+      if (!isPhysicalGpuDevice(current)) throw statusError(400, 'Select an approved PCI GPU');
+      const owner = target ?? expected;
+      const existing = owner && gpuAssignmentFor(current, owner.userId, owner.workerId);
+      if (!target && gpuAssignments(current).length && (!existing ||
+          expected?.incarnation !== undefined && existing.incarnation !== expected.incarnation))
+        throw statusError(409, 'GPU release authority changed; preserve the current assignment');
       if (target) {
         const worker = this.workers.get(target.userId, target.workerId);
         if (!worker || worker.runtimeKind !== 'incus-vm' || worker.status !== 'active' || worker.deletionPending)
-          throw statusError(409, 'Physical GPU assignment requires an existing ordinary Incus worker');
-        if (current!.physicalAssignment &&
-            (current!.physicalAssignment.userId !== target.userId || current!.physicalAssignment.workerId !== target.workerId))
+          throw statusError(409, 'GPU assignment requires an existing ordinary Incus worker');
+        if ([...catalog.values()].some(device => device.id !== deviceId && gpuAssignmentFor(device, target.userId, target.workerId)))
+          throw statusError(409, 'This VM already has a GPU assignment');
+        const others = gpuAssignments(current).filter(binding => binding !== existing);
+        if (!profile && others.length || profile && current!.physicalAssignment && current!.physicalAssignment !== existing)
           throw statusError(409, 'Release the existing physical GPU assignment before selecting another VM');
-        if ([...catalog.values()].some(device => device.id !== deviceId && device.physicalAssignment?.userId === target.userId &&
-            device.physicalAssignment.workerId === target.workerId))
-          throw statusError(409, 'This VM already has a physical GPU assignment');
+        if (profile && (!existing || !('profile' in existing) || existing.profile !== profile)) {
+          const evidence = inventory.find(item => item.selector === current!.selector)?.incus?.evidence;
+          if (!evidence?.mediatedProfiles?.includes(profile)) throw statusError(409, 'Unsupported mediated GPU profile');
+          // shortcut: use homogeneous profiles until a driver exposes explicit mixed-profile compatibility.
+          if (others.some(binding => !('profile' in binding) || binding.profile !== profile))
+            throw statusError(409, 'GPU requires compatible homogeneous profiles; release other allocations first');
+          const total = evidence.mediatedProfileInfo?.[profile]?.total ?? ((evidence.mediatedAvailable?.[profile] ?? 0) + (evidence.mediatedInstances?.[profile]?.length ?? 0));
+          if (total !== undefined && others.length >= total)
+            throw statusError(409, 'Selected mediated GPU profile has no available capacity');
+        }
       }
-      updated = { ...current!, physicalAssignment: target && { ...target }, updatedAt: new Date().toISOString() };
-      validatePersistedDevice(updated);
-      catalog.set(deviceId, updated);
+      const mdevAssignments = (current!.mdevAssignments ?? []).filter(binding => binding !== existing);
+      if (target && profile) mdevAssignments.push({ ...target, profile });
+      updated = { ...current!,
+        physicalAssignment: target && !profile ? { ...target } : current!.physicalAssignment === existing ? undefined : current!.physicalAssignment,
+        mdevAssignments: mdevAssignments.length ? mdevAssignments : undefined, updatedAt: new Date().toISOString() };
+      validatePersistedDevice(updated); catalog.set(deviceId, updated);
     });
     return structuredClone(updated);
   }
@@ -142,7 +160,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   assertPhysicalGpuSelection(userId: string, workerId: string, deviceIds: string[] | undefined) {
     const selected = [...new Set(deviceIds ?? [])].filter(id => isPhysicalGpuDevice(this.getDevice(id))).sort();
     const assigned = this.listCatalog().filter(device => isPhysicalGpuDevice(device) &&
-      device.physicalAssignment?.userId === userId && device.physicalAssignment.workerId === workerId).map(device => device.id).sort();
+      !!gpuAssignmentFor(device, userId, workerId)).map(device => device.id).sort();
     if (JSON.stringify(selected) !== JSON.stringify(assigned))
       throw statusError(403, 'Only a platform administrator may change a physical GPU assignment');
   }
@@ -157,7 +175,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
         )
         .map((grant) => grant.deviceId),
     );
-    return this.listCatalog().filter((path) => entitled.has(path.id) || path.physicalAssignment?.userId === userId);
+    return this.listCatalog().filter((path) => entitled.has(path.id) || gpuAssignments(path).some(binding => binding.userId === userId));
   }
 
   listGrants(userId: string, includeEntitlements = false) {
@@ -224,7 +242,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   async deleteDevice(deviceId: string): Promise<HardwareDeviceRevocation> {
     if (!this.getDevice(deviceId)) throw statusError(404, "Approved hardware device not found");
     await this.mutateCatalog((catalog) => {
-      if (catalog.get(deviceId)?.physicalAssignment)
+      if (gpuAssignments(catalog.get(deviceId)).length)
         throw statusError(409, 'Release the physical GPU assignment before deleting its catalog entry');
       catalog.delete(deviceId);
     });
@@ -411,6 +429,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
         throw statusError(409, `Hardware device \"${device.name}\" is unavailable. Reconnect it, then rebuild the worker.`);
       return {
         deviceId,
+        mdevProfile: (gpuAssignmentFor(device, userId, workerId) as { profile?: string } | undefined)?.profile,
         candidate: structuredClone(candidate),
         deviceNodes: [...candidate.deviceNodes],
         groupIds: [...candidate.groupIds],
@@ -426,8 +445,7 @@ export class HardwareDeviceStore extends UserScopedJsonStore<string, HardwareDev
   ) {
     const device = this.getDevice(deviceId);
     if (!device) return false;
-    if (isPhysicalGpuDevice(device)) return isNvidiaPhysicalGpuDevice(device) &&
-      device.physicalAssignment?.userId === userId && device.physicalAssignment.workerId === workerId;
+    if (isPhysicalGpuDevice(device)) return !!gpuAssignmentFor(device, userId, workerId);
     if (!this.isEntitled(userId, deviceId)) return false;
     return this.listForUser(userId).some((grant) => {
       if (grant.deviceId !== deviceId || grant.targetType === "entitlement") return false;
@@ -724,12 +742,20 @@ function validatePersistedDevice(input: unknown): asserts input is HardwareDevic
       (item.product !== undefined && typeof item.product !== "string") ||
       (item.serial !== undefined && typeof item.serial !== "string") ||
       (item.physicalIdentity !== undefined && !validPhysicalIdentity(item.physicalIdentity)) ||
-      (item.physicalAssignment !== undefined && (!isNvidiaPhysicalGpuDevice(item) || !item.physicalAssignment ||
+      (item.physicalAssignment !== undefined && (!isPhysicalGpuDevice(item) || !item.physicalAssignment ||
         typeof item.physicalAssignment.userId !== 'string' || !item.physicalAssignment.userId ||
         typeof item.physicalAssignment.workerId !== 'string' || !item.physicalAssignment.workerId ||
         item.physicalAssignment.incarnation !== undefined && (typeof item.physicalAssignment.incarnation !== 'string' ||
           !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(item.physicalAssignment.incarnation)) ||
         Object.keys(item.physicalAssignment).some(key => !['userId', 'workerId', 'incarnation'].includes(key)))) ||
+      (item.mdevAssignments !== undefined && (!isPhysicalGpuDevice(item) || !Array.isArray(item.mdevAssignments) ||
+        item.mdevAssignments.some(binding => !binding || typeof binding.userId !== 'string' || !binding.userId ||
+          typeof binding.workerId !== 'string' || !binding.workerId || typeof binding.profile !== 'string' ||
+          !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(binding.profile) ||
+          binding.incarnation !== undefined && !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(binding.incarnation) ||
+          Object.keys(binding).some(key => !['userId', 'workerId', 'incarnation', 'profile'].includes(key))) ||
+        new Set(item.mdevAssignments.map(binding => binding.workerId)).size !== item.mdevAssignments.length ||
+        !!item.physicalAssignment && item.mdevAssignments.length > 0)) ||
       typeof item.createdAt !== "string" || typeof item.updatedAt !== "string")
     throw new Error("Invalid persisted hardware device");
 }

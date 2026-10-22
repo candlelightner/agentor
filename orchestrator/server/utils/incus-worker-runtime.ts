@@ -1,7 +1,7 @@
 import { sameIncusDevice as sameDevice } from './incus-device-layout';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import { effectiveIncusWorkerMemoryLimit } from '../../shared/worker-memory';
-import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, INCUS_MDEV_GUEST_SETUP, type IncusHardwareOptions } from "./incus-hardware";
+import { resolveIncusHardware, assertIncusHardwareLayout, assertIncusHardwareExclusive, incusHardwareDevices, INCUS_MDEV_GUEST_SETUP, type IncusHardwareOptions } from "./incus-hardware";
 import type { HardwareDeviceCandidate } from "../../shared/types";
 import type { Config } from "./config";
 import type { DockerService } from "./docker";
@@ -160,7 +160,8 @@ export class IncusWorkerRuntime {
   async preflightHardware(opts: IncusHardwareOptions, instance?: IncusInstance, operation: 'preflight' | 'attach' = 'preflight'): Promise<Record<string, IncusDevice>> {
     if (!opts.hardwareDevices?.length) return {};
     if (!this.hardwareDiscovery) throw new Error('Incus hardware discovery is unavailable');
-    const devices = await resolveIncusHardware(this.config, opts, () => this.hardwareDiscovery!(opts), operation, instance);
+    let inventory: HardwareDeviceCandidate[] = [];
+    const devices = await resolveIncusHardware(this.config, opts, async () => inventory = await this.hardwareDiscovery!(opts), operation, instance);
     const project = await this.client.request<{ config: Record<string, string> }>('GET', `/1.0/projects/${encodeURIComponent(this.config.incusProject)}`);
     if (project.config.restricted !== 'true' || (project.config['restricted.devices.usb'] ?? 'block') !== (this.config.incusUsbEnabled ? 'allow' : 'block') ||
         (project.config['restricted.devices.gpu'] ?? 'block') !== (this.config.incusGpuMdevProfile || this.config.incusGpuPhysicalEnabled ? 'allow' : 'block') ||
@@ -169,7 +170,7 @@ export class IncusWorkerRuntime {
         (project.config['restricted.virtual-machines.lowlevel'] ?? 'block') !== 'block' ||
         ['pci', 'unix-char', 'unix-block', 'unix-hotplug'].some(kind => (project.config['restricted.devices.' + kind] ?? 'block') !== 'block'))
       throw new Error('Incus hardware requires explicit restricted project USB/GPU policy');
-    assertIncusHardwareExclusive(opts.containerName, devices, await this.client.listInstances());
+    assertIncusHardwareExclusive(opts.containerName, devices, await this.client.listInstances(), inventory, instance);
     return devices;
   }
   private imageResolver?: (opts: IncusWorkerOptions, stored?: IncusWorkerImageIdentity,
@@ -216,6 +217,18 @@ export class IncusWorkerRuntime {
       .assertWorkspaceReplacementSettled(owner);
   }
 
+  async validateGpuAssignment(owner: IncusStorageOwner, incarnation: string, device: import('../../shared/types').HardwareDevice, profile?: string) {
+    await this.assertPhysicalGpuStopped(owner, incarnation);
+    if (!this.config.incusGpuPhysicalEnabled || !this.hardwareDiscovery) throw physicalGpuConflict('Operator GPU enablement is required');
+    const inventory = await this.hardwareDiscovery(owner);
+    const matches = inventory.filter(candidate => candidate.selector === device.selector);
+    if (matches.length !== 1) throw physicalGpuConflict('GPU is unavailable or ambiguous');
+    const expected = incusHardwareDevices([{ deviceId: device.id, candidate: matches[0], mdevProfile: profile, deviceNodes: [], groupIds: [] }]);
+    const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
+    assertIncusHardwareExclusive(owner.containerName, expected, await this.client.listInstances(), inventory,
+      { ...instance, devices: expected, expanded_devices: expected });
+  }
+
   async assertPhysicalGpuStopped(owner: IncusStorageOwner, incarnation: string): Promise<void> {
     const instance = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
     if (instance.type !== 'virtual-machine' || instance.status !== 'Stopped' ||
@@ -231,12 +244,12 @@ export class IncusWorkerRuntime {
     const before = await this.assertOwned(opts.containerName, opts.id, opts.userId, incarnation);
     const hardware = await this.preflightHardware(opts, before, 'preflight');
     const key = 'hw' + createHash('sha256').update(deviceId).digest('hex').slice(0, 12);
-    if (hardware[key]?.type !== 'gpu' || hardware[key]?.gputype !== 'physical')
+    if (hardware[key]?.type !== 'gpu' || !['physical', 'mdev'].includes(hardware[key]?.gputype))
       throw physicalGpuConflict('Physical GPU selection did not resolve to an exact physical device');
     const previous = { ...hardware }; delete previous[key];
     if (before.devices[key]) {
-      if (!sameDevice(before.devices[key], hardware[key]!)) throw physicalGpuConflict('Existing physical GPU mapping differs; release it before assignment');
-      previous[key] = hardware[key]!;
+      if (!sameDevice(before.devices[key], hardware[key]!) && !(before.devices[key]!.gputype === 'mdev' && hardware[key]!.gputype === 'mdev' && before.devices[key]!.pci === hardware[key]!.pci)) throw physicalGpuConflict('Existing GPU mapping differs; release it before assignment');
+      previous[key] = before.devices[key]!;
     }
     assertIncusHardwareLayout(before, previous);
     const devices = { ...before.devices, ...hardware };
@@ -257,7 +270,7 @@ export class IncusWorkerRuntime {
     await authorize(); await this.assertPhysicalGpuStopped(owner, incarnation);
     const before = await this.assertOwned(owner.containerName, owner.id, owner.userId, incarnation);
     const key = 'hw' + createHash('sha256').update(deviceId).digest('hex').slice(0, 12), selected = before.devices[key];
-    if (selected && (selected.type !== 'gpu' || selected.gputype !== 'physical' ||
+    if (selected && (selected.type !== 'gpu' || !['physical', 'mdev'].includes(selected.gputype) ||
         !/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/.test(selected.pci ?? '')))
       throw physicalGpuConflict('Physical GPU mapping differs; preserve its recovery fence');
     // Reject unregistered physical/PCI mappings, profiles and expanded drift;
@@ -1930,7 +1943,7 @@ export class IncusWorkerRuntime {
       for (const device of Object.values(hostMounts.devices))
         await this.checkedExec(name, ['timeout', '15', 'mountpoint', '-q', '--', device.path!]);
       await this.checkedExec(name, ["systemctl", "stop", "agentor-worker.service"]);
-      if (Object.values(hardware).some(device => device.type === 'gpu' && device.gputype === 'mdev'))
+      if (Object.values(hardware).some(device => device.type === 'gpu' && device.gputype === 'mdev' && /^i915-GVTg_/.test(device.mdev)))
         await this.checkedExec(name, ['timeout', '30', 'bash', '-ec', INCUS_MDEV_GUEST_SETUP]);
       await this.reprovisionManagedNetworks(opts, instance.config['volatile.uuid']!);
       if (Object.keys(account).length) {

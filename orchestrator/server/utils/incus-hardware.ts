@@ -36,6 +36,21 @@ export function incusHardwareDevices(resolved: ResolvedHardwareDevice[], gpuProf
         devices[key] = { type: 'gpu', gputype: 'physical', pci };
         continue;
       }
+      if (value.mdevProfile) {
+        const profile = value.mdevProfile, evidence = candidate.incus?.evidence, pci = evidence?.pciAddress;
+        if (!candidate.incus?.supported || candidate.incus.mode !== 'gpu-mdev' || !pci ||
+            !/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/.test(pci) ||
+            !candidate.selector.startsWith('pci-gpu:') || !evidence?.mediatedProfiles?.includes(profile) ||
+            !evidence.driver || evidence.driver === 'vfio-pci')
+          fail('Selected mediated GPU profile is unavailable on the current host driver');
+        const expected = { type: 'gpu', gputype: 'mdev', pci, mdev: profile };
+        const uuid = instance?.config[`volatile.${key}.vgpu.uuid`];
+        const owned = instance?.status === 'Running' && isDeepStrictEqual(instance.devices[key], expected) &&
+          !!uuid && evidence.mediatedInstances?.[profile]?.includes(uuid);
+        if (!owned && !(Number.isInteger(evidence.mediatedAvailable?.[profile]) && evidence.mediatedAvailable![profile]! > 0))
+          fail('Selected mediated GPU profile has no available capacity');
+        devices[key] = expected; continue;
+      }
       if (!candidate.incus?.supported) fail(candidate.incus?.reason || 'Intel mediated GPU host capability is unavailable');
       if (!gpuProfile || !/^i915-GVTg_V[0-9]+_[0-9]+$/.test(gpuProfile))
         fail('Intel mediated GPU requires an explicit INCUS_GPU_MDEV_PROFILE selected from current host profiles');
@@ -108,13 +123,15 @@ export async function resolveIncusHardware(config: Config, opts: IncusHardwareOp
   // unarchive rechecks before allocating compute. This also covers legacy Docker.
   for (const peer of workers.list()) {
     if (peer.id === opts.id && peer.userId === opts.userId || peer.status === 'archived') continue;
-    if ((peer.hardwareDeviceIds ?? []).some(id => requested.includes(id)))
+    if ((peer.hardwareDeviceIds ?? []).some(id => requested.includes(id) && !resolved?.find(value => value.deviceId === id)?.mdevProfile))
       fail('Hardware device is exclusively reserved by another active worker; archive or remove its device selection first');
   }
   if (resolved?.some(value => value.candidate?.kind === 'usb') && !config.incusUsbEnabled)
     fail('Incus USB passthrough is disabled; operator host setup and INCUS_USB_ENABLED=true are required');
   if (resolved?.some(value => value.candidate?.incus?.mode === 'gpu-physical') && !config.incusGpuPhysicalEnabled)
     fail('Incus physical GPU passthrough is disabled; operator host release and INCUS_GPU_PHYSICAL_ENABLED=true are required');
+  if (resolved?.some(value => value.mdevProfile) && !config.incusGpuPhysicalEnabled)
+    fail('Platform GPU management requires operator GPU project enablement');
   return incusHardwareDevices(resolved ?? [], config.incusGpuMdevProfile, instance);
 }
 
@@ -132,17 +149,36 @@ export function assertIncusHardwareLayout(instance: IncusInstance, expected: Rec
 
 /** An instance outside the registry can still hold an assignment. A broad USB
  * selector conflicts conservatively; never stop or edit the conflicting peer. */
-export function assertIncusHardwareExclusive(name: string, expected: Record<string, IncusDevice>, peers: IncusInstance[]): void {
+export function assertIncusHardwareExclusive(name: string, expected: Record<string, IncusDevice>, peers: IncusInstance[], inventory: HardwareDeviceCandidate[] = [], instance?: IncusInstance): void {
   for (const peer of peers) {
     if (peer.name === name) continue;
     for (const device of Object.values(peer.expanded_devices ?? peer.devices)) {
       if ((device.type === 'gpu' || device.type === 'pci') && Object.values(expected).some(gpu => gpu.type === 'gpu' &&
-          (!device.pci && !device.address || (device.pci || device.address) === gpu.pci)))
+          (!device.pci && !device.address || (device.pci || device.address) === gpu.pci) &&
+          !(gpu.gputype === 'mdev' && device.gputype === 'mdev' && device.mdev === gpu.mdev && inventory.some(candidate => candidate.incus?.evidence?.pciAddress === gpu.pci && candidate.incus?.evidence?.mediatedProfiles?.includes(gpu.mdev)))))
         fail('GPU is assigned to another Incus instance; release that assignment first');
       if (device.type !== 'usb') continue;
       if (Object.values(expected).some(usb => usb.type === 'usb' && ['vendorid', 'productid', 'serial'].every(key => !device[key] || device[key] === usb[key])))
         fail('USB device is assigned to another Incus instance; release that assignment first');
     }
+  }
+  for (const gpu of Object.values(expected).filter(device => device.gputype === 'mdev')) {
+    const evidence = inventory.find(candidate => candidate.incus?.evidence?.pciAddress === gpu.pci)?.incus?.evidence;
+    if (!evidence?.mediatedProfiles?.includes(gpu.mdev)) continue; // Existing Intel path.
+    const active = Object.entries(evidence.mediatedInstances ?? {}).flatMap(([profile, ids]) => ids.map(uuid => ({ profile, uuid })));
+    if (active.some(value => value.profile !== gpu.mdev)) fail('GPU requires compatible homogeneous profiles');
+    const allocations = [...peers.filter(peer => peer.name !== name), ...(instance ? [{ ...instance, devices: expected, expanded_devices: expected }] : [{ name, devices: expected, config: {}, status: 'Stopped' } as IncusInstance])]
+      .flatMap(peer => Object.entries(peer.expanded_devices ?? peer.devices).filter(([, device]) => device.type === 'gpu' && device.pci === gpu.pci)
+        .map(([key, device]) => ({ device, uuid: peer.status === 'Running' ? peer.config[`volatile.${key}.vgpu.uuid`] : undefined })));
+    const uuids = allocations.map(value => value.uuid).filter((uuid): uuid is string => !!uuid);
+    if (new Set(uuids).size !== uuids.length || allocations.some(value => value.device.mdev !== gpu.mdev || value.device.gputype !== 'mdev') ||
+        uuids.some(uuid => !active.some(value => value.uuid === uuid))) fail('Mediated GPU instance ownership is ambiguous');
+    const unknown = active.filter(value => !uuids.includes(value.uuid)).length;
+    if (unknown) fail('Mediated GPU instance ownership is unknown; resolve unmanaged allocations first');
+    const total = evidence.mediatedProfileInfo?.[gpu.mdev]?.total;
+    const pending = allocations.filter(value => !value.uuid).length;
+    if (total !== undefined && allocations.length + unknown > total || pending > (evidence.mediatedAvailable?.[gpu.mdev] ?? 0))
+      fail('Selected mediated GPU profile has no available capacity; stopped VM assignments reserve capacity too');
   }
 }
 

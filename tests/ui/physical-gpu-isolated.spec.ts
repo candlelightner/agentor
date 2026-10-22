@@ -79,3 +79,27 @@ test('running assignments cannot be released by the control', async ({ page }) =
   await expect(page.getByRole('alert')).toContainText('Stop the selected VM');
   expect(writes).toBe(0);
 });
+
+test('vGPU controls show framebuffer, capacity and active VM, and assign/change/release an explicit stopped allocation', async ({ page }) => {
+  const view: any = initial(), writes: any[] = [];
+  Object.assign(view.devices[0], { mode: 'gpu-mdev', physicalSupported: false, physicalReason: 'Host driver owns device',
+    profiles: [{ id: 'vendor-small', name: 'Small vGPU', framebufferMiB: 1024, available: 2, total: 2, active: 0, reserved: 0, compatible: true },
+      { id: 'vendor-large', name: 'Large vGPU', framebufferMiB: 2048, available: 1, total: 1, active: 0, reserved: 0, compatible: true }], allocations: [] });
+  await page.route('**/api/hardware-devices/gpu', async route => {
+    if (route.request().method() === 'PUT') {
+      const body = route.request().postDataJSON(); writes.push(body);
+      view.devices[0].allocations = body.workerId ? [{ workerId: body.workerId, displayName: 'Worker A', profile: body.profile, status: 'stopped' }] : [];
+      await route.fulfill({ json: { stopped: true } });
+    } else await route.fulfill({ json: view });
+  });
+  await page.goto(url); await expect(page.getByText('1024 MiB')).toBeVisible(); await expect(page.getByText('2 / 2', { exact: true })).toBeVisible();
+  const vm = page.getByLabel('Assigned VM for NVIDIA fixture'), profile = page.getByLabel('GPU profile for NVIDIA fixture');
+  await expect(profile.locator('option[value="physical"]')).toBeDisabled();
+  await vm.selectOption('a'); await page.getByRole('button', { name: 'Assign', exact: true }).click();
+  await expect(page.getByText('Worker A · vendor-small · stopped')).toBeVisible();
+  await profile.selectOption('vendor-large'); await page.getByRole('button', { name: 'Assign', exact: true }).click();
+  await expect(page.getByText('Worker A · vendor-large · stopped')).toBeVisible();
+  await page.getByRole('button', { name: 'Release Worker A', exact: true }).click();
+  await expect.poll(() => writes).toEqual([{ deviceId: 'nvidia', workerId: 'a', profile: 'vendor-small' },
+    { deviceId: 'nvidia', workerId: 'a', profile: 'vendor-large' }, { deviceId: 'nvidia', workerId: null, releaseWorkerId: 'a' }]);
+});

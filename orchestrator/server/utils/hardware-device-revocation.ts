@@ -20,7 +20,7 @@ export async function enforceHardwareDeviceRevocation(userId?: string) {
 export function assertPhysicalGpuPolicyRemovalSafe(deviceId: string): void {
   const device = useHardwareDeviceStore().getDevice(deviceId);
   if (!isPhysicalGpuDevice(device)) return;
-  if (device!.physicalAssignment || [...useWorkerStore().list(), ...useContainerManager().list()]
+  if (device!.physicalAssignment || device!.mdevAssignments?.length || [...useWorkerStore().list(), ...useContainerManager().list()]
     .some(worker => worker.hardwareDeviceIds?.includes(deviceId)))
     throw createError({ statusCode: 409, statusMessage: 'Release the physical GPU through platform GPU management before deleting its catalog entry or entitlement.' });
 }

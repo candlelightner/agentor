@@ -10,9 +10,9 @@ const mutate = { readOnlyHint: false, idempotentHint: false, openWorldHint: fals
 
 export class ManagementHardwareDeviceDomain {
   tools() { return [
-    tool("hardware-devices.gpu.list", "List approved physical NVIDIA GPUs, their assigned ordinary worker VM, availability and stopped-VM requirements. Platform administrators only.", {}, read),
-    tool("hardware-devices.gpu.assign", "Assign a physical NVIDIA GPU to one explicit stopped ordinary Incus worker. No running VM or host driver is interrupted. Platform administrators only.", { deviceId: stringSchema(), workerId: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, mutate, ["deviceId", "workerId"]),
-    tool("hardware-devices.gpu.release", "Release a physical NVIDIA GPU from its stopped ordinary worker VM. Platform administrators only.", { deviceId: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, { ...mutate, destructiveHint: true }, ["deviceId"]),
+    tool("hardware-devices.gpu.list", "List approved GPUs, native vGPU profiles, framebuffer, capacity, active allocations and stopped-VM requirements. Platform administrators only.", {}, read),
+    tool("hardware-devices.gpu.assign", "Assign full physical passthrough or a discovered vGPU profile to one explicit stopped ordinary Incus worker. No running VM or host driver is interrupted. Platform administrators only.", { deviceId: stringSchema(), workerId: stringSchema(), profile: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, mutate, ["deviceId", "workerId"]),
+    tool("hardware-devices.gpu.release", "Release a GPU allocation from its stopped ordinary worker VM. Supply workerId when multiple vGPU allocations exist. Platform administrators only.", { deviceId: stringSchema(), workerId: stringSchema(), lockPassword: { ...stringSchema(), writeOnly: true } }, { ...mutate, destructiveHint: true }, ["deviceId"]),
     tool("hardware-devices.discover", "Discover host GPUs and USB devices and show whether each is already approved. Platform administration only.", {}, read),
     tool("hardware-devices.catalog.list", "List globally approved hardware devices and their current availability. Platform administration only.", {}, read),
     tool("hardware-devices.catalog.approve", "Approve one currently discovered hardware device by stable selector.", { selector: stringSchema(), name: stringSchema() }, mutate, ["selector"]),
@@ -43,8 +43,8 @@ export class ManagementHardwareDeviceDomain {
       };
       await authorize();
       if (name === "hardware-devices.gpu.list") return handled(await listPhysicalGpuAssignments());
-      if (name === "hardware-devices.gpu.assign") return handled(await setPhysicalGpuAssignment(args.deviceId, args.workerId, authorize, args.lockPassword));
-      if (name === "hardware-devices.gpu.release") return handled(await setPhysicalGpuAssignment(args.deviceId, null, authorize, args.lockPassword));
+      if (name === "hardware-devices.gpu.assign") return handled(await setPhysicalGpuAssignment(args.deviceId, args.workerId, authorize, args.lockPassword, { profile: args.profile }));
+      if (name === "hardware-devices.gpu.release") return handled(await setPhysicalGpuAssignment(args.deviceId, null, authorize, args.lockPassword, { releaseWorkerId: args.workerId }));
       throw failure(404, "Unknown physical GPU operation");
     }
     if (name === "hardware-devices.discover") {

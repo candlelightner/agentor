@@ -18,7 +18,7 @@ import type { Readable, Duplex } from "node:stream";
 import * as tar from "tar-stream";
 import { DockerService } from "./docker";
 import { IncusWorkerCommands } from "./incus-worker-commands";
-import { isNvidiaPhysicalGpuDevice, isPhysicalGpuDevice } from './hardware-device-store';
+import { gpuAssignmentFor, gpuAssignments, isPhysicalGpuDevice } from './hardware-device-store';
 import type { ManagedNetworkManager } from './managed-network-manager';
 import type {
   EnvironmentJsonPayload,
@@ -1857,8 +1857,7 @@ export class ContainerManager {
       if (record?.runtimeKind === 'incus-vm') {
         const hardware = useHardwareDeviceStore();
         const selected = record.hardwareDeviceIds?.filter(value => isPhysicalGpuDevice(hardware.getDevice(value))) ?? [];
-        const assigned = hardware.listCatalog().filter(device => device.physicalAssignment?.userId === info.userId &&
-          device.physicalAssignment.workerId === info.id);
+        const assigned = hardware.listCatalog().filter(device => !!gpuAssignmentFor(device, info.userId, info.id));
         if (record.hardwareDevicesRevoked && (selected.length || assigned.length) || assigned.some(device => !selected.includes(device.id)))
           throw Object.assign(new Error('Use the platform-admin GPU control to finish physical GPU recovery before changing worker lifecycle'), { statusCode: 409 });
       }
@@ -2417,10 +2416,15 @@ export class ContainerManager {
       : store.authorizeDeviceIds(userId, workerId, deviceIds, directGroupId);
   }
 
+  async gpuInstances() {
+    if (!this.config.incusEnabled && !this.config.incusEndpoint) return [];
+    return this.incusRuntime.client.listInstances();
+  }
+
   /** Dedicated platform-admin domain only. The callback rechecks current
    * administrative authority and the existing worker protection lock. */
   async setPhysicalGpuSelection(id: string, deviceId: string | undefined,
-    authorize: () => Promise<void>): Promise<void> {
+    authorize: () => Promise<void>, profile?: string): Promise<void> {
     const conflict = (message: string) => Object.assign(new Error(message), { statusCode: 409, statusMessage: message });
     return this.withExistingWorkerLifecycleMutation(id, async () => {
       const info = this.containers.get(id)!, record = this.workerStore?.get(info.userId, id);
@@ -2429,8 +2433,7 @@ export class ContainerManager {
         throw conflict('Physical GPU assignment requires a settled ordinary Incus VM');
       const { useHardwareDeviceStore } = await import('./services');
       const hardware = useHardwareDeviceStore(), incarnation = this.capturedIncusIncarnation(info);
-      const binding = hardware.listCatalog().filter(device => device.physicalAssignment?.userId === info.userId &&
-        device.physicalAssignment.workerId === id);
+      const binding = hardware.listCatalog().filter(device => !!gpuAssignmentFor(device, info.userId, id));
       const selected = [...new Set([...(record.hardwareDeviceIds ?? []), ...(info.hardwareDeviceIds ?? [])])]
         .filter(value => isPhysicalGpuDevice(hardware.getDevice(value)));
       const physical = [...new Set([...binding.map(device => device.id), ...selected])];
@@ -2439,11 +2442,12 @@ export class ContainerManager {
       const currentId = deviceId ?? physical[0];
       if (!currentId) return;
       const device = hardware.getDevice(currentId);
-      if (!isNvidiaPhysicalGpuDevice(device)) throw conflict('Direct physical GPU assignment supports NVIDIA devices only');
-      if (device!.physicalAssignment && (device!.physicalAssignment.userId !== info.userId || device!.physicalAssignment.workerId !== id))
+      if (!isPhysicalGpuDevice(device)) throw conflict('Select an approved PCI GPU');
+      const currentBinding = gpuAssignmentFor(device, info.userId, id);
+      if (deviceId && gpuAssignments(device).some(binding => binding !== currentBinding && (!profile || !('profile' in binding))))
         throw conflict('Physical GPU belongs to another VM; release its assignment first');
       if ((record.hardwareDevicesRevoked || !deviceId && !record.hardwareDeviceIds?.includes(currentId)) &&
-          device!.physicalAssignment?.incarnation && device!.physicalAssignment.incarnation !== incarnation)
+          currentBinding?.incarnation && currentBinding.incarnation !== incarnation)
         throw conflict('Physical GPU recovery incarnation changed; preserve the stopped VM for administrative recovery');
       if ((record.pendingRebuild || info.pendingRebuild) && !record.hardwareDevicesRevoked)
         throw conflict('Apply pending worker configuration before changing its physical GPU');
@@ -2455,6 +2459,7 @@ export class ContainerManager {
           throw conflict('Physical GPU worker identity changed; preserve its recovery fence');
       };
       await validate(); await this.incusRuntime.assertPhysicalGpuStopped(info, incarnation);
+      if (deviceId) await this.incusRuntime.validateGpuAssignment(info, incarnation, device!, profile);
       // Existing restart/recovery fences are durable before either catalog or
       // native device mutation; unknown outcomes always retain this intent.
       await this.workerStore!.updateHardwareDeviceAccess(info.userId, id, record.hardwareDeviceIds, true);
@@ -2463,7 +2468,7 @@ export class ContainerManager {
       const retained = (record.hardwareDeviceIds ?? []).filter(value => !isPhysicalGpuDevice(hardware.getDevice(value)));
       const finalIds = deviceId ? [...retained, deviceId].sort() : retained;
       const receipt = { userId: info.userId, workerId: id, incarnation };
-      await hardware.setPhysicalGpuAssignment(currentId, receipt);
+      await hardware.setPhysicalGpuAssignment(currentId, receipt, undefined, deviceId ? profile : (currentBinding as { profile?: string } | undefined)?.profile);
       if (deviceId) {
         const ids = [...retained, deviceId].sort();
         await this.workerStore!.updateHardwareDeviceAccess(info.userId, id, ids, true);
@@ -2491,7 +2496,7 @@ export class ContainerManager {
     const { useHardwareDeviceStore } = await import('./services');
     const hardware = useHardwareDeviceStore(), record = this.workerStore?.get(info.userId, info.id);
     if (record?.hardwareDeviceIds?.some(value => isPhysicalGpuDevice(hardware.getDevice(value))) ||
-        hardware.listCatalog().some(device => device.physicalAssignment?.userId === info.userId && device.physicalAssignment.workerId === info.id))
+        hardware.listCatalog().some(device => !!gpuAssignmentFor(device, info.userId, info.id)))
       throw Object.assign(new Error('A platform administrator must release the physical GPU before archiving or deleting this worker'), { statusCode: 403 });
   }
 

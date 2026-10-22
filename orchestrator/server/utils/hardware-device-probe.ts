@@ -156,6 +156,25 @@ for entry in sorted((root/'sys/bus/pci/devices').glob('*')):
         reason = 'Physical GPU is owned by a host driver or its ownership is unknown; operator maintenance must release it before assignment.'
     capability = unsupported(reason, evidence) if reason else dict(supported=True, mode='gpu-physical',
         reason='Exclusive physical GPU passthrough; current identity, isolation and ownership are checked before start.', evidence=evidence)
+    evidence['physicalSupported'] = not bool(reason)
+    evidence['physicalReason'] = reason or capability['reason']
+    profiles, available, instances, profile_info = [], {}, {}, {}
+    for path in sorted((sys/'mdev_supported_types').glob('*')):
+        count, description = read(path/'available_instances'), read(path/'description')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', path.name) or read(path/'device_api') != 'vfio-pci' or not count.isdigit(): continue
+        profiles.append(path.name)
+        available[path.name] = int(count)
+        instances[path.name] = sorted(p.name for p in (path/'devices').glob('*')
+            if re.fullmatch(r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}', p.name) and p.exists())
+        framebuffer = re.search(r'(?:^|[, ])framebuffer=([0-9]+)M(?:[, ]|$)', description)
+        maximum = re.search(r'(?:^|[, ])max_instance=([0-9]+)(?:[, ]|$)', description)
+        profile_info[path.name] = dict(name=read(path/'name', path.name),
+            **({'framebufferMiB':int(framebuffer[1])} if framebuffer else {}),
+            **({'total':int(maximum[1])} if maximum else {}))
+    if profiles:
+        evidence.update(mediatedProfiles=profiles, mediatedAvailable=available, mediatedInstances=instances, mediatedProfileInfo=profile_info)
+        if serial and all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids) and iommu and driver and driver.name != 'vfio-pci':
+            capability = dict(supported=True, mode='gpu-mdev', reason='Native mediated GPU profiles; stopped VM and compatible capacity required. Guest drivers are the worker responsibility. Physical passthrough requires operator host release; Agentor never switches drivers.', evidence=evidence)
     # shortcut: driver UUID continuity expires on host reboot or PCI re-enumeration; revalidate with the host driver then.
     selector = 'pci-gpu:'+':'.join(ids)+':'+serial if serial and all(re.fullmatch(r'[0-9a-f]{4}', value) for value in ids) else 'pci-gpu:unavailable:'+entry.name
     result.append(dict(kind='gpu', selector=selector, name='GPU '+ids[0]+':'+ids[1]+' ('+entry.name+')',

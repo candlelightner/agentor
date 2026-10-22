@@ -49,8 +49,8 @@ function fixture() {
     rename: load('api/hardware-devices/[id].patch.ts', routeModules, globals).default,
   };
   const physical = { listPhysicalGpuAssignments: async () => { calls.push('list-physical'); return [{ deviceId: device.id }]; },
-    setPhysicalGpuAssignment: async (id: string, worker: string | null, authorize: () => void, password?: string) => {
-      await authorize(); calls.push('physical:' + (worker ?? 'none')); return { deviceId: id, workerId: worker, passwordSupplied: !!password };
+    setPhysicalGpuAssignment: async (id: string, worker: string | null, authorize: () => void, password?: string, options?: any) => {
+      await authorize(); calls.push('physical:' + (worker ?? 'none')); return { deviceId: id, workerId: worker, passwordSupplied: !!password, profile: options?.profile, releaseWorkerId: options?.releaseWorkerId };
     } };
   const { ManagementHardwareDeviceDomain } = load('utils/management-hardware-device-domain.ts', {
     './services': services, './hardware-device-revocation': revocation, './auth': { getUserById: () => ({ id: 'owner' }) },
@@ -174,7 +174,7 @@ test('queued release of GPU A cannot release replacement GPU B on the same worke
   } };
   const { setPhysicalGpuAssignment } = load('utils/physical-gpu-management.ts', {
     './services': { useHardwareDeviceStore: () => store, useWorkerStore: () => workers, useContainerManager: () => manager },
-    './hardware-device-store': { isNvidiaPhysicalGpuDevice: () => true },
+    './hardware-device-store': { isPhysicalGpuDevice: () => true, gpuAssignments: (device: any) => device?.physicalAssignment ? [device.physicalAssignment] : [] },
     './worker-protection-lock': { useWorkerProtectionLockStore: () => ({ verify: async () => {} }) },
   });
   await expect(setPhysicalGpuAssignment('gpu-a', null, async () => { authorized++; })).rejects.toMatchObject({ statusCode: 409 });
@@ -216,4 +216,34 @@ test('catalog REST and MCP responses omit host identity and assignment incarnati
   expect(publicHardwareDevice(f.device()).physicalAssignment).toEqual({ userId: 'owner', workerId: 'worker' });
   expect(f.device().physicalAssignment.incarnation).toBe('private-synthetic-incarnation');
   expect(f.device().physicalIdentity.bootId).toBe('private-synthetic-boot');
+});
+
+test('GPU view derives stopped reservations and running allocations from Incus/sysfs, and flags restart drift', async () => {
+  const device: any = { id: 'gpu', kind: 'gpu', name: 'Synthetic GPU', selector: 'pci-gpu:synthetic', mdevAssignments: [{ userId: 'owner', workerId: 'a', profile: 'native-small', incarnation: 'private' }] };
+  const evidence: any = { pciAddress: '0000:04:00.0', physicalSupported: false, mediatedProfiles: ['native-small'], mediatedAvailable: { 'native-small': 2 },
+    mediatedInstances: { 'native-small': [] }, mediatedProfileInfo: { 'native-small': { name: 'Small', framebufferMiB: 1024, total: 2 } } };
+  const worker = { id: 'a', userId: 'owner', displayName: 'Worker A', runtimeKind: 'incus-vm', status: 'active', hardwareDeviceIds: ['gpu'] };
+  const native: any = { name: 'worker-a', status: 'Stopped', config: { 'user.agentor.id': 'a' }, devices: { hw: { type: 'gpu', gputype: 'mdev', pci: evidence.pciAddress, mdev: 'native-small' } } };
+  const { listPhysicalGpuAssignments } = load('utils/physical-gpu-management.ts', {
+    './services': { useHardwareDeviceStore: () => ({ listCatalog: () => [device], listDiscoveredDevices: async () => [{ ...device, incus: { mode: 'gpu-mdev', supported: true, reason: 'Native profiles', evidence } }] }),
+      useWorkerStore: () => ({ list: () => [worker], get: () => worker }), useContainerManager: () => ({ gpuInstances: async () => [native], get: () => ({ status: native.status.toLowerCase() }) }) },
+    './hardware-device-store': { isPhysicalGpuDevice: () => true, gpuAssignments: (value: any) => value?.mdevAssignments ?? [] },
+    './worker-protection-lock': {},
+  });
+  let gpu = (await listPhysicalGpuAssignments()).devices[0];
+  expect(gpu.allocations).toEqual([{ workerId: 'a', displayName: 'Worker A', profile: 'native-small', status: 'stopped', pendingRebuild: false }]);
+  expect(gpu.profiles[0]).toMatchObject({ available: 1, total: 2, reserved: 1, active: 0, framebufferMiB: 1024 });
+  expect(JSON.stringify(gpu)).not.toContain('private');
+  native.status = 'Running'; native.config['volatile.hw.vgpu.uuid'] = 'uuid-a'; evidence.mediatedInstances['native-small'] = ['uuid-a']; evidence.mediatedAvailable['native-small'] = 1;
+  gpu = (await listPhysicalGpuAssignments()).devices[0];
+  expect(gpu.profiles[0]).toMatchObject({ available: 1, reserved: 0, active: 1 }); expect(gpu.status).toBe('running');
+  evidence.mediatedInstances['native-small'] = []; expect((await listPhysicalGpuAssignments()).devices[0].status).toBe('recovery-required');
+});
+
+
+test('MCP forwards native profile choice and exact allocation release through the shared admin operation', async () => {
+  const f = fixture(), authority = { scope: 'platform' as const, reauthorize: async () => {} };
+  await expect(f.domain.execute('hardware-devices.gpu.assign', { deviceId: 'gpu-device', workerId: 'worker', profile: 'native-small' }, authority)).resolves.toMatchObject({ result: { profile: 'native-small' } });
+  await expect(f.domain.execute('hardware-devices.gpu.release', { deviceId: 'gpu-device', workerId: 'worker' }, authority)).resolves.toMatchObject({ result: { releaseWorkerId: 'worker' } });
+  expect(f.domain.tools().find((tool: any) => tool.name === 'hardware-devices.gpu.assign').inputSchema.properties.profile.type).toBe('string');
 });

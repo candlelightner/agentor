@@ -45,7 +45,7 @@ test('NVIDIA physical GPUs require one exact catalog binding and reject legacy o
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
-test('catalog assignment CAS serializes independent stale stores and new physical assignment excludes non-NVIDIA devices', async () => {
+test('catalog assignment CAS serializes stale stores and generic PCI GPUs retain platform-only authority', async () => {
   const f = await fixture(); try {
     const nvidia = { ...candidate, vendor: '10de', selector: 'pci-gpu:10de:1234:10de:0000:synthetic-serial', deviceNodes: [] };
     const other = { ...nvidia, vendor: '1002', selector: 'pci-gpu:1002:1234:1002:0000:other-serial' };
@@ -59,7 +59,8 @@ test('catalog assignment CAS serializes independent stale stores and new physica
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
     const disk = JSON.parse(await readFile(join(f.dir, 'admin/hardware-devices.v1.json'), 'utf8'));
     expect(disk.find((item: any) => item.id === device.id).physicalAssignment).toEqual({ userId: owner, workerId: 'root-worker' });
-    await expect(f.store.setPhysicalGpuAssignment(unsupported.id, { userId: owner, workerId: 'child-worker' })).rejects.toMatchObject({ statusCode: 400 });
+    await f.store.setPhysicalGpuAssignment(unsupported.id, { userId: owner, workerId: 'child-worker' });
+    expect(f.store.canWorkerUseDevice(owner, 'child-worker', unsupported.id)).toBe(true);
     await expect(f.store.createOwnerGrant(owner, { deviceId: unsupported.id, targetType: 'all' })).rejects.toMatchObject({ statusCode: 403 });
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });

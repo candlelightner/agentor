@@ -6,14 +6,14 @@ import { randomUUID } from 'node:crypto';
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
-import { HardwareDeviceStore } from '../../orchestrator/server/utils/hardware-device-store';
+import { HardwareDeviceStore, gpuAssignmentFor } from '../../orchestrator/server/utils/hardware-device-store';
 import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker-runtime';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { useHardwareDeviceStore } from '../../orchestrator/server/utils/services';
 import type { HardwareDeviceCandidate } from '../../orchestrator/shared/types';
 
 // Entirely synthetic Incus transport; no host driver, PCI or device access.
-async function fixture() {
+async function fixture(profile?: string, vendor = '10de') {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-direct-gpu-'));
   const workers = new WorkerStore(dataDir), groups = new WorkerGroupStore(dataDir);
   await Promise.all([workers.init(), groups.init()]);
@@ -26,6 +26,11 @@ async function fixture() {
     vendor: '10de', product: '1234', serial: 'synthetic-serial', selector: 'pci-gpu:10de:1234:10de:0000:synthetic-serial',
     deviceNodes: [], groupIds: [], incus: { supported: true, mode: 'gpu-physical', reason: 'Synthetic isolated GPU',
       evidence: { pciAddress: '0000:04:00.0', driver: 'vfio-pci', bootVga: false, iommuGroup: '24', iommuMembers: ['0000:04:00.0'] } } };
+  candidate.vendor = vendor; candidate.selector = candidate.selector.replace('pci-gpu:10de:', `pci-gpu:${vendor}:`);
+  if (profile) candidate.incus = { supported: true, mode: 'gpu-mdev', reason: 'Native profiles', evidence: { pciAddress: '0000:04:00.0', driver: 'native-vgpu',
+    mediatedProfiles: ['vendor-small', 'vendor-large'], mediatedAvailable: { 'vendor-small': 2, 'vendor-large': 1 }, mediatedInstances: { 'vendor-small': [], 'vendor-large': [] },
+    mediatedProfileInfo: { 'vendor-small': { name: 'Small vGPU', framebufferMiB: 1024, total: 2 }, 'vendor-large': { name: 'Large vGPU', framebufferMiB: 2048, total: 1 } } } };
+  const peers: any[] = [];
   let inventory = [candidate], lost = false, writes = 0, authorization = true;
   const hardware = new HardwareDeviceStore(dataDir, async () => inventory, groups, workers); await hardware.init();
   const device = await hardware.approveDevice({ selector: candidate.selector });
@@ -42,12 +47,12 @@ async function fixture() {
       eth0: { type: 'nic', network: 'synthetic' } } };
   const actual = structuredClone(initial);
   const client: any = { getInstance: async () => structuredClone(actual), getInstanceState: async () => ({ status: actual.status }),
-    listInstances: async () => [], request: async () => ({ config: { restricted: 'true', 'restricted.devices.gpu': 'allow',
+    listInstances: async () => peers, request: async () => ({ config: { restricted: 'true', 'restricted.devices.gpu': 'allow',
       'user.agentor.gpu-physical': 'true', 'restricted.virtual-machines.lowlevel': 'block' } }),
     updateInstanceDevices: async (_name: string, devices: any, _accepted: any, expected: any) => {
       expect(expected).toEqual(actual); expect(actual.status).toBe('Stopped');
       expect(workers.get(owner.userId, id)?.hardwareDevicesRevoked).toBe(true);
-      expect(hardware.getDevice(device.id)?.physicalAssignment).toMatchObject({ userId: owner.userId, workerId: id });
+      expect(gpuAssignmentFor(hardware.getDevice(device.id), owner.userId, id)).toMatchObject({ userId: owner.userId, workerId: id });
       writes++; actual.devices = structuredClone(devices);
       if (lost) throw Error('Lost native configuration response');
     } };
@@ -58,10 +63,10 @@ async function fixture() {
   (manager as any).assertOwnerExists = async () => {};
   (manager as any).containers.set(id, info);
   const authorize = async () => { if (!authorization) throw Object.assign(Error('Not a platform administrator'), { statusCode: 403 }); };
-  return { dataDir, manager, workers, hardware, runtime, device, id, incarnation, owner, info, initial, actual,
+  return { candidate, peers, dataDir, manager, workers, hardware, runtime, device, id, incarnation, owner, info, initial, actual,
     get writes() { return writes; }, set lost(value: boolean) { lost = value; },
     disconnect() { inventory = []; }, deny() { authorization = false; }, authorize,
-    assign: () => manager.setPhysicalGpuSelection(id, device.id, authorize),
+    assign: (selectedProfile = profile) => manager.setPhysicalGpuSelection(id, device.id, authorize, selectedProfile),
     release: () => manager.setPhysicalGpuSelection(id, undefined, authorize),
     cleanup: async () => { for (const [name, value] of saved) globalHardware[name] = value; await rm(dataDir, { recursive: true, force: true }); } };
 }
@@ -171,5 +176,78 @@ test('failed final catalog release retains a retryable captured binding after th
     f.hardware.setPhysicalGpuAssignment = set;
     await f.release(); expect(f.writes).toBe(2);
     expect(f.hardware.getDevice(f.device.id)?.physicalAssignment).toBeUndefined();
+  } finally { await f.cleanup(); }
+});
+
+test('native vGPU cold assignment, profile change, recovery and disconnected release reuse existing lifecycle fences', async () => {
+  const f = await fixture('vendor-small'); try {
+    await f.assign();
+    expect(Object.values(f.actual.devices)).toContainEqual({ type: 'gpu', gputype: 'mdev', pci: '0000:04:00.0', mdev: 'vendor-small' });
+    expect(f.hardware.getDevice(f.device.id)?.physicalAssignment).toBeUndefined();
+    await f.assign('vendor-large');
+    expect(Object.values(f.actual.devices)).toContainEqual({ type: 'gpu', gputype: 'mdev', pci: '0000:04:00.0', mdev: 'vendor-large' });
+    f.lost = true; await expect(f.assign('vendor-small')).rejects.toThrow('Lost native');
+    expect(f.workers.get(f.owner.userId, f.id)?.hardwareDevicesRevoked).toBe(true);
+    f.lost = false; await f.assign();
+    f.disconnect(); await f.release();
+    expect(f.actual).toEqual(f.initial); expect(f.hardware.getDevice(f.device.id)?.mdevAssignments).toBeUndefined();
+  } finally { await f.cleanup(); }
+});
+
+test('vGPU invalid capacity, incompatible profiles, unknown instances and running mutations fail before changing worker state', async () => {
+  for (const reason of ['invalid', 'capacity', 'incompatible', 'unknown', 'running']) {
+    const f = await fixture('vendor-small'); try {
+      const evidence = f.candidate.incus!.evidence!;
+      if (reason === 'capacity') evidence.mediatedAvailable!['vendor-small'] = 0;
+      if (reason === 'incompatible') f.peers.push({ name: 'foreign', status: 'Stopped', config: {}, devices: { gpu: { type: 'gpu', gputype: 'mdev', pci: '0000:04:00.0', mdev: 'vendor-large' } } });
+      if (reason === 'unknown') evidence.mediatedInstances!['vendor-small'] = [randomUUID()];
+      if (reason === 'running') f.actual.status = 'Running';
+      await expect(f.assign(reason === 'invalid' ? 'not-exposed' : undefined)).rejects.toThrow();
+      expect(f.writes).toBe(0); expect(f.workers.get(f.owner.userId, f.id)?.hardwareDevicesRevoked).toBeUndefined();
+      expect(f.hardware.getDevice(f.device.id)?.mdevAssignments).toBeUndefined();
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('two stopped vGPU selections reserve real capacity and generic owner/group paths cannot allocate or revoke them', async () => {
+  const f = await fixture('vendor-small'); try {
+    await f.assign();
+    const record = f.workers.get(f.owner.userId, f.id)!;
+    const second = { ...record, id: randomUUID(), hardwareDeviceIds: undefined };
+    const third = { ...second, id: randomUUID() };
+    await f.workers.upsert(second); await f.workers.upsert(third);
+    await f.hardware.setPhysicalGpuAssignment(f.device.id, { userId: second.userId, workerId: second.id }, undefined, 'vendor-small');
+    await expect(f.hardware.setPhysicalGpuAssignment(f.device.id, { userId: third.userId, workerId: third.id }, undefined, 'vendor-small')).rejects.toThrow('capacity');
+    await expect(f.hardware.setPhysicalGpuAssignment(f.device.id, { userId: second.userId, workerId: second.id }, undefined, 'vendor-large')).rejects.toThrow('homogeneous');
+    await expect(f.hardware.createOwnerGrant(f.owner.userId, { deviceId: f.device.id, targetType: 'worker', targetId: f.id })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(f.hardware.createGroupDelegation(f.owner.userId, 'group', { deviceId: f.device.id, targetType: 'worker', targetId: f.id })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(f.manager.updateSettings(f.id, { hardwareDeviceIds: [] })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(f.manager.archive(f.id)).rejects.toMatchObject({ statusCode: 403 });
+    await expect(f.manager.remove(f.id)).rejects.toMatchObject({ statusCode: 403 });
+    const reloaded = new HardwareDeviceStore(f.dataDir, async () => [f.candidate], new WorkerGroupStore(f.dataDir), f.workers); await reloaded.init();
+    expect(reloaded.canWorkerUseDevice(f.owner.userId, f.id, f.device.id)).toBe(true);
+    await f.release();
+    expect(f.hardware.getDevice(f.device.id)?.mdevAssignments?.map(binding => binding.workerId)).toEqual([second.id]);
+    await f.hardware.setPhysicalGpuAssignment(f.device.id, undefined, { userId: second.userId, workerId: second.id });
+  } finally { await f.cleanup(); }
+});
+
+test('GPU inventory skips an unconfigured Incus runtime but observes configured native workers when creation is disabled', async () => {
+  const config: any = { incusEnabled: false, incusEndpoint: '' };
+  const manager = new ContainerManager({} as any, config);
+  let reads = 0;
+  const instances = [{ name: 'synthetic-native-worker' }];
+  manager.setIncusRuntime({ client: { listInstances: async () => { reads++; return instances; } } } as any);
+  expect(await manager.gpuInstances()).toEqual([]);
+  expect(reads).toBe(0);
+  config.incusEndpoint = 'https://incus.example:8443';
+  expect(await manager.gpuInstances()).toEqual(instances);
+  expect(reads).toBe(1);
+});
+
+test('consumer GPU without mdev support retains generic physical passthrough', async () => {
+  const f = await fixture(undefined, '1002'); try {
+    await f.assign(); expect(Object.values(f.actual.devices)).toContainEqual({ type: 'gpu', gputype: 'physical', pci: '0000:04:00.0' });
+    await f.release(); expect(f.actual).toEqual(f.initial);
   } finally { await f.cleanup(); }
 });
