@@ -397,8 +397,13 @@ def routing_unlocked(config):
     command("sysctl", "-w", "net.ipv4.ip_forward=1")
 
 
+def unit_path(value):
+    # Unit path fields expand specifiers, but never command environment variables.
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
 def unit_argument(value):
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+    return unit_path(value).replace("$", "$$")
 
 
 def bridge_ready_timeout(config):
@@ -483,7 +488,7 @@ def install_units(config, directory, library):
     budget = bridge_ready_timeout(config)
     header = "# Agentor installation " + config["installation"] + "\n"
     units = {
-        prefix + "-bridge-ready.service": header + "[Unit]\nWants=incus.service\nAfter=incus.service\nBefore=docker.service\nRequiresMountsFor=" + unit_argument(config["dataDir"])
+        prefix + "-bridge-ready.service": header + "[Unit]\nWants=incus.service\nAfter=incus.service\nBefore=docker.service\nRequiresMountsFor=" + unit_path(config["dataDir"])
             + "\n[Service]\nType=oneshot\nExecStart=" + " ".join(map(unit_argument, ready))
             + "\nTimeoutStartSec=" + str(budget + 15) + "\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\n",
         prefix + "-policy.service": header + "[Unit]\nAfter=network-online.target incus.service docker.service\n[Service]\nType=simple\nUser=root\nExecStart=" + " ".join(map(unit_argument, policy))

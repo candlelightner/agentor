@@ -810,6 +810,31 @@ print('attempting',flush=True);m.routing({'installation':ident})
         value = SETUP.unit_argument('/srv/a b/$secret%name"file')
         self.assertEqual(value, '"/srv/a b/$$secret%%name\\"file"')
 
+    def test_generated_mount_dependency_resolves_literal_dollar_space_and_percent_data_path(self):
+        data = '/srv/agentor $literal%data'
+        self.assertEqual(SETUP.SOURCES.canonical(data), data)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); name = 'agentor-incus-12345678-bridge-ready.service'
+            config = {**self.config(), 'dataDir': data, 'listen': '172.25.0.1', 'policyPort': 9444}
+            with patch.object(SETUP, 'SYSTEMD_SYSTEM', root), patch.object(SETUP, 'namespace'), \
+                 patch.object(SETUP, 'verify_startup_order'), patch.object(SETUP, 'command'), patch.object(SETUP, 'write_file') as write:
+                SETUP.install_units(config, root / 'operator', root / 'library')
+            body = next(call.args[1] for call in write.call_args_list if call.args[0] == root / name)
+            self.assertIn('RequiresMountsFor="/srv/agentor $literal%%data"\n', body)
+            (root / name).write_text(body)
+            for target in ('sysinit.target', 'basic.target', 'shutdown.target'):
+                (root / target).write_text('[Unit]\nDefaultDependencies=no\n')
+            (root / 'incus.service').write_text('[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n')
+            mount = subprocess.check_output(['systemd-escape', '--path', '--suffix=mount', data], text=True).strip()
+            (root / mount).write_text('[Unit]\nDefaultDependencies=no\nAfter=' + name +
+                                     '\n[Mount]\nWhat=tmpfs\nType=tmpfs\nWhere=/srv/agentor $literal%%data\n')
+            # This reverse ordering must form a cycle only when the generated
+            # gate actually depends on the exact DATA mount, including its '$'.
+            result = subprocess.run(['systemd-analyze', 'verify', '--man=no', '--generators=no', str(root / name)],
+                                    capture_output=True, timeout=15,
+                                    env={**os.environ, 'SYSTEMD_UNIT_PATH': temporary, 'LC_ALL': 'C'})
+            self.assertIn(b'ordering cycle', result.stderr.lower())
+
     def test_generated_nft_check_and_install_use_separate_chain_table_closing_lines(self):
         config = self.config(); submitted = []
         def command(*args, **kwargs):
