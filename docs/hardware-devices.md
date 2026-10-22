@@ -1,6 +1,6 @@
 # Hardware device permissions
 
-Agentor can pass host GPUs and USB devices into ordinary workers. USB and Intel mediated GPU access requires platform approval, account entitlement, and an owner assignment. Physical NVIDIA GPUs use the separate platform-admin-only assignment described below. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
+Agentor can pass host GPUs and USB devices into ordinary workers. USB and Intel mediated GPU access requires platform approval, account entitlement, and an owner assignment. Physical PCI GPUs and native vGPU profiles use the separate platform-admin-only assignment described below. A host bind mount is not sufficient because Docker's device cgroup must also permit the character device.
 
 ## Discovery and stable identity
 
@@ -73,7 +73,7 @@ Legacy USB catalog selectors written by the old shell probe may contain one newl
 
 ### Physical GPU passthrough (P1, separate opt-in)
 
-Physical NVIDIA GPU assignment uses the existing catalog, exclusive reservations,
+Physical PCIe GPU assignment uses the existing catalog, exclusive reservations,
 revocation and incarnation fences, with platform-admin-only per-VM authority. It emits only
 `type=gpu`, `gputype=physical`, and the current PCI address resolved from fresh
 sysfs evidence. Worker requests, records, exports and backups keep opaque catalog
@@ -117,7 +117,7 @@ GPU permission; the trusted control plane enforces the exact catalog device.
 Physical and mdev policy can coexist, with each explicitly enabled. Changing
 project policy or production GPU ownership still requires operator approval.
 
-Only a global platform administrator can assign or release a physical NVIDIA
+Only a global platform administrator can assign or release a physical PCIe
 GPU. The Hardware dialog provides one VM selector per approved GPU; the same
 operations are available through platform-admin MCP as
 `hardware-devices.gpu.list`, `hardware-devices.gpu.assign` and
@@ -125,8 +125,9 @@ operations are available through platform-admin MCP as
 Assignment uses a catalog binding to one explicit ordinary Incus VM, independent
 of account/group grants. Owner grants, delegated grants, portable imports,
 clones and generic worker settings cannot create, move or remove this binding.
-Existing Intel mediated GPU and USB permissions remain unchanged. Other
-physical GPU vendors are not enabled by this interface.
+Existing Intel mediated GPU and USB permissions remain unchanged. The physical
+path accepts any vendor with the required identity and isolation evidence, including
+consumer GPUs with no native mdev capability.
 
 Stop the VM before assigning or releasing its GPU. Agentor changes only the
 captured stopped VM's device configuration, retaining its ordinary root image,
@@ -155,3 +156,37 @@ unrelated guest health before and after the cycle. When upstream PCIe bridges
 must stay awake during testing, use only temporary operator-approved settings and
 restore them afterward; install no permanent power policy. Keep actual identities,
 addresses, topology, diagnostics and acceptance receipts private and untracked.
+
+
+### Native vGPU profiles in Hardware
+
+For host preparation, guest driver compatibility and a disposable CUDA lifecycle
+check, see [NVIDIA vGPU setup](nvidia-vgpu.md).
+
+The existing platform GPU opt-in also enables per-worker native mdev assignment.
+The Hardware popup lists dynamically discovered profile names, framebuffer sizes
+and maximum capacity when sysfs reports them, current available capacity, and
+running or stopped worker allocations. Incus device configurations remain the
+allocation record; existing catalog metadata stores only administrative authority
+and interrupted-change recovery receipts. No allocation database or service is added.
+
+Use the same GPU REST/MCP operations, with an optional `profile` on assignment:
+`hardware-devices.gpu.assign({deviceId, workerId, profile})`. Omitting `profile`
+selects full physical passthrough. To release one of several vGPU allocations,
+provide `workerId` to `hardware-devices.gpu.release`; REST uses
+`{deviceId, workerId: null, releaseWorkerId}`. Profile changes require the same
+stopped worker and preserve its other devices and data. Stopped configurations
+reserve capacity across starts; running instances must have distinct UUIDs found
+in current sysfs. Unknown instances, conflicting physical mappings and insufficient
+capacity block assignment. Homogeneous profiles are required conservatively;
+mixed profiles are not inferred from framebuffer sizes alone.
+
+Host mode is reported from current driver ownership. Full physical passthrough
+remains visible when a host vGPU driver owns the GPU, with its maintenance
+constraint explained. Agentor never changes host drivers or creates mdevs itself.
+Native vGPU guest drivers and licensing belong to the worker; Agentor installs
+neither and imposes no Intel render-node setup on a native vGPU guest. Intel's
+existing operator-selected GVT-g profile and USB authorization stay unchanged.
+The restricted Incus client sees only its installation project; unknown live
+sysfs instances fail closed. Operators must also account for stopped assignments
+in other projects before reserving a shared host GPU.

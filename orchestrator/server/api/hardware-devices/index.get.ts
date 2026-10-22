@@ -17,7 +17,7 @@ export default defineEventHandler(async (event) => {
   const liveSelectors = new Set(discovered.map((item) => item.selector));
   const entitled = new Set(store.listEntitledDevices(ownerId).map((item) => item.id));
   const baseCatalog = user.role === "admin" ? store.listCatalog() : store.listCatalog().filter(item =>
-    entitled.has(item.id) || item.physicalAssignment?.userId === ownerId);
+    entitled.has(item.id) || item.physicalAssignment?.userId === ownerId || item.mdevAssignments?.some(binding => binding.userId === ownerId));
   const workerId = typeof query.workerId === "string" ? query.workerId : undefined;
   const groupId = typeof query.groupId === "string" ? query.groupId : undefined;
   if (workerId && groupId) throw createError({ statusCode: 400, statusMessage: "Choose workerId or groupId, not both" });

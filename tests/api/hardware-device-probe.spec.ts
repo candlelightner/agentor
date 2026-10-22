@@ -176,3 +176,18 @@ test('physical GPU reads bounded VPD serial records and rejects malformed or dup
     }
   } finally { await f.cleanup(); }
 });
+
+test('native vGPU profiles are discovered without DRM, with driver-owned physical fallback constraints', async () => {
+  const f = await fixture(); try {
+    const { pci } = await f.add();
+    const driver = join(f.root, 'sys/bus/pci/drivers/native-vgpu'); await mkdir(driver, { recursive: true }); await symlink(driver, join(pci, 'driver'));
+    const profile = join(pci, 'mdev_supported_types/vendor-profile'); await mkdir(join(profile, 'devices'), { recursive: true });
+    for (const [key, value] of Object.entries({ device_api: 'vfio-pci', name: 'Discovered vGPU', description: 'framebuffer=4096M, max_instance=3', available_instances: '2' })) await writeFile(join(profile, key), value);
+    const uuid = '11111111-2222-3333-4444-555555555555'; await mkdir(join(profile, 'devices', uuid));
+    expect(f.read()[0]?.incus).toMatchObject({ supported: true, mode: 'gpu-mdev', evidence: { physicalSupported: false,
+      mediatedProfiles: ['vendor-profile'], mediatedAvailable: { 'vendor-profile': 2 }, mediatedInstances: { 'vendor-profile': [uuid] },
+      mediatedProfileInfo: { 'vendor-profile': { name: 'Discovered vGPU', framebufferMiB: 4096, total: 3 } } } });
+    await writeFile(join(profile, 'device_api'), 'unsupported'); expect(f.read()[0]?.incus?.mode).toBe('unsupported');
+    await rm(join(pci, 'driver')); expect(f.read()[0]?.incus?.mode).toBe('gpu-physical');
+  } finally { await f.cleanup(); }
+});

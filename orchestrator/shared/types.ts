@@ -56,8 +56,10 @@ export interface HardwareDevice {
   serial?: string;
   /** Private continuity witness; valid only for the same host boot and kernel PCI object. */
   physicalIdentity?: { bootId: string; deviceInode: string; deviceNodes?: string[] };
-  /** Platform-admin-only assignment authority for one ordinary NVIDIA VM. */
+  /** Platform-admin-only physical assignment authority for one ordinary VM. */
   physicalAssignment?: { userId: string; workerId: string; /** Private cold-change recovery receipt. */ incarnation?: string };
+  /** Administrative authority/recovery receipts; actual allocations live in Incus. */
+  mdevAssignments?: (NonNullable<HardwareDevice['physicalAssignment']> & { profile: string })[];
   createdAt: string;
   updatedAt: string;
 }
@@ -68,6 +70,8 @@ export interface IncusHardwareCapability {
   reason: string;
   evidence?: { driver?: string; iommuGroup?: string; mediatedProfiles?: string[]; sriovTotalVfs?: number; bootVga?: boolean; gvtEnabled?: boolean;
     mediatedAvailable?: Record<string, number>; mediatedInstances?: Record<string, string[]>;
+    mediatedProfileInfo?: Record<string, { name: string; framebufferMiB?: number; total?: number }>;
+    physicalSupported?: boolean; physicalReason?: string;
     pciAddress?: string; iommuMembers?: string[]; iommuBridges?: string[]; resetMethods?: string[]; resetDomainSafe?: boolean };
 }
 
@@ -102,6 +106,7 @@ export interface HardwareDeviceGrant {
 }
 
 export interface ResolvedHardwareDevice {
+  mdevProfile?: string;
   candidate?: HardwareDeviceCandidate;
   deviceId: string;
   deviceNodes: string[];

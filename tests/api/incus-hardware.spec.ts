@@ -452,3 +452,20 @@ test('shared Docker log reader retains raw buffers and parsed strings without ch
     });
   }
 });
+
+test('native shared mdev permits distinct instances within capacity and rejects duplicate UUIDs or excess stopped reservations', () => {
+  const pci = '0000:04:00.0', profile = 'native-small', expected = { hwself: { type: 'gpu', gputype: 'mdev', pci, mdev: profile } };
+  const evidence: any = { pciAddress: pci, mediatedProfiles: [profile], mediatedAvailable: { [profile]: 1 },
+    mediatedInstances: { [profile]: ['uuid-a'] }, mediatedProfileInfo: { [profile]: { name: 'Small', total: 2 } } };
+  const inventory: any[] = [{ incus: { evidence } }];
+  const peer: any = { name: 'peer-a', status: 'Running', config: { 'volatile.hw.vgpu.uuid': 'uuid-a' }, devices: { hw: { ...expected.hwself } } };
+  expect(() => assertIncusHardwareExclusive('self', expected, [peer], inventory)).not.toThrow();
+  const stopped = { ...peer, name: 'peer-b', status: 'Stopped', config: {} };
+  expect(() => assertIncusHardwareExclusive('self', expected, [peer, stopped], inventory)).toThrow('capacity');
+  const duplicate = { ...peer, name: 'peer-b' };
+  expect(() => assertIncusHardwareExclusive('self', expected, [peer, duplicate], inventory)).toThrow('ownership');
+  evidence.mediatedInstances[profile] = ['uuid-a', 'unmanaged'];
+  expect(() => assertIncusHardwareExclusive('self', expected, [peer], inventory)).toThrow('unknown');
+  evidence.mediatedInstances = { [profile]: ['uuid-a'], 'native-large': ['uuid-b'] };
+  expect(() => assertIncusHardwareExclusive('self', expected, [peer], inventory)).toThrow('homogeneous');
+});

@@ -30,7 +30,7 @@ All agents are installed in a single unified worker image. Start any agent via i
 - **Port & domain mapping** — unified Traefik reverse proxy handling both TCP port forwarding (localhost- or network-bound) and subdomain-based HTTP/HTTPS/TCP routing with TLS (Let's Encrypt HTTP-01/DNS-01 or self-signed CA), optional HTTP basic auth
 - **Auto-updates** — per-image or bulk image updates in production mode with registry-agnostic digest comparison (GHCR + Docker Hub), orchestrator self-replaces
 - **Resource limits** — per-environment CPU and memory constraints applied to every worker on that environment (plus a global default)
-- **Hardware grants** — cataloged, authorized devices with capability reporting and ownership checks; supported Intel GVT-g sharing and serial USB are explicit operator opt-ins, while VM grants reject storage and unsupported passthrough modes; see [Hardware permissions](docs/hardware-devices.md)
+- **Hardware grants** — cataloged, authorized devices with capability reporting and ownership checks; native vGPU profiles, full physical GPU passthrough, Intel GVT-g sharing and serial USB use explicit operator opt-ins; see [Hardware permissions](docs/hardware-devices.md) and [NVIDIA vGPU setup](docs/nvidia-vgpu.md)
 - **Governed host mounts** — an empty-by-default platform path catalog, per-account entitlements, all/group/worker assignments, read-only-by-default access, downward-only group-admin delegation, and immediate stop/rebuild enforcement on revocation; see [Host mount permissions](docs/host-mounts.md)
 - **Persistent VM storage** — workspace, agent/editor state, selected persistent paths, managed volumes and optional native Docker data survive compute rebuilds and archiving; the VM root disk is disposable
 - **Bounded worker recovery** — durable running/stopped intent survives daemon restarts; unresponsive runtimes report safe diagnostics and can be recovered through UI/API/MCP while preserving canonical data; ambiguous operations retain explicit recovery fences
@@ -78,8 +78,10 @@ disk. Rebuild preserves canonical persistent volumes; arbitrary changes to the
 root filesystem need a custom image, setup script or selected persistent path.
 
 Intel UHD620 mediated GPU use has passed real migration, rebuild, host reboot and
-Whisper/Vulkan workload checks. Physical GPU/PCI, SR-IOV and native-context
-assignment are unsupported. Physical USB attach/detach/revocation acceptance is
+Whisper/Vulkan workload checks. Native mdev profiles and full physical GPU
+passthrough are available through platform-admin Hardware controls; see
+[NVIDIA vGPU setup](docs/nvidia-vgpu.md). Raw PCI, direct SR-IOV and native-context
+assignment remain unsupported. Physical USB attach/detach/revocation acceptance is
 still open in [#12](https://github.com/candlelightner/agentor/issues/12). Native-admin
 encrypted disaster recovery and compound updater/recovery tests remain tracked
 in [#13](https://github.com/candlelightner/agentor/issues/13); representative backup
