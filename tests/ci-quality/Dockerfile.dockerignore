@@ -1,0 +1,7 @@
+**
+!tests/
+!tests/package.json
+!tests/package-lock.json
+!tests/ci-quality/
+!tests/ci-quality/Dockerfile
+!tests/ci-quality/check-image.mjs
