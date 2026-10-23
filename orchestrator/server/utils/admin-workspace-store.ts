@@ -87,7 +87,7 @@ export type AdminWorkspaceIdentityMaterializer = (
  */
 export interface AdminWorkspaceRuntimeAdapter {
   getCpuSettings?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<VcpuSettings>;
-  setCpuCount?(record: Readonly<AdministrativeWorkspaceRecord>, count: number, acknowledge: AdminNativeAcknowledge): Promise<VcpuSettings>;
+  setCpuCount?(record: Readonly<AdministrativeWorkspaceRecord>, count: number, acknowledge: AdminNativeAcknowledge, authorize?: () => void): Promise<VcpuSettings>;
   observeStatus?(record: Readonly<AdministrativeWorkspaceRecord>): Promise<"running" | "stopped">;
   ensure(
     record: Readonly<AdministrativeWorkspaceRecord>,
@@ -514,14 +514,21 @@ export class AdminWorkspaceStore {
       throw Object.assign(new Error('Administrative workspace changed; refresh CPU settings'), { statusCode: 503 });
     return result;
   }
-  async setCpuCount(value: unknown, expectedWorkspaceId?: string): Promise<VcpuSettings> {
+  async setCpuCount(value: unknown, expectedWorkspaceId?: string, authorize?: () => void, reconcileOnly = false): Promise<VcpuSettings> {
     const count = validateVcpuCount(value);
     return this.withNativeRuntimeTransaction(async (record, acknowledge) => {
+      authorize?.();
+      if (reconcileOnly && record.nativeRuntime?.pending?.kind !== 'cpu') {
+        useLogger().warn('[vcpu] Reconciliation has no recorded CPU operation; request stopped without submitting a resize.');
+        throw Object.assign(new Error('No pending CPU change remains; refresh CPU settings'), { statusCode: 409 });
+      }
       if (expectedWorkspaceId !== undefined && record.id !== expectedWorkspaceId)
         throw Object.assign(new Error('Administrative workspace changed; refresh before retrying'), { statusCode: 409 });
       this.requireRuntime();
       if (!this.runtime!.setCpuCount) throw Object.assign(new Error('Administrative CPU settings are unavailable'), { statusCode: 503 });
-      return this.runtime!.setCpuCount(record, count, acknowledge);
+      const result = await this.runtime!.setCpuCount(record, count, acknowledge, authorize);
+      authorize?.();
+      return result;
     });
   }
   async setResources(value: unknown) {

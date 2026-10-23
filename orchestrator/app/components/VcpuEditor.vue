@@ -38,7 +38,7 @@ onMounted(() => { void request(); });
     <p class="text-xs">Stop the VM before changing its vCPU count. Save, then start it normally; storage is retained.</p>
     <p v-if="error" role="alert" class="text-sm text-red-500">{{ error }}</p>
     <template v-if="settings">
-      <p class="text-xs">Assigned: {{ settings.vcpuCount }} · Backend maximum: {{ settings.maxVcpuCount }}</p>
+      <p class="text-xs">Assigned: {{ settings.vcpuCount }} · Maximum allowed: {{ settings.maxVcpuCount }}</p>
       <p v-if="settings.status === 'running'" role="status" class="text-xs">Stop the VM, then refresh to edit its vCPU count.</p>
       <p v-if="settings.pending" role="status" class="text-xs text-amber-500">A previous CPU change needs reconciliation before another change.</p>
       <UButton v-if="settings.pendingVcpuCount !== undefined" :disabled="busy" color="warning" @click="request(true, true)">Reconcile pending CPU change</UButton>

@@ -651,13 +651,13 @@ export class IncusClient {
   }
 
   async updateInstanceCpuCount(name: string, count: number,
-    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance): Promise<void> {
+    onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance, assertAllowed?: () => void): Promise<void> {
     let submitted = false;
     try {
       validateVcpuCount(count);
       validateVcpuCount(count, await this.getCpuCapacity());
       if (!expected) throw new IncusError('CPU update requires the captured stopped VM definition');
-      await this.updateInstanceDefinition(name, expected.devices, onAccepted, expected, undefined, count, () => { submitted = true; });
+      await this.updateInstanceDefinition(name, expected.devices, onAccepted, expected, undefined, count, () => { assertAllowed?.(); submitted = true; });
     } catch (error) {
       if (!submitted && !(error instanceof IncusRequestRejected))
         throw new IncusRequestRejected(error instanceof Error ? error.message : 'CPU update was not submitted',

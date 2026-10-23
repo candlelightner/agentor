@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,9 +9,16 @@ import { IncusWorkerRuntime } from '../../orchestrator/server/utils/incus-worker
 import { ContainerManager } from '../../orchestrator/server/utils/container';
 import { WorkerStore } from '../../orchestrator/server/utils/worker-store';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
-import { useContainerManager } from '../../orchestrator/server/utils/services';
+import { useContainerManager, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { useWorkerProtectionLockStore } from '../../orchestrator/server/utils/worker-protection-lock';
 import { withWorkerLifecycleMutation, isWorkerLifecycleMutationActive } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+
+const previousLogger = Object.getOwnPropertyDescriptor(globalThis, 'useLogger');
+test.beforeAll(() => { (globalThis as any).useLogger ??= () => ({ debug() {}, info() {}, warn() {}, error() {} }); });
+test.afterAll(() => {
+  if (previousLogger) Object.defineProperty(globalThis, 'useLogger', previousLogger);
+  else delete (globalThis as any).useLogger;
+});
 
 const instance = () => ({ name: 'fixture', type: 'virtual-machine', status: 'Stopped', profiles: [], description: 'retained',
   config: { 'volatile.uuid': randomUUID(), 'limits.cpu': '2', 'limits.memory': '4GiB', 'user.agentor.owner': 'owner' },
@@ -266,4 +274,73 @@ test('CPU routes authorize before body reads, honor protection and reject pendin
     manager.get = original.get; manager.getVcpuSettings = original.read; manager.setVcpuCount = original.write; locks.verify = original.verify;
     for (const [key, descriptor] of saved) { if (descriptor) Object.defineProperty(globals, key, descriptor); else delete globals[key]; }
   }
+});
+
+
+test('group ceiling applies to owner resize and readback, while recorded reconciliation stays observational', async () => {
+  const f = await workerFixture(), groups = useWorkerGroupStore();
+  await groups.init();
+  const group = await groups.create(f.owner.userId, 'CPU policy fixture', undefined, undefined, 4);
+  await groups.update(f.owner.userId, group.id, { workerIds: [f.info.id] });
+  try {
+    expect(await f.manager.getVcpuSettings(f.info.id)).toMatchObject({ vcpuCount: 2, maxVcpuCount: 4 });
+    await expect(f.manager.setVcpuCount(f.info.id, 5)).rejects.toMatchObject({ statusCode: 403 });
+    expect(f.updates).toBe(0);
+    expect(f.store.get(f.owner.userId, f.info.id)?.incusCpuResize).toBeUndefined();
+    f.mode = 'unknown';
+    await expect(f.manager.setVcpuCount(f.info.id, 4)).rejects.toThrow('Lost operation');
+    await groups.update(f.owner.userId, group.id, { maxVcpuCount: 1 });
+    expect(await f.manager.getVcpuSettings(f.info.id)).toMatchObject({ vcpuCount: 4, maxVcpuCount: 1, pending: true });
+    expect(await f.manager.setVcpuCount(f.info.id, 4, undefined, true)).toMatchObject({ vcpuCount: 4, maxVcpuCount: 1, pending: false });
+    expect(f.updates).toBe(1);
+    await expect(f.manager.setVcpuCount(f.info.id, 1, undefined, true)).rejects.toThrow('No pending');
+    expect(f.updates).toBe(1);
+    expect(f.actual.config['limits.cpu']).toBe('4');
+  } finally { await groups.remove(f.owner.userId, group.id); await f.cleanup(); }
+});
+
+test('CPU authority and the group ceiling are rechecked after asynchronous preflight', async () => {
+  const f = await workerFixture(), groups = useWorkerGroupStore();
+  await groups.init();
+  const group = await groups.create(f.owner.userId, 'CPU recheck fixture', undefined, undefined, 4);
+  await groups.update(f.owner.userId, group.id, { workerIds: [f.info.id] });
+  let allowed = true;
+  try {
+    f.runtime.client.getCpuCapacity = async () => {
+      await groups.update(f.owner.userId, group.id, { maxVcpuCount: 2 });
+      return 8;
+    };
+    await expect(f.manager.setVcpuCount(f.info.id, 4)).rejects.toThrow('ceiling of 2');
+    expect(f.updates).toBe(0);
+    f.runtime.client.getCpuCapacity = async () => { allowed = false; return 8; };
+    await expect(f.manager.setVcpuCount(f.info.id, 1, () => {
+      if (!allowed) throw Object.assign(new Error('Delegation revoked'), { statusCode: 403 });
+    })).rejects.toThrow('Delegation revoked');
+    expect(f.updates).toBe(0);
+    expect(f.store.get(f.owner.userId, f.info.id)?.incusCpuResize).toBeUndefined();
+  } finally { await groups.remove(f.owner.userId, group.id); await f.cleanup(); }
+});
+
+
+test('CPU authority revoked at the final native submission boundary produces no write', async () => {
+  const f = clientFixture();
+  await expect(f.client.updateInstanceCpuCount('fixture', 4, undefined, f.current as any, () => {
+    throw Object.assign(new Error('CPU authority revoked'), { statusCode: 403 });
+  })).rejects.toBeInstanceOf(IncusRequestRejected);
+  expect(f.writes).toEqual([]);
+});
+
+
+test('ordinary runtime receives live allocation policy from its container manager before native preflight', async () => {
+  const f = await workerFixture(), groups = useWorkerGroupStore();
+  await groups.init();
+  const group = await groups.create(f.owner.userId, 'Runtime policy fixture', undefined, undefined, 2);
+  await groups.update(f.owner.userId, group.id, { workerIds: [f.info.id] });
+  const options: any = { ...f.owner, cpuLimit: 3, start: false, recreationNonce: 'fixture-nonce' };
+  try {
+    await expect(f.runtime.preflightRecreation(options)).rejects.toThrow('ceiling of 2');
+    await expect(f.runtime.preflightCanonicalRestore(options)).rejects.toThrow('ceiling of 2');
+    await expect(f.runtime.create(options)).rejects.toThrow('ceiling of 2');
+    expect(f.updates).toBe(0);
+  } finally { await groups.remove(f.owner.userId, group.id); await f.cleanup(); }
 });

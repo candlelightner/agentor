@@ -39,9 +39,11 @@ jobs:
               - 'scripts/incus-canary.mjs'
               - '.dockerignore'
               - '.github/workflows/docker-build.yml'
+              - 'scripts/promote-main-image.sh'
             worker:
               - 'worker/**'
               - '.github/workflows/docker-build.yml'
+              - 'scripts/promote-main-image.sh'
             validation:
               - 'orchestrator/**'
               - 'worker/**'
@@ -52,6 +54,7 @@ jobs:
               - 'scripts/agentor-incus-network-service.py'
               - 'scripts/setup-incus-host.sh'
               - 'scripts/profile-ci-workflow.py'
+              - 'scripts/promote-main-image.sh'
               - '.dockerignore'
               - 'tests/**'
               - 'docker-compose.tests.yml'
@@ -366,11 +369,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/agentor-orchestrator
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
 
       - run: |
           cd /tmp/digests
@@ -468,11 +471,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/agentor-worker
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
 
       - run: |
           cd /tmp/digests
@@ -480,3 +483,49 @@ jobs:
           TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           SOURCES=$(for f in *; do echo "$IMAGE@$(cat $f)"; done)
           docker buildx imagetools create $TAGS $SOURCES
+
+  promote-main:
+    name: Promote main (${{ matrix.image }})
+    needs: [merge-orchestrator, merge-worker]
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      (needs.merge-orchestrator.result == 'success' || needs.merge-worker.result == 'success')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: agentor-orchestrator
+            merge-result: ${{ needs.merge-orchestrator.result }}
+          - image: agentor-worker
+            merge-result: ${{ needs.merge-worker.result }}
+    # Keep the freshness check and both shared tags under the same per-image lock.
+    concurrency:
+      group: main-image-promotion-${{ github.repository }}-${{ matrix.image }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        if: matrix.merge-result == 'success'
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.merge-result == 'success'
+
+      - uses: docker/login-action@v3
+        if: matrix.merge-result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote only the current main revision
+        if: matrix.merge-result == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+        run: bash scripts/promote-main-image.sh

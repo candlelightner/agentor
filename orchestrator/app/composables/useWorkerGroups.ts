@@ -26,6 +26,8 @@ export interface WorkerGroup {
     archived: number;
   };
   parentId?: string;
+  maxVcpuCount?: number | null;
+  effectiveMaxVcpuCount?: number | null;
   workerSelfApiAccess?: import("~/types").WorkerSelfApiAccess;
   effectiveWorkerSelfApiAccess?: import("~/types").EffectiveWorkerSelfApiAccess;
   adminWorkspace?: GroupAdminWorkspace;
@@ -51,7 +53,7 @@ export function useWorkerGroups() {
   };
   const update = async (
     id: string,
-    patch: Partial<Pick<WorkerGroup, "name" | "workerIds" | "workerSelfApiAccess">> & {
+    patch: Partial<Pick<WorkerGroup, "name" | "workerIds" | "workerSelfApiAccess" | "maxVcpuCount">> & {
       parentId?: string | null;
     },
   ) => {

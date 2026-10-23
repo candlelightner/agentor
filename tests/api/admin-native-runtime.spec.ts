@@ -8,6 +8,7 @@ import { IncusAdminWorkspaceRuntime, ADMIN_NATIVE_CONTROL_WRITE, ADMIN_NATIVE_IN
 import { AdministrativeWorkspaceRuntime } from '../../orchestrator/server/utils/administrative-workspace-runtime';
 import { IncusAdminNetworkBoundary } from '../../orchestrator/server/utils/incus-admin-network';
 import { applyAdminNativePatch } from '../../orchestrator/server/utils/admin-native-authority';
+import { assertGroupVcpuLimit } from '../../orchestrator/server/utils/worker-vcpu-policy';
 import { IncusRequestRejected } from '../../orchestrator/server/utils/incus-client';
 import { IncusOfflineArchiveHelper } from '../../orchestrator/server/utils/incus-offline-archive-helper';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_LINK, MANAGED_KILO_PARENT_CHECK } from '../../orchestrator/server/utils/managed-volume-kilo-parent';
@@ -26,12 +27,13 @@ async function fixture() {
     const managed = new ManagedVolumeStore(directory);
     await managed.init();
     const events: string[] = [], files = new Map<string, string>(), volumes = new Map<string, any>();
-    let instance: any, failCredential = false, unknownStart = false;
+    let instance: any, failCredential = false, unknownStart = false, vcpuLimit: number | null = null, policyAvailable = true;
     const boundary: any = { boundary: async () => { events.push('network'); return { cpuCountUpdates: true, network: 'aa123', managementAddress: '10.88.0.2', gatewayUrl: 'http://10.88.0.2:3000', mcpUrl: 'http://10.88.0.2:3099/mcp', guestAddress: '10.88.0.3' }; }, device: () => ({ type: 'nic', network: 'aa123', name: 'eth0', hwaddr: '02:00:00:00:00:01', 'ipv4.address': '10.88.0.3', 'security.mac_filtering': 'true', 'security.ipv4_filtering': 'true', 'security.ipv6_filtering': 'true' }) };
     const client: any = { endpoint: 'https://invalid.example', project: 'agentor',
         getCpuCapacity: async () => 8,
         assertInstanceMutationSettled: async () => {},
-        updateInstanceCpuCount: async (_name: string, count: number, accepted: any) => {
+        updateInstanceCpuCount: async (_name: string, count: number, accepted: any, _expected: any, authorize?: () => void) => {
+            try { authorize?.(); } catch (error: any) { throw new IncusRequestRejected(error.message, error.statusCode || 409); }
             events.push('cpu-update'); await accepted?.('/1.0/operations/' + randomUUID()); instance.config['limits.cpu'] = String(count);
         },
         getCustomVolume: async (_pool: string, name: string) => {
@@ -75,11 +77,17 @@ async function fixture() {
                     } }, result: Promise.resolve(failCredential ? 1 : 0), close() { } };
         },
     };
-    const runtime = new IncusAdminWorkspaceRuntime(config, client, boundary, { managedStore: async () => managed, readRecord: async () => structuredClone(record), resolveImage: async () => { events.push('image'); return image; }, register: () => events.push('register') });
+    const runtime = new IncusAdminWorkspaceRuntime(config, client, boundary, { managedStore: async () => managed,
+        assertVcpuLimit: (input, count) => {
+            const groupId = (input as any).groupId;
+            assertGroupVcpuLimit(input.ownerId!, groupId, count, false, policyAvailable ? [{
+                id: groupId, userId: input.ownerId!, name: 'Fixture policy', workerIds: [], maxVcpuCount: vcpuLimit, createdAt: stamp, updatedAt: stamp,
+            }] : []);
+        }, readRecord: async () => structuredClone(record), resolveImage: async () => { events.push('image'); return image; }, register: () => events.push('register') });
     runtime.setManagementListener(async () => { events.push('listener'); });
     const ack = async (patch: any) => { events.push('ack' + (patch.nativeRuntime?.pending ? ':' + patch.nativeRuntime.pending.kind : '')); applyAdminNativePatch(record, patch); };
     const prepare = () => runtime.prepareCredential(structuredClone(record), async () => { events.push('credential-issue'); return 'mcp1.' + 'a'.repeat(43); });
-    return { runtime, client, managed, config, boundary, events, files, volumes, image, ack, prepare, get record() { return record; }, get instance() { return instance; }, set failCredential(v: boolean) { failCredential = v; }, set unknownStart(v: boolean) { unknownStart = v; }, cleanup: () => rm(directory, { recursive: true, force: true }) };
+    return { runtime, client, managed, config, boundary, events, files, volumes, image, ack, prepare, get record() { return record; }, get instance() { return instance; }, set failCredential(v: boolean) { failCredential = v; }, set unknownStart(v: boolean) { unknownStart = v; }, set vcpuLimit(value: number | null) { vcpuLimit = value; }, set policyAvailable(value: boolean) { policyAvailable = value; }, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 for (const project of ['agdr1cf75b31', 'agdr1cf75b31r']) test(`native admin compute and canonical storage fit virtiofs in ${project}`, async () => {
     const f = await fixture();
@@ -1301,5 +1309,59 @@ test('known admin CPU rejection remains durably reconcilable when follow-up proo
         await expect(f.runtime.setCpuCount(f.record, 3, f.ack)).rejects.toMatchObject({ statusCode: 409 });
         expect(f.record.nativeRuntime!.pending).toBeUndefined(); expect(f.record.vcpuCount).toBeUndefined();
         expect(f.instance.config['limits.cpu']).toBe('2'); expect(submitted).toBe(1);
+    } finally { await f.cleanup(); }
+});
+
+
+test('group administrative runtime uses its injected policy before creation, rebuild and the final CPU write', async () => {
+    const f = await fixture();
+    try {
+        Object.assign(f.record, { kind: 'group-administrative', groupId: 'bounded-group', ownerId: 'bounded-owner', status: 'stopped' });
+        f.vcpuLimit = 1;
+        await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('ceiling of 1');
+        expect(f.events).toEqual([]); expect(f.record.nativeRuntime).toBeUndefined();
+        f.policyAvailable = false;
+        await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('Worker group not found');
+        expect(f.events).toEqual([]);
+        f.policyAvailable = true; f.vcpuLimit = 4;
+        await f.runtime.ensure(f.record, f.ack);
+        const original = structuredClone(f.instance);
+        f.events.length = 0; f.vcpuLimit = 1;
+        await expect(f.runtime.rebuild(f.record, f.ack)).rejects.toThrow('ceiling of 1');
+        expect(f.events).toEqual([]); expect(f.instance).toEqual(original);
+        f.vcpuLimit = 4;
+        const acknowledge = async (patch: any) => {
+            await f.ack(patch);
+            if (patch.nativeRuntime?.pending?.kind === 'cpu') f.vcpuLimit = 2;
+        };
+        await expect(f.runtime.setCpuCount(f.record, 3, acknowledge)).rejects.toThrow('ceiling of 2');
+        expect(f.events).not.toContain('cpu-update'); expect(f.instance).toEqual(original);
+        expect(f.record.nativeRuntime!.pending).toBeUndefined();
+    } finally { await f.cleanup(); }
+});
+
+test('administrative dispatcher forwards live CPU authority to the native submission boundary', async () => {
+    const f = await fixture();
+    try {
+        f.record.status = 'stopped'; await f.runtime.ensure(f.record, f.ack);
+        const original = structuredClone(f.instance);
+        const dispatch = new AdministrativeWorkspaceRuntime(f.config, f.runtime, {} as any);
+        let checks = 0;
+        f.events.length = 0;
+        await expect(dispatch.setCpuCount(f.record, 3, f.ack, () => {
+            checks++; throw Object.assign(new Error('CPU authority revoked'), { statusCode: 403 });
+        })).rejects.toThrow('CPU authority revoked');
+        expect(checks).toBe(1); expect(f.events).not.toContain('cpu-update'); expect(f.instance).toEqual(original);
+        expect(f.record.nativeRuntime!.pending).toBeUndefined();
+    } finally { await f.cleanup(); }
+});
+
+test('group administrative allocation fails closed without an injected policy reader', async () => {
+    const f = await fixture();
+    try {
+        Object.assign(f.record, { kind: 'group-administrative', groupId: 'bounded-group', ownerId: 'bounded-owner' });
+        delete (f.runtime as any).dependencies.assertVcpuLimit;
+        await expect(f.runtime.ensure(f.record, f.ack)).rejects.toThrow('CPU policy is unavailable');
+        expect(f.events).toEqual([]); expect(f.record.nativeRuntime).toBeUndefined();
     } finally { await f.cleanup(); }
 });

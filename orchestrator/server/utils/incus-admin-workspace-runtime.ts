@@ -112,6 +112,7 @@ try:
 finally: os.close(fd)
 `;
 interface Dependencies {
+    assertVcpuLimit?: (record: Readonly<AdministrativeWorkspaceRecord>, count: number) => void;
     managedStore?: () => Promise<ManagedVolumeStore>;
     readRecord?: (id: string) => Promise<AdministrativeWorkspaceRecord>;
     resolveImage?: (record: Readonly<AdministrativeWorkspaceRecord>, refresh: boolean) => Promise<IncusWorkerImageIdentity>;
@@ -134,6 +135,14 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             return manager.store;
         }));
         this.network = network;
+    }
+    private assertVcpuLimit(record: Readonly<AdministrativeWorkspaceRecord>, count: number) {
+        if (administrativeRuntimeOwner(record).kind !== 'group-administrative') return;
+        if (!this.dependencies.assertVcpuLimit) {
+            console.warn('[vcpu-policy] Group administrative CPU policy is unavailable; allocation stopped, existing VM retained.');
+            throw failure('Group administrative CPU policy is unavailable');
+        }
+        this.dependencies.assertVcpuLimit(record, count);
     }
     setManagementListener(listener: (host: string) => Promise<void>) { this.listener = listener; }
     async validateAuthority(record: Readonly<AdministrativeWorkspaceRecord>, incarnation?: string) {
@@ -253,6 +262,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await this.validateAuthority(record);
         if (record.nativeRuntime!.pending)
             throw failure('Administrative VM operation requires explicit recovery');
+        if (kind === 'create' && record.kind === 'group-administrative')
+            this.assertVcpuLimit(record, record.nativeRuntime!.vcpuCount ?? 2);
         await ack({ ...record.nativeRuntime!, pending: { kind } });
         try {
             await action(async (operation) => ack({ ...record.nativeRuntime!, pending: { kind, ...(operation ? { operation } : {}) } }));
@@ -283,7 +294,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             pending: record.nativeRuntime?.pending?.kind === 'cpu',
             ...(record.nativeRuntime?.pending?.cpu ? { pendingVcpuCount: record.nativeRuntime.pending.cpu.vcpuCount } : {}) };
     }
-    async setCpuCount(input: Readonly<AdministrativeWorkspaceRecord>, value: number, acknowledge: AdminNativeAcknowledge): Promise<VcpuSettings> {
+    async setCpuCount(input: Readonly<AdministrativeWorkspaceRecord>, value: number, acknowledge: AdminNativeAcknowledge, authorize?: () => void): Promise<VcpuSettings> {
         const count = validateVcpuCount(value), record = structuredClone(input), ack = this.patch(record, acknowledge);
         if (record.runtimeKind !== 'incus-vm')
             throw Object.assign(new Error('Migrate the administrative workspace to a native VM before changing CPUs'), { statusCode: 409 });
@@ -310,6 +321,8 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             return this.getCpuSettings(record);
         }
         validateVcpuCount(count, await this.client.getCpuCapacity());
+        if (record.kind === 'group-administrative' && count !== (record.vcpuCount ?? 2))
+            this.assertVcpuLimit(record, count);
         const instance = await this.assertOwned(record);
         if (instance.status !== 'Stopped' || record.status !== 'stopped')
             throw Object.assign(new Error('Stop the administrative VM before changing its vCPU count, then start it to apply the change'), { statusCode: 409 });
@@ -318,6 +331,9 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (boundary.cpuCountUpdates !== true)
             throw Object.assign(new Error('The installed administrative host policy does not support CPU updates. Run the trusted setup-incus-host.sh --update-policy procedure, then refresh and retry.'), { statusCode: 409 });
         await this.client.assertInstanceMutationSettled(instance.name);
+        await this.validateAuthority(record);
+        if (record.kind === 'group-administrative' && count !== (record.vcpuCount ?? 2))
+            this.assertVcpuLimit(record, count);
         if (instance.config['limits.cpu'] === String(count)) return this.getCpuSettings(record);
         const cpu = { previousCount: record.nativeRuntime!.vcpuCount ?? 2, vcpuCount: count,
             definitionFingerprint: incusCpuDefinitionFingerprint(instance) };
@@ -325,7 +341,10 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         try {
             await this.client.updateInstanceCpuCount(instance.name, count, async operation => {
                 await ack({ ...record.nativeRuntime!, pending: { kind: 'cpu', cpu: { ...cpu, acknowledged: true }, ...(operation ? { operation } : {}) } });
-            }, instance);
+            }, instance, () => {
+                authorize?.();
+                if (record.kind === 'group-administrative') this.assertVcpuLimit(record, count);
+            });
         } catch (error) {
             if (error instanceof IncusRequestRejected) {
                 await ack({ ...record.nativeRuntime!, pending: { kind: 'cpu', cpu: { ...cpu, rejected: true } } });
@@ -399,6 +418,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     }
     private async ensureRecord(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge: AdminNativeAcknowledge | undefined, running: boolean, explicitStart = false): Promise<AdminWorkspaceRuntimeImage> {
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
+        if (!record.nativeRuntime?.incarnation) this.assertVcpuLimit(record, record.vcpuCount ?? 2);
         assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         await this.installation();
         await this.validateAuthority(record);
@@ -574,6 +594,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await ack({ ...native, pending: undefined });
     }
     async rebuild(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
+        if (input.kind === 'group-administrative') this.assertVcpuLimit(input, input.vcpuCount ?? 2);
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
         assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         if (record.nativeRuntime?.pending)
