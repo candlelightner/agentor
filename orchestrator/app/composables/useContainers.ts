@@ -1,6 +1,8 @@
 import type { ContainerInfo, CreateContainerRequest, UpdateContainerSettingsRequest } from '~/types';
+import { fetchErrorMessage } from '../utils/fetch-error';
 
 export function useContainers() {
+  const toast = useToast();
   const { data: containers, refresh } = useFetch<ContainerInfo[]>('/api/containers', {
     key: 'workers',
     default: () => [],
@@ -23,8 +25,13 @@ export function useContainers() {
   }
 
   async function restartContainer(id: string) {
-    await $fetch(`/api/containers/${id}/restart`, { method: 'POST' });
-    await refresh();
+    const notice = toast.add({ title: 'Starting worker', description: 'Waiting for storage preparation and worker readiness.', duration: 0 });
+    try {
+      await $fetch(`/api/containers/${id}/restart`, { method: 'POST', retry: 0 });
+      toast.add({ title: 'Worker started', description: 'Worker readiness confirmed.', color: 'success', duration: 5000 });
+    } catch (error) {
+      toast.add({ title: 'Worker start not confirmed', description: fetchErrorMessage(error, 'Inspect runtime recovery for the failed startup phase before retrying.'), color: 'error', duration: 0 });
+    } finally { toast.remove(notice.id); await refresh(); }
   }
 
   async function recoverContainer(

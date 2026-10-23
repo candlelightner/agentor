@@ -1521,3 +1521,5 @@ Terminal WebSocket attachment preserves only the latest validated early resize a
 - Operator desired-state controls remain available with an explicit warning when actual runtime state is unknown; desired and observed state remain distinct.
 - Emergency-stop intent is accepted during pending worker/platform/group lifecycle operations, preserves runtime identity/settlement fences and reports confirmation separately.
 - Equivalent REST/GUI/management MCP controls; group administrators are restricted to live descendant groups and member workers, while platform administrative shutdown is platform-only.
+
+Docker storage preparation waits only for the exact owned block-device identity, with a bounded deadline and retained filesystem/initialization safeguards. Native startup logs correlate storage/service phases and cleanup outcomes with the worker. Start/Retry shows a pending notification and a visible confirmed/failed result instead of leaving a rejected UI action unexplained.

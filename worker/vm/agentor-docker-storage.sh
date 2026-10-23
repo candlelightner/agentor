@@ -11,16 +11,23 @@ jq -e '.serial == "incus_docker" and (.volume | test("^[A-Za-z0-9_-]+-docker$"))
 # Only the exact serial of Incus device "docker", whose source is checked by
 # the orchestrator against worker-owned volume metadata. Never scan unused
 # disks or use /dev/sdb as authority.
-udevadm settle
+# Unrelated GPU/USB events can keep the global udev queue busy indefinitely.
+echo "[agentor-docker-storage] Waiting up to 30 seconds for the owned Docker block device..."
 DOCKER_DISK=""
-for id in /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_incus_docker /dev/disk/by-id/virtio-incus_docker; do
-    if [[ -b "$id" ]]; then
-        disk=$(readlink -f "$id")
-        [[ -z "$DOCKER_DISK" || "$DOCKER_DISK" == "$disk" ]] || fail "Ambiguous Docker block device"
-        DOCKER_DISK="$disk"
+deadline=$((SECONDS + 30))
+while [[ -z "$DOCKER_DISK" ]]; do
+    for id in /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_incus_docker /dev/disk/by-id/virtio-incus_docker; do
+        if test -b "$id"; then
+            disk=$(readlink -f "$id")
+            [[ -z "$DOCKER_DISK" || "$DOCKER_DISK" == "$disk" ]] || fail "Ambiguous Docker block device"
+            DOCKER_DISK="$disk"
+        fi
+    done
+    if [[ -z "$DOCKER_DISK" ]]; then
+        ((SECONDS < deadline)) || fail "Owned Docker block device absent after 30 seconds; Docker startup stopped, existing data unchanged; inspect the Incus disk attachment"
+        sleep 1
     fi
 done
-[[ -n "$DOCKER_DISK" ]] || fail "Expected Incus Docker block device is absent"
 [[ "$(lsblk -dn -o TYPE "$DOCKER_DISK")" == disk ]] || fail "Expected a whole custom block volume"
 [[ "$(lsblk -n -o NAME "$DOCKER_DISK" | wc -l)" -eq 1 ]] || fail "Partitioned Docker volume needs explicit recovery"
 
@@ -44,3 +51,5 @@ else
     mount -o defaults "$DOCKER_DISK" /var/lib/docker
 fi
 [[ "$(findmnt -n -o FSTYPE --target /var/lib/docker)" == ext4 ]] || fail "Docker storage must be native ext4"
+
+echo "[agentor-docker-storage] Owned ext4 Docker storage verified and mounted; storage preparation complete."

@@ -1453,7 +1453,9 @@ export class IncusWorkerRuntime {
   }
 
   private async checkedExec(name: string, command: string[], phase = "guest bootstrap"): Promise<void> {
-    const result = await this.client.exec(name, command);
+    let result;
+    try { result = await this.client.exec(name, command); }
+    catch { throw new WorkerStartupError(phase); }
     if (result.returnCode !== 0) throw new WorkerStartupError(phase, result.returnCode);
   }
 
@@ -1921,7 +1923,7 @@ export class IncusWorkerRuntime {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     if (!ready) {
-      useLogger().warn("[incus-worker] guest agent readiness deadline expired; startup unconfirmed, VM retained for recovery");
+      useLogger().warn(`[incus-worker] ${opts.id}: guest agent readiness deadline expired; startup unconfirmed, VM retained for recovery`);
       throw new WorkerStartupError("guest agent readiness deadline");
     }
     try {
@@ -1978,6 +1980,7 @@ export class IncusWorkerRuntime {
           initialize: await storage.dockerInitializationAllowed(opts),
         }), { uid: 0, gid: 0, mode: 0o600 });
         await this.checkedExec(name, ["systemctl", "unmask", "docker", "docker.socket", "containerd", "agentor-docker-storage"]);
+        useLogger().info(`[incus-worker] ${opts.id}: preparing Docker storage; worker service remains stopped until storage is verified`);
         await this.checkedExec(name, ["systemctl", "start", "agentor-docker-storage"], "Docker storage preparation");
         await this.checkedExec(name, ["mountpoint", "-q", "/var/lib/docker"]);
         await storage.markDockerInitialized(opts);
@@ -1988,12 +1991,13 @@ export class IncusWorkerRuntime {
         await this.checkedExec(name, ["systemctl", "mask", "docker", "docker.socket", "containerd"]);
       }
       recovery.assertStartAllowed?.();
+      useLogger().info(`[incus-worker] ${opts.id}: starting worker service; readiness confirmation pending`);
       await this.checkedExec(name, ["systemctl", "start", "agentor-worker.service"], "worker service start");
-      await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"]);
+      await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"], "worker service readiness");
       const workerDeadline = Date.now() + 120_000;
       let workerReady = false;
       while (Date.now() < workerDeadline) {
-        await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"]);
+        await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"], "worker service readiness");
         const result = await this.client.exec(name, ["grep", "-q", "^READY|", "/tmp/worker-events"]);
         if (result.returnCode === 0) { workerReady = true; break; }
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -2006,7 +2010,7 @@ export class IncusWorkerRuntime {
         try { await this.stop(opts, instance.config['volatile.uuid']); outcome = 'startup VM stopped; persistent data retained'; }
         catch { outcome = 'startup cleanup unconfirmed; operator recovery required'; }
       }
-      useLogger().warn(`[incus-worker] ${workerStartupFailure(error).message}; ${outcome}`);
+      useLogger().warn(`[incus-worker] ${opts.id}: ${workerStartupFailure(error).message}; ${outcome}`);
       throw error;
     }
   }
