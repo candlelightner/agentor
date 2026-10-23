@@ -41,7 +41,7 @@ function browser(tests, contract) {
 }
 
 function toolVersions() {
-  return Object.fromEntries([['npm', ['--version']], ['python3', ['--version']], ['qemu-img', ['--version']],
+  return Object.fromEntries([['npm', ['--version']], ['jq', ['--version']], ['tmux', ['-V']], ['python3', ['--version']], ['qemu-img', ['--version']],
     ['systemd-analyze', ['--version']], ['openssl', ['version']], ['tar', ['--version']], ['g++', ['--version']],
     ['docker', ['--version']], ['docker-compose', []]].map(([command, args]) => {
       try {

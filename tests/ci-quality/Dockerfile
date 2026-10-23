@@ -10,7 +10,7 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
-       ca-certificates curl git python3 build-essential pkg-config qemu-utils \
+       ca-certificates curl git jq tmux python3 build-essential pkg-config qemu-utils \
        systemd openssl sudo tar gzip xz-utils zstd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 runner && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner \
