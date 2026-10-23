@@ -2,7 +2,7 @@
 # Run inside the candidate image with a fresh checked-out workspace, no socket.
 set -euo pipefail
 phase='checking the image contract'
-trap 'printf "[ci-quality] Failed while %s; candidate validation stopped and the image is ineligible for publication.\n" "$phase" >&2' ERR
+trap 'printf "[ci-quality] Failed while %s; quality validation stopped; dependent publication is blocked and the image is ineligible for publication.\n" "$phase" >&2' ERR
 node tests/ci-quality/check-image.mjs --preflight
 phase='installing checked-out orchestrator dependencies'
 npm ci --prefix orchestrator --no-audit --no-fund
@@ -22,4 +22,4 @@ phase='running the existing root-owned archive fixture split'
   api/incus-admin-restore.spec.ts api/incus-derived-image.spec.ts \
   api/incus-docker-restore-archive.spec.ts api/incus-selected-restore.spec.ts \
   api/managed-kilo-parent.spec.ts api/portable-pax-size.spec.ts)
-printf '[ci-quality] Full candidate quality validation passed; active CI remains unchanged.\n'
+printf '[ci-quality] Full quality validation passed.\n'

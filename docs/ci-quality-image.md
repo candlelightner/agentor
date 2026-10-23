@@ -1,9 +1,9 @@
 # Standalone quality image: phase-one operator contract
 
-Issue [#47](https://github.com/candlelightner/agentor/issues/47) evaluates a
-separate Ubuntu 24.04 amd64 image for the quality job. This is a preparation
-path: active CI still uses its existing hosted runner, and no timing result yet
-justifies switching it.
+Issue [#47](https://github.com/candlelightner/agentor/issues/47) introduced a
+separate Ubuntu 24.04 amd64 image for the quality job. The existing quality
+job and test gate now select the reviewed immutable image when its approved
+inputs match; incompatible checkouts run all existing baseline checks.
 
 ## Image contents and validation
 
@@ -29,8 +29,8 @@ Docker-in-Docker regression image and workflow unchanged.
 For a local candidate check, use a Linux amd64 host with Docker Buildx and a
 local Docker engine. The checkout and npm-cache directory mounted below must
 be writable by UID 1001, which runs the candidate. The container run does not
-mount the host Docker socket or use Docker `--privileged`; its `sudo` remains
-limited to the six existing root-owned fixtures.
+mount the host Docker socket or use Docker `--privileged`; the quality command uses `sudo`
+only for the six existing root-owned fixtures.
 
 ```sh
 python3 -m unittest discover -s tests/helpers -p test_ci_quality_image.py
@@ -78,22 +78,68 @@ Only a trusted `main` run may publish, and it must publish the exact image
 artifact that passed candidate validation. Use the unique source-SHA/run-ID/
 attempt tag, then retain the registry's immutable digest with the run's image
 contract and resolved base materials; do not move a `latest` tag. The
-preparation workflow has not yet been used to publish an image. A successful
-push does not make the package anonymously pullable by itself; verify an
-anonymous clean pull of the pinned digest before considering untrusted-PR
-adoption. Before merging this workflow, review and approve the
-package name, automatic publication on matching `main` pushes, weekly runs and
-manual dispatches, and the intended package visibility. The initial merge
-itself triggers a matching main push. The workflow does not change package
-visibility, grant PR registry credentials, or switch active CI.
+initial trusted publication passed and its digest is anonymously pullable. A successful
+push does not make the package anonymously pullable by itself. The reviewed
+digest passed anonymous clean pulls and full quality in both hosted benchmark
+image jobs. Maintainers must review future publication-trigger or package
+visibility changes. The existing workflow does not change package visibility,
+grant PR registry credentials, or automatically change the reviewed active pin.
 
-## Adoption and rollback gate
+## Guarded selection, updates and rollback
 
-Keep issue #47 open until a clean registry pull passes the unchanged quality
-suite with functional parity and matched hosted cold and warm runs show the
-full elapsed time, including image pull and dependency installation. Local
-single-CPU timings are not a hosted comparison. Adopt the image only if those
-matched measurements improve the quality path without changing its checks.
-Until then, leave the active job alone. If a later adoption regresses, restore
-the previously approved image digest together with its matching lock and
-compatibility contract; do not roll back to a floating tag.
+`tests/ci-quality/approved-image.json` reviews the canonical immutable image
+reference, Node 22 ABI 127 and the three approved test-lock, Dockerfile and
+live-guard hashes. The host's stdlib selector compares those fixed input paths
+without running image code. Matching inputs select the image. Changed or
+missing inputs log why all existing baseline quality commands will run,
+including the original sudo split. This lets a Playwright/recipe update pass
+PR checks before a trusted main workflow can publish its new compatible image;
+there is no image-publication/merge deadlock.
+
+A malformed pin or noncanonical/nonimmutable reference fails selection with
+a visible reason. Once selected, an image pull, contract or test failure is a
+real quality failure: there is no error-triggered baseline retry. The image's
+own guard remains strict. The container receives only the checkout, npm
+download-cache mount and `CI=true`; anonymous pull uses an empty host-side
+Docker configuration, which is never mounted into quality. The image path
+caches npm downloads by runner OS/architecture, Node ABI and both lockfiles,
+and runs `npm ci` every time. It never caches project `node_modules`.
+
+Weekly publication does not move the active pin. Maintainers review the
+publication receipt and compatible inputs, then update the digest/hashes in a
+separate PR. If adoption regresses, restore the last approved digest and its
+matching hashes, or remove image selection while preserving all baseline
+checks. Do not weaken the live guard or roll back to a floating tag.
+
+## Hosted measurements and limits
+
+[Run 39930171116](https://github.com/candlelightner/agentor/actions/runs/39930171116)
+measured two independent Ubuntu 24.04 hosted pairs at PR-merge checkout
+`40f5f2094a16a612a4756ec9a448836125a1b829`. Each arm ran cold then warm from
+fresh tracked workspaces, using Node 22.23.4 and the same locks/browser/tests.
+Cold npm/browser download directories were empty; the pinned image was absent
+before anonymous pull. Existing runner tools, shared base layers and Node's
+hosted tool cache were not pruned. Warm reused that arm's download/browser
+cache and image layers, with fresh workspaces and `npm ci`.
+
+| Pair/sample | Baseline | Pinned image, including pull | Image difference |
+| --- | ---: | ---: | ---: |
+| 1 cold | 897.36s | 283.21s | 614.15s faster; installation outlier |
+| 1 warm | 245.06s | 260.51s | 15.45s slower |
+| 2 cold | 326.72s | 274.04s | 52.68s faster (16.1%) |
+| 2 warm | 264.09s | 251.85s | 12.25s faster |
+
+Image cold pulls took 20.53s and 19.61s. All eight samples passed exact source,
+lock, Node/browser and per-case pass/skip parity: 1,907 ordinary passes and 65
+skips, plus 61 root-fixture passes and one skip, with no unexpected/flaky tests.
+Warm medians were effectively tied: baseline 254.58s, image 256.18s.
+
+Pair 1 baseline spent 577.25s in Chromium/library installation; its precise
+mirror/download cause was not retained. That outlier dominates the two-sample
+cold median and does not justify a routine 54.5% speedup claim. The second
+cold pair showed a real pull-inclusive 52.68s saving, but recent ordinary active
+quality jobs were around 289–294s, so routine gains could be only 10–15s.
+Independent machines and package/network variation remain limitations. The
+change targets cold preparation reliability and a modest routine preparation
+saving while retaining an explicit complete baseline path; it does not promise every future run will be faster. Local
+single-CPU measurements are not included in this hosted comparison.
