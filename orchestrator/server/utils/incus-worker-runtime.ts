@@ -1,4 +1,3 @@
-import { workerVcpuAllocation } from './worker-vcpu-policy';
 import { assertIncusHostMountRemoval } from './incus-device-layout';
 import { WorkerStartupError, workerStartupFailure } from "./worker-startup-error";
 import { sameIncusDevice as sameDevice } from './incus-device-layout';
@@ -156,6 +155,9 @@ export interface IncusRecreationPreflight {
  * guest configuration crosses only the agent file API after each boot. */
 export class IncusWorkerRuntime {
   readonly client: IncusClient;
+  private vcpuAllocation?: (opts: IncusWorkerOptions) => number | undefined;
+  /** Control-plane policy stays outside standalone recovery runtimes. */
+  setVcpuAllocation(resolve: (opts: IncusWorkerOptions) => number | undefined): void { this.vcpuAllocation = resolve; }
   private installation?: Promise<string>;
   private hardwareDiscovery?: (opts: IncusHardwareOptions) => Promise<HardwareDeviceCandidate[]>;
   setHardwareDiscovery(discover: (opts: IncusHardwareOptions) => Promise<HardwareDeviceCandidate[]>): void { this.hardwareDiscovery = discover; }
@@ -1144,7 +1146,7 @@ export class IncusWorkerRuntime {
   }
 
   async preflightRecreation(opts: IncusWorkerOptions, dockerRequired = false, refreshBootstrap = false): Promise<IncusRecreationPreflight> {
-    workerVcpuAllocation(opts.userId, opts.id, opts.cpuLimit, opts.hostMountGroupId);
+    this.vcpuAllocation?.(opts);
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     this.validateOptions(opts);
@@ -1304,7 +1306,7 @@ export class IncusWorkerRuntime {
    * does not reserve, adopt, format, or allocate a destination. */
   async preflightCanonicalRestore(opts: IncusWorkerOptions, source?: WorkerBackupRuntimeSource,
     detachedManagedVolumes: StoredManagedVolume[] = []): Promise<void> {
-    workerVcpuAllocation(opts.userId, opts.id, opts.cpuLimit, opts.hostMountGroupId);
+    this.vcpuAllocation?.(opts);
     if (!opts.recreationNonce || opts.start !== false)
       throw new Error('Incus restore requires durable nonce and stopped initial creation');
     this.validateOptions(opts);
@@ -1383,7 +1385,7 @@ export class IncusWorkerRuntime {
   private async createWorker(opts: IncusWorkerOptions, existing?: IncusRecreationPreflight,
     restore?: { fingerprint?: string; source?: WorkerBackupRuntimeSource; dockerData?: boolean;
       detachedManagedVolumes?: StoredManagedVolume[] }): Promise<IncusInstance> {
-    workerVcpuAllocation(opts.userId, opts.id, opts.cpuLimit, opts.hostMountGroupId);
+    this.vcpuAllocation?.(opts);
     await this.assertReady();
     // These features are integrated in the following storage/device phases.
     // Refuse them here rather than silently placing data on disposable rootfs.
@@ -1426,7 +1428,8 @@ export class IncusWorkerRuntime {
     const memoryLimit = effectiveIncusWorkerMemoryLimit(opts.memoryLimit, this.config.incusDefaultMemoryLimit);
     if (!restore && !isDeepStrictEqual(hardware, await this.preflightHardware(opts, undefined, 'attach')))
       throw new Error('Hardware authority changed during worker creation');
-    const cpuCount = workerVcpuAllocation(opts.userId, opts.id, opts.cpuLimit, opts.hostMountGroupId);
+    const cpuCount = this.vcpuAllocation ? this.vcpuAllocation(opts)
+      : opts.cpuLimit ? Math.max(1, Math.ceil(opts.cpuLimit)) : undefined;
     const instance = await this.client.createInstance({
       name: opts.containerName, type: "virtual-machine", profiles: [],
       source: { type: "image", fingerprint },

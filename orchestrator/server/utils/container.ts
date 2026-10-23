@@ -82,7 +82,7 @@ import { resolveDefaultIncusImage } from './incus-default-image';
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected, incusCpuDefinitionFingerprint } from './incus-client';
-import { effectiveWorkerVcpuLimit, assertWorkerVcpuLimit } from './worker-vcpu-policy';
+import { effectiveWorkerVcpuLimit, assertWorkerVcpuLimit, workerVcpuAllocation } from './worker-vcpu-policy';
 import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from './ordinary-worker-identity';
@@ -655,6 +655,7 @@ export class ContainerManager {
 
   private configureIncusImages(runtime: IncusWorkerRuntime, restoreAuthority?: () => Promise<void>,
     migrationAuthority?: () => Promise<void>): void {
+    runtime.setVcpuAllocation?.(opts => workerVcpuAllocation(opts.userId, opts.id, opts.cpuLimit, opts.hostMountGroupId));
     runtime.setHardwareDiscovery?.(opts => this.dockerService.discoverIncusHardwareDevices(opts.id));
     if (!this.config.incusConverterSeedFingerprint) return;
     runtime.setImageResolver(async (opts, stored, restoreSource, refreshBootstrap) => {

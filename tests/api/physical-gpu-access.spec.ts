@@ -136,7 +136,7 @@ test('MCP worker cloning omits physical GPU ownership while retaining USB and me
     './workspace-inventory': { findWorkspaceInventory: async () => ({ state: 'available' }) },
     './workspace-access': { OfflineWorkspaceAccess: class { async cloneInto() {} } },
     './worker-self-access': { withEffectiveWorkerSelfApiAccess: (value: any) => value },
-    './image-catalog': {}, './worker-config-response': {}, './worker-group-manager': {},
+    './image-catalog': {}, './worker-config-response': {}, './worker-group-manager': {}, './worker-vcpu-policy': {},
     './admin-workspace-store': {}, './group-admin-workspace-store': {}, './worker-group-hierarchy': {}, './worker-group-env': {}, './worker-group-response': {},
   });
   await expect(new ManagementWorkerDomain().execute('workers.clone', { workerId: worker.id })).resolves.toMatchObject({ handled: true });

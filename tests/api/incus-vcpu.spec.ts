@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +12,13 @@ import { backupInstallationId } from '../../orchestrator/server/utils/backup-ins
 import { useContainerManager, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { useWorkerProtectionLockStore } from '../../orchestrator/server/utils/worker-protection-lock';
 import { withWorkerLifecycleMutation, isWorkerLifecycleMutationActive } from '../../orchestrator/server/utils/worker-lifecycle-coordinator';
+
+const previousLogger = Object.getOwnPropertyDescriptor(globalThis, 'useLogger');
+test.beforeAll(() => { (globalThis as any).useLogger ??= () => ({ debug() {}, info() {}, warn() {}, error() {} }); });
+test.afterAll(() => {
+  if (previousLogger) Object.defineProperty(globalThis, 'useLogger', previousLogger);
+  else delete (globalThis as any).useLogger;
+});
 
 const instance = () => ({ name: 'fixture', type: 'virtual-machine', status: 'Stopped', profiles: [], description: 'retained',
   config: { 'volatile.uuid': randomUUID(), 'limits.cpu': '2', 'limits.memory': '4GiB', 'user.agentor.owner': 'owner' },
@@ -320,4 +328,19 @@ test('CPU authority revoked at the final native submission boundary produces no 
     throw Object.assign(new Error('CPU authority revoked'), { statusCode: 403 });
   })).rejects.toBeInstanceOf(IncusRequestRejected);
   expect(f.writes).toEqual([]);
+});
+
+
+test('ordinary runtime receives live allocation policy from its container manager before native preflight', async () => {
+  const f = await workerFixture(), groups = useWorkerGroupStore();
+  await groups.init();
+  const group = await groups.create(f.owner.userId, 'Runtime policy fixture', undefined, undefined, 2);
+  await groups.update(f.owner.userId, group.id, { workerIds: [f.info.id] });
+  const options: any = { ...f.owner, cpuLimit: 3, start: false, recreationNonce: 'fixture-nonce' };
+  try {
+    await expect(f.runtime.preflightRecreation(options)).rejects.toThrow('ceiling of 2');
+    await expect(f.runtime.preflightCanonicalRestore(options)).rejects.toThrow('ceiling of 2');
+    await expect(f.runtime.create(options)).rejects.toThrow('ceiling of 2');
+    expect(f.updates).toBe(0);
+  } finally { await groups.remove(f.owner.userId, group.id); await f.cleanup(); }
 });

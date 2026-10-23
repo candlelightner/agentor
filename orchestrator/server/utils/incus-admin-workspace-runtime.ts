@@ -1,4 +1,3 @@
-import { assertGroupVcpuLimit } from './worker-vcpu-policy';
 import { adminMemorySettings } from '../../shared/admin-workspace-memory';
 import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { sameIncusDevices } from './incus-device-layout';
@@ -113,6 +112,7 @@ try:
 finally: os.close(fd)
 `;
 interface Dependencies {
+    assertVcpuLimit?: (record: Readonly<AdministrativeWorkspaceRecord>, count: number) => void;
     managedStore?: () => Promise<ManagedVolumeStore>;
     readRecord?: (id: string) => Promise<AdministrativeWorkspaceRecord>;
     resolveImage?: (record: Readonly<AdministrativeWorkspaceRecord>, refresh: boolean) => Promise<IncusWorkerImageIdentity>;
@@ -135,6 +135,14 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
             return manager.store;
         }));
         this.network = network;
+    }
+    private assertVcpuLimit(record: Readonly<AdministrativeWorkspaceRecord>, count: number) {
+        if (administrativeRuntimeOwner(record).kind !== 'group-administrative') return;
+        if (!this.dependencies.assertVcpuLimit) {
+            console.warn('[vcpu-policy] Group administrative CPU policy is unavailable; allocation stopped, existing VM retained.');
+            throw failure('Group administrative CPU policy is unavailable');
+        }
+        this.dependencies.assertVcpuLimit(record, count);
     }
     setManagementListener(listener: (host: string) => Promise<void>) { this.listener = listener; }
     async validateAuthority(record: Readonly<AdministrativeWorkspaceRecord>, incarnation?: string) {
@@ -255,7 +263,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         if (record.nativeRuntime!.pending)
             throw failure('Administrative VM operation requires explicit recovery');
         if (kind === 'create' && record.kind === 'group-administrative')
-            assertGroupVcpuLimit(administrativeRuntimeOwner(record).userId, (record as any).groupId, record.nativeRuntime!.vcpuCount ?? 2);
+            this.assertVcpuLimit(record, record.nativeRuntime!.vcpuCount ?? 2);
         await ack({ ...record.nativeRuntime!, pending: { kind } });
         try {
             await action(async (operation) => ack({ ...record.nativeRuntime!, pending: { kind, ...(operation ? { operation } : {}) } }));
@@ -314,7 +322,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         }
         validateVcpuCount(count, await this.client.getCpuCapacity());
         if (record.kind === 'group-administrative' && count !== (record.vcpuCount ?? 2))
-            assertGroupVcpuLimit(administrativeRuntimeOwner(record).userId, (record as any).groupId, count);
+            this.assertVcpuLimit(record, count);
         const instance = await this.assertOwned(record);
         if (instance.status !== 'Stopped' || record.status !== 'stopped')
             throw Object.assign(new Error('Stop the administrative VM before changing its vCPU count, then start it to apply the change'), { statusCode: 409 });
@@ -325,7 +333,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await this.client.assertInstanceMutationSettled(instance.name);
         await this.validateAuthority(record);
         if (record.kind === 'group-administrative' && count !== (record.vcpuCount ?? 2))
-            assertGroupVcpuLimit(administrativeRuntimeOwner(record).userId, (record as any).groupId, count);
+            this.assertVcpuLimit(record, count);
         if (instance.config['limits.cpu'] === String(count)) return this.getCpuSettings(record);
         const cpu = { previousCount: record.nativeRuntime!.vcpuCount ?? 2, vcpuCount: count,
             definitionFingerprint: incusCpuDefinitionFingerprint(instance) };
@@ -335,7 +343,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
                 await ack({ ...record.nativeRuntime!, pending: { kind: 'cpu', cpu: { ...cpu, acknowledged: true }, ...(operation ? { operation } : {}) } });
             }, instance, () => {
                 authorize?.();
-                if (record.kind === 'group-administrative') assertGroupVcpuLimit(administrativeRuntimeOwner(record).userId, (record as any).groupId, count);
+                if (record.kind === 'group-administrative') this.assertVcpuLimit(record, count);
             });
         } catch (error) {
             if (error instanceof IncusRequestRejected) {
@@ -410,6 +418,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
     }
     private async ensureRecord(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge: AdminNativeAcknowledge | undefined, running: boolean, explicitStart = false): Promise<AdminWorkspaceRuntimeImage> {
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
+        if (!record.nativeRuntime?.incarnation) this.assertVcpuLimit(record, record.vcpuCount ?? 2);
         assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         await this.installation();
         await this.validateAuthority(record);
@@ -585,7 +594,7 @@ export class IncusAdminWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter 
         await ack({ ...native, pending: undefined });
     }
     async rebuild(input: Readonly<AdministrativeWorkspaceRecord>, acknowledge?: AdminNativeAcknowledge) {
-        if (input.kind === 'group-administrative') assertGroupVcpuLimit(administrativeRuntimeOwner(input).userId, (input as any).groupId, input.vcpuCount ?? 2);
+        if (input.kind === 'group-administrative') this.assertVcpuLimit(input, input.vcpuCount ?? 2);
         const record = structuredClone(input), ack = this.patch(record, acknowledge);
         assertIncusWorkerSocketPath(this.config.incusProject, adminNativeInstanceName(record));
         if (record.nativeRuntime?.pending)

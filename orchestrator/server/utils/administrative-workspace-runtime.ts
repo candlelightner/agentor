@@ -1,9 +1,10 @@
+import { assertGroupVcpuLimit } from './worker-vcpu-policy';
 import Docker from 'dockerode';
 import type { Config } from './config';
 import type { AdministrativeWorkspaceRecord, AdminWorkspaceRuntimeAdapter, AdminWorkspaceIdentityMaterializationIntent } from './admin-workspace-store';
 import { DockerAdminWorkspaceRuntime, administrativeWorkspaceResourceNames } from './admin-workspace-runtime';
 import { IncusAdminWorkspaceRuntime } from './incus-admin-workspace-runtime';
-import { readAdministrativeRuntimeRecord, type AdminNativeAcknowledge } from './admin-native-authority';
+import { administrativeRuntimeOwner, readAdministrativeRuntimeRecord, type AdminNativeAcknowledge } from './admin-native-authority';
 /** Native is the sole provisioning backend. Legacy sources are inspect/stop
  * only here; explicit migration/rollback owns any legacy recreation. */
 export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdapter {
@@ -11,7 +12,12 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
     readonly legacy: DockerAdminWorkspaceRuntime;
     private docker = new Docker({ socketPath: '/var/run/docker.sock' });
     private listener?: (host: string) => Promise<void>;
-    constructor(config: Config, native = new IncusAdminWorkspaceRuntime(config), legacy = new DockerAdminWorkspaceRuntime(config)) {
+    constructor(config: Config, native = new IncusAdminWorkspaceRuntime(config, undefined, undefined, {
+        assertVcpuLimit: (record, count) => {
+            const owner = administrativeRuntimeOwner(record);
+            if (owner.groupId) assertGroupVcpuLimit(owner.userId, owner.groupId, count);
+        },
+    }), legacy = new DockerAdminWorkspaceRuntime(config)) {
         this.native = native;
         this.legacy = legacy;
     }
@@ -47,9 +53,9 @@ export class AdministrativeWorkspaceRuntime implements AdminWorkspaceRuntimeAdap
         if (!this.isNative(record)) return this.migrationRequired();
         return this.native.getCpuSettings(record);
     }
-    async setCpuCount(record: Readonly<AdministrativeWorkspaceRecord>, count: number, ack: AdminNativeAcknowledge) {
+    async setCpuCount(record: Readonly<AdministrativeWorkspaceRecord>, count: number, ack: AdminNativeAcknowledge, authorize?: () => void) {
         if (!this.isNative(record)) return this.migrationRequired();
-        return this.native.setCpuCount(record, count, ack);
+        return this.native.setCpuCount(record, count, ack, authorize);
     }
     async start(record: Readonly<AdministrativeWorkspaceRecord>, ack?: AdminNativeAcknowledge) { if (!this.isNative(record))
         return this.migrationRequired(); return this.native.start(record, ack); }

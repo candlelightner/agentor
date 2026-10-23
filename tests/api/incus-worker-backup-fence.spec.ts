@@ -23,7 +23,7 @@ async function fixture(run: (manager: ContainerManager, dataDir: string, info: a
     containerId: 'incus:' + randomUUID(), runtimeKind: 'incus-vm', status: 'running', displayName: 'fence' };
   await store.upsert({ id, userId: info.userId, runtimeKind: 'incus-vm', status: 'active', displayName: 'fence' } as any);
   manager.registerExternal(info);
-  manager.setIncusRuntime(new Proxy({ setHardwareDiscovery() {} }, { get: (target, key) => key === 'setHardwareDiscovery' ? target.setHardwareDiscovery : () => {
+  manager.setIncusRuntime(new Proxy({ setHardwareDiscovery() {}, setVcpuAllocation() {} }, { get: (target, key) => key === 'setHardwareDiscovery' || key === 'setVcpuAllocation' ? target[key] : () => {
     throw new Error('Canonical backup fence must reject before guest/file/image operations');
   } }) as any);
   try { await run(manager, dataDir, info); }
