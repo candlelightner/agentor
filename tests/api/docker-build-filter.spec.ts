@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { matchesGlob } from 'node:path';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 
 const { parse } = createRequire(new URL('../../orchestrator/package.json', import.meta.url))('yaml');
 async function filters(): Promise<Record<string, string[]>> {
@@ -27,7 +28,9 @@ test('dependency detection stays narrow and preserves independent worker builds'
   const config = await filters();
   for (const path of ['docs/testing.md', 'scripts/unrelated-helper.sh'])
     for (const scope of ['orchestrator', 'validation']) expect(config[scope]!.some(pattern => matchesGlob(path, pattern))).toBe(false);
-  expect(config.worker).toEqual(['worker/**', '.github/workflows/docker-build.yml']);
+  expect(config.worker).toEqual(['worker/**', '.github/workflows/docker-build.yml', 'scripts/promote-main-image.sh']);
+  for (const scope of ['orchestrator', 'worker', 'validation'])
+    expect(config[scope]!.includes('scripts/promote-main-image.sh')).toBe(true);
   for (const path of ['scripts/incus-admin-network-policy.py', 'scripts/setup-incus-host.sh', 'scripts/profile-ci-workflow.py']) {
     expect(config.validation!.some(pattern => matchesGlob(path, pattern))).toBe(true);
     expect(config.orchestrator!.some(pattern => matchesGlob(path, pattern))).toBe(false);
@@ -51,4 +54,8 @@ test('regression runner uses current source and publication still requires valid
     expect(workflow.jobs[`build-${image}`].needs).toEqual(['changes', 'test_gate']);
     expect(workflow.jobs[`build-${image}`].if).toContain("needs.test_gate.result == 'success'");
   }
+});
+
+test('main promotion rejects stale runs for both images and retains publication boundaries', () => {
+  execFileSync('python3', [new URL('../helpers/test_main_image_promotion.py', import.meta.url).pathname], { timeout: 30_000 });
 });
