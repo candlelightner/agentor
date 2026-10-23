@@ -56,7 +56,7 @@ class QualityImageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertIn('installing checked-out orchestrator dependencies', result.stderr)
         self.assertIn('ineligible for publication', result.stderr)
-        self.assertNotIn('Full candidate quality validation passed', result.stdout)
+        self.assertNotIn('Full quality validation passed', result.stdout)
 
     def test_optional_fixture_tools_are_installed_and_observed_instead_of_silently_skipped(self):
         recipe = (ROOT / 'tests/ci-quality/Dockerfile').read_text()

@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "image": "ghcr.io/candlelightner/agentor-ci-quality@sha256:bcf69468194f5ef9d21d312452850188c925f3e714b18b35b3ef95dca742f236",
+  "nodeMajor": 22,
+  "nodeABI": "127",
+  "inputs": {
+    "tests/package-lock.json": "bf549345a8cc282a79b7ae1b1121f90ae3e076869cf24dc928051fb1aca112da",
+    "tests/ci-quality/Dockerfile": "15a82f1df637e35f62a7b41620cc776542e0c846bca391b8816f4a545f3dd9c2",
+    "tests/ci-quality/check-image.mjs": "5bcbd263b934e31b2e03ba5983a33b3433e7ac4761dffee363b41ca04513cf6c"
+  }
+}

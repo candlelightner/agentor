@@ -154,7 +154,7 @@ jobs:
           [[ "$ref" =~ ^ghcr.io/candlelightner/agentor-ci-quality@sha256:[a-f0-9]{64}$ ]] || { echo 'Published digest could not be confirmed; active CI remains unchanged.' >&2; exit 1; }
           printf '%s\n' "$ref" > "$RUNNER_TEMP/quality-image/publication-reference.txt"
           printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/quality-image/source-sha.txt"
-          printf 'Tested quality image: `%s`\n\nSource: `%s`\n\nPreparation only: active CI was not switched.\n' "$ref" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Tested quality image: `%s`\n\nSource: `%s`\n\nPublishing a refreshed candidate does not change the approved active-CI pin.\n' "$ref" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
           {
             printf '\nImage contract:\n```json\n'
             cat "$RUNNER_TEMP/quality-image/contract.json"

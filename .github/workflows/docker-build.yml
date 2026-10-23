@@ -73,8 +73,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify compatible and deliberately mismatched selector routes
+        run: python3 -m unittest discover -s tests/helpers -p test_ci_quality_selector.py
+
+      - name: Select approved image or full baseline quality
+        id: quality-runner
+        run: python3 tests/ci-quality/select-image.py
 
       - uses: actions/setup-node@v4
+        if: steps.quality-runner.outputs.mode == 'baseline'
         with:
           node-version: 22
           cache: npm
@@ -83,34 +93,42 @@ jobs:
             tests/package-lock.json
 
       - name: Install orchestrator dependencies
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: orchestrator
         run: npm ci --no-audit --no-fund
 
       - name: Install test dependencies
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: tests
         run: npm ci --no-audit --no-fund
 
       - name: Install module test system tools
+        if: steps.quality-runner.outputs.mode == 'baseline'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-utils
 
       - name: Install locked Playwright Chromium and system dependencies
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: tests
         run: npx --no-install playwright install --with-deps chromium
 
       - name: Typecheck orchestrator
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: orchestrator
         run: npm run typecheck
 
       - name: Run no-server module and helper tests
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: tests
         run: npm run test:modules -- --grep-invert 'api/(incus-admin-restore|incus-derived-image|incus-docker-restore-archive|incus-selected-restore|managed-kilo-parent|portable-pax-size)\.spec\.ts'
 
       - name: Verify CI profiler
+        if: steps.quality-runner.outputs.mode == 'baseline'
         run: python3 scripts/profile-ci-workflow.py --self-test
 
       - name: Run root-owned archive metadata fixtures
+        if: steps.quality-runner.outputs.mode == 'baseline'
         working-directory: tests
         run: >-
           sudo -- "$(command -v node)" ./node_modules/@playwright/test/cli.js test
@@ -119,6 +137,37 @@ jobs:
           api/incus-docker-restore-archive.spec.ts api/incus-selected-restore.spec.ts
           api/managed-kilo-parent.spec.ts
           api/portable-pax-size.spec.ts
+
+      - name: Restore image-path npm download cache
+        if: steps.quality-runner.outputs.mode == 'image'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/quality-image-npm
+          key: quality-image-npm-v1-${{ runner.os }}-${{ runner.arch }}-node22-abi${{ steps.quality-runner.outputs.node-abi }}-${{ hashFiles('orchestrator/package-lock.json', 'tests/package-lock.json') }}
+          restore-keys: quality-image-npm-v1-${{ runner.os }}-${{ runner.arch }}-node22-abi${{ steps.quality-runner.outputs.node-abi }}-
+
+      - name: Pull approved image anonymously and run full quality
+        if: steps.quality-runner.outputs.mode == 'image'
+        env:
+          QUALITY_IMAGE: ${{ steps.quality-runner.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          phase='preparing isolated image client and npm download cache'
+          trap 'printf "[quality-image] Failed while %s; quality stopped with no baseline fallback.\n" "$phase" >&2' ERR
+          client=$(mktemp -d "$RUNNER_TEMP/quality-anonymous-docker.XXXXXX")
+          printf '{}\n' > "$client/config.json"
+          unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+          export DOCKER_HOST=unix:///var/run/docker.sock
+          mkdir -p "$RUNNER_TEMP/quality-image-npm"
+          [[ "$(id -u)" == 1001 && -w "$RUNNER_TEMP/quality-image-npm" ]] || { echo '[quality-image] UID1001/cache prerequisite failed; quality stopped without baseline fallback.' >&2; exit 1; }
+          phase='pulling the approved immutable image anonymously'
+          docker --config "$client" pull --platform linux/amd64 "$QUALITY_IMAGE"
+          phase='running strict image guard and full quality checks'
+          docker --config "$client" run --rm --init --shm-size=1g \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --mount "type=bind,src=$RUNNER_TEMP/quality-image-npm,dst=/home/runner/.npm" \
+            --env CI=true "$QUALITY_IMAGE" bash tests/ci-quality/run-quality.sh
 
   docker_regression:
     name: Isolated Docker API and UI regression
