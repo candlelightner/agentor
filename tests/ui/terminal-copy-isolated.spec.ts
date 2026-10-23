@@ -15,8 +15,8 @@ const { build } = require('esbuild');
 const { WebSocketServer } = require('ws');
 const realCopyText = 'Known isolated Codex response\n' + 'Long multiline é 漢字 😀 text '.repeat(12) + '\n' + 'line of complete response\n'.repeat(1000) + 'END-COPY-RESPONSE';
 
-// Actual TerminalPane + useTerminal + xterm. Deterministic cases substitute
-// remote execution; the opt-in case uses a real CLI, tmux and WebSocket.
+// Actual PaneContent + TerminalPane + useTerminal + xterm. Deterministic cases
+// substitute remote execution; the opt-in case uses a real CLI, tmux and WebSocket.
 test.describe.serial('Terminal clipboard through actual xterm', () => {
   let server: ReturnType<typeof createServer>, baseURL: string;
   let sockets: any, cli: ChildProcessWithoutNullStreams | undefined, cliRoot: string | undefined;
@@ -25,23 +25,39 @@ test.describe.serial('Terminal clipboard through actual xterm', () => {
     const source = await readFile(new URL('../../orchestrator/app/components/TerminalPane.vue', import.meta.url), 'utf8');
     const { descriptor } = parse(source);
     const script = compileScript(descriptor, { id: 'isolated-terminal-pane', inlineTemplate: true, genDefaultAs: 'TerminalPane' });
-    const prelude = `import { createApp, ref, shallowReactive, computed, toRef, nextTick, watch, onMounted, onUnmounted } from 'vue';
+    const paneSource = await readFile(new URL('../../orchestrator/app/components/PaneContent.vue', import.meta.url), 'utf8');
+    const { descriptor: paneDescriptor } = parse(paneSource);
+    const paneScript = compileScript(paneDescriptor, { id: 'isolated-pane-content', inlineTemplate: true, genDefaultAs: 'PaneContent' });
+    // The harness inlines both SFCs in one module, so their template hoists need distinct names.
+    const paneComponent = paneScript.content.replace(/\b_hoisted_(\d+)\b/g, '_pane_hoisted_$1');
+    const prelude = `import { createApp, ref, reactive, shallowReactive, computed, toRef, nextTick, watch, onMounted, onUnmounted } from 'vue';
 import { Terminal } from '@xterm/xterm'; import { FitAddon } from '@xterm/addon-fit';
 import { useTerminal } from './app/composables/useTerminal';
 window.useColorMode = () => ref('dark'); window.useToast = () => ({ add() {} });
 window.$fetch = async () => ({ protected: false });
 function useNuxtApp() { return { $Terminal: Terminal, $FitAddon: FitAddon }; }
+const fixtureGroup = reactive({ id: 'pane', sizeFraction: 1, tabs: [
+  { id: 'terminal-tab', containerId: 'fixture-worker', containerName: 'fixture-worker', type: 'terminal' },
+  { id: 'logs-tab', containerId: 'fixture-worker', containerName: 'fixture-worker', type: 'logs' },
+], activeTabId: 'terminal-tab' });
+const fixtureWorkerInventory = ref([{ id: 'fixture-worker', status: 'running' }]);
+function useNuxtData() { return { data: fixtureWorkerInventory }; }
+window.setFixtureActiveTab = id => { fixtureGroup.activeTabId = id; };
+window.setFixtureWorkers = value => { fixtureWorkerInventory.value = value; };
 function useTmuxTabs() { const windows = ref([]), activeWindowIndex = ref(null); setTimeout(() => { windows.value = [{ index: 0, name: 'main' }]; activeWindowIndex.value = 0; }, 50); return { windows, activeWindowIndex, defaultWindowIndex: ref(0), createWindow() {}, renameWindow() {}, closeWindow() {}, activateWindow() {}, destroy() {} }; }
 window.sent = [];
 class RemoteFixture { static OPEN = 1; readyState = 1; constructor() { window.remote = this; setTimeout(() => this.onopen?.(), 0); } send(data) { window.sent.push(data); this.input = (this.input || '') + data; if (this.input.endsWith('/copy\\r')) this.onmessage?.({ data: window.copySequence }); } close() { this.readyState = 3; } }
 if (!new URLSearchParams(location.search).has('realCli')) window.WebSocket = RemoteFixture;
 window.emitOutput = data => window.remote.onmessage?.({ data });
 `;
-    const bundle = await build({ stdin: { contents: prelude + script.content + '\ncreateApp(TerminalPane, { containerId: "fixture-worker" }).component("TmuxTabBar", { render() { return null; } }).mount("#app");', resolveDir: new URL('../../orchestrator', import.meta.url).pathname, loader: 'ts' }, bundle: true, write: false, format: 'iife', define: { 'process.env.NODE_ENV': '"production"', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false', __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false' }, plugins: [{ name: 'nuxt-autoimports-fixture', setup(builder: any) { builder.onResolve({ filter: /^~\/utils\/fetch-error$/ }, () => ({ path: new URL('../../orchestrator/app/utils/fetch-error.ts', import.meta.url).pathname })); builder.onLoad({ filter: /\/useTerminal\.ts$/ }, async (args: any) => ({ contents: "import { ref, shallowRef, watch } from 'vue';\n" + await readFile(args.path, 'utf8'), loader: 'ts' })); } }] });
+    const bundle = await build({ stdin: { contents: prelude + script.content + '\n' + paneComponent + '\ncreateApp(PaneContent, { group: fixtureGroup }).component("TerminalPane", TerminalPane).component("TmuxTabBar", { render() { return null; } }).component("LogPane", { render() { return null; } }).component("AppsPane", { render() { return null; } }).component("ServicePane", { render() { return null; } }).component("PluginPane", { render() { return null; } }).component("TerminalPlaceholder", { render() { return null; } }).mount("#app");', resolveDir: new URL('../../orchestrator', import.meta.url).pathname, loader: 'ts' }, bundle: true, write: false, format: 'iife', define: { 'process.env.NODE_ENV': '"production"', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false', __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false' }, plugins: [{ name: 'nuxt-autoimports-fixture', setup(builder: any) { builder.onResolve({ filter: /^~\/utils\/fetch-error$/ }, () => ({ path: new URL('../../orchestrator/app/utils/fetch-error.ts', import.meta.url).pathname })); builder.onLoad({ filter: /\/useTerminal\.ts$/ }, async (args: any) => ({ contents: "import { ref, shallowRef, watch } from 'vue';\n" + await readFile(args.path, 'utf8'), loader: 'ts' })); } }] });
     const css = await readFile(require.resolve('@xterm/xterm/css/xterm.css'), 'utf8');
+    const appCss = await readFile(new URL('../../orchestrator/app/assets/css/main.css', import.meta.url), 'utf8');
+    const overscrollRules = appCss.match(/(?:\.xterm-viewport|html:has\(\[data-terminal-pane-active\]\))\s*\{\s*overscroll-behavior-y:\s*contain;\s*\}/g);
+    if (overscrollRules?.length !== 2) throw new Error('Terminal overscroll containment rules are missing from application CSS');
     server = createServer((req, res) => {
       if (req.url === '/component.js') { res.setHeader('Content-Type', 'application/javascript'); res.end(bundle.outputFiles[0].text); }
-      else { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><style>' + css + ' html,body,#app{height:100%;margin:0}.absolute{position:absolute;inset:0}.flex{display:flex}.flex-col{flex-direction:column}.flex-1{flex:1}.relative{position:relative}.min-h-0{min-height:0}.shrink-0{flex-shrink:0}.overflow-x-auto{overflow-x:auto}.mobile-terminal-keys{display:block;position:relative}.mobile-terminal-keys [role=toolbar]{min-height:48px;box-sizing:border-box}@media(min-width:640px){.mobile-terminal-keys{display:none}}</style><div id="app"></div><script src="/component.js"></script>'); }
+      else { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><style>' + css + overscrollRules!.join('') + ' html,body,#app{height:100%;margin:0}.absolute{position:absolute;inset:0}.flex{display:flex}.flex-col{flex-direction:column}.flex-1{flex:1}.relative{position:relative}.min-h-0{min-height:0}.shrink-0{flex-shrink:0}.overflow-x-auto{overflow-x:auto}.mobile-terminal-keys{display:block;position:relative}.mobile-terminal-keys [role=toolbar]{min-height:48px;box-sizing:border-box}@media(min-width:640px){.mobile-terminal-keys{display:none}}</style><div id="app"></div><script src="/component.js"></script>'); }
     });
     sockets = new WebSocketServer({ server });
     sockets.on('connection', async (socket: any) => {
@@ -86,6 +102,27 @@ window.emitOutput = data => window.remote.onmessage?.({ data });
     if (cliRoot) await rm(cliRoot, { recursive: true, force: true });
   });
   test.beforeEach(async ({ page }) => { await page.goto(baseURL); await expect(page.locator('.xterm')).toBeVisible(); });
+
+  test('document overscroll containment follows the active available terminal pane', async ({ page }) => {
+    const rootOverscroll = () => page.evaluate(() => getComputedStyle(document.documentElement).overscrollBehaviorY);
+    await expect(page.locator('[data-terminal-pane-active]')).toHaveCount(1);
+    expect(await rootOverscroll()).toBe('contain');
+    expect(await page.locator('.xterm-viewport').evaluate(el => getComputedStyle(el).overscrollBehaviorY)).toBe('contain');
+
+    await page.evaluate(() => (window as any).setFixtureActiveTab('logs-tab'));
+    await expect(page.locator('[data-terminal-pane-active]')).toHaveCount(0);
+    await expect(page.locator('.xterm')).toHaveCount(1); // v-show keeps the inactive pane mounted.
+    expect(await rootOverscroll()).toBe('auto');
+
+    await page.evaluate(() => (window as any).setFixtureActiveTab('terminal-tab'));
+    await expect(page.locator('[data-terminal-pane-active]')).toHaveCount(1);
+    expect(await rootOverscroll()).toBe('contain');
+
+    await page.evaluate(() => (window as any).setFixtureWorkers([{ id: 'fixture-worker', status: 'stopped' }]));
+    await expect(page.getByTestId('terminal-unavailable')).toBeVisible();
+    await expect(page.locator('[data-terminal-pane-active]')).toHaveCount(0);
+    expect(await rootOverscroll()).toBe('auto');
+  });
 
   test('remote /copy request reaches browser clipboard unchanged after explicit operator click', async ({ page, context }) => {
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
@@ -386,7 +423,7 @@ window.emitOutput = data => window.remote.onmessage?.({ data });
       const horizontalPrevented = dispatch('touchmove', [{ x: 140, y: 100 }]);
       dispatch('touchend', []);
       const sentAfterHorizontal = (window as any).sent.filter((value: string) => !value.startsWith('{'));
-      return { tapPrevented, selectionShiftKey, longPressPrevented, sentAfterLongPress, sentAfterSlowSwipe, sentAfterMultiTouch, verticalPrevented, horizontalPrevented, sentAfterVertical, sentAfterHorizontal, bubbledWheel, touchAction: terminal.style.touchAction, overscroll: terminal.style.overscrollBehavior, targetInScreen: !!(target as HTMLElement).closest('.xterm-screen') };
+      return { tapPrevented, selectionShiftKey, longPressPrevented, sentAfterLongPress, sentAfterSlowSwipe, sentAfterMultiTouch, verticalPrevented, horizontalPrevented, sentAfterVertical, sentAfterHorizontal, bubbledWheel, touchAction: terminal.style.touchAction, overscroll: getComputedStyle(terminal.querySelector('.xterm-viewport')!).overscrollBehaviorY, targetInScreen: !!(target as HTMLElement).closest('.xterm-screen') };
     });
     expect(gesture.tapPrevented).toBe(false);
     expect(gesture.selectionShiftKey).toBe(false);

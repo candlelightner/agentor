@@ -18,6 +18,15 @@
   height: 100%;
 }
 
+/* Stop scroll chaining and pull-to-refresh at the terminal's scroll boundary. */
+.xterm-viewport {
+  overscroll-behavior-y: contain;
+}
+
+html:has([data-terminal-pane-active]) {
+  overscroll-behavior-y: contain;
+}
+
 /* Theme variables for hex-color scoped styles */
 :root {
   /* Pane tab bar */
