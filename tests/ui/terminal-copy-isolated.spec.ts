@@ -37,11 +37,11 @@ class RemoteFixture { static OPEN = 1; readyState = 1; constructor() { window.re
 if (!new URLSearchParams(location.search).has('realCli')) window.WebSocket = RemoteFixture;
 window.emitOutput = data => window.remote.onmessage?.({ data });
 `;
-    const bundle = await build({ stdin: { contents: prelude + script.content + '\ncreateApp(TerminalPane, { containerId: "fixture-worker" }).component("TmuxTabBar", { render() { return null; } }).mount("#app");', resolveDir: new URL('../../orchestrator', import.meta.url).pathname, loader: 'ts' }, bundle: true, write: false, format: 'iife', define: { 'process.env.NODE_ENV': '"production"', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false', __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false' }, plugins: [{ name: 'nuxt-autoimports-fixture', setup(builder: any) { builder.onLoad({ filter: /\/useTerminal\.ts$/ }, async (args: any) => ({ contents: "import { ref, shallowRef, watch } from 'vue';\n" + await readFile(args.path, 'utf8'), loader: 'ts' })); } }] });
+    const bundle = await build({ stdin: { contents: prelude + script.content + '\ncreateApp(TerminalPane, { containerId: "fixture-worker" }).component("TmuxTabBar", { render() { return null; } }).mount("#app");', resolveDir: new URL('../../orchestrator', import.meta.url).pathname, loader: 'ts' }, bundle: true, write: false, format: 'iife', define: { 'process.env.NODE_ENV': '"production"', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false', __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false' }, plugins: [{ name: 'nuxt-autoimports-fixture', setup(builder: any) { builder.onResolve({ filter: /^~\/utils\/fetch-error$/ }, () => ({ path: new URL('../../orchestrator/app/utils/fetch-error.ts', import.meta.url).pathname })); builder.onLoad({ filter: /\/useTerminal\.ts$/ }, async (args: any) => ({ contents: "import { ref, shallowRef, watch } from 'vue';\n" + await readFile(args.path, 'utf8'), loader: 'ts' })); } }] });
     const css = await readFile(require.resolve('@xterm/xterm/css/xterm.css'), 'utf8');
     server = createServer((req, res) => {
       if (req.url === '/component.js') { res.setHeader('Content-Type', 'application/javascript'); res.end(bundle.outputFiles[0].text); }
-      else { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><style>' + css + ' html,body,#app{height:100%;margin:0}.absolute{position:absolute;inset:0}.flex{display:flex}.flex-col{flex-direction:column}.flex-1{flex:1}.relative{position:relative}.min-h-0{min-height:0}</style><div id="app"></div><script src="/component.js"></script>'); }
+      else { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><style>' + css + ' html,body,#app{height:100%;margin:0}.absolute{position:absolute;inset:0}.flex{display:flex}.flex-col{flex-direction:column}.flex-1{flex:1}.relative{position:relative}.min-h-0{min-height:0}.shrink-0{flex-shrink:0}.overflow-x-auto{overflow-x:auto}.mobile-terminal-keys{display:block;position:relative}.mobile-terminal-keys [role=toolbar]{min-height:48px;box-sizing:border-box}@media(min-width:640px){.mobile-terminal-keys{display:none}}</style><div id="app"></div><script src="/component.js"></script>'); }
     });
     sockets = new WebSocketServer({ server });
     sockets.on('connection', async (socket: any) => {
@@ -159,5 +159,293 @@ window.emitOutput = data => window.remote.onmessage?.({ data });
     await page.evaluate(() => (window as any).emitOutput('\x1b]52;c;' + 'A'.repeat(1_400_000) + '\x07'));
     await expect(page.getByRole('status')).toContainText('exceeds 1 MiB');
     expect((await page.evaluate(() => (window as any).sent)).every((value: string) => value.startsWith('{'))).toBe(true);
+  });
+
+  test('mobile toolbar sends one-shot modifier combinations without duplicate terminal input', async ({ page, context }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await page.evaluate(() => navigator.clipboard.writeText('virtual modifier paste'));
+    const input = page.locator('.xterm-helper-textarea');
+    await input.focus();
+    await page.evaluate(() => { (window as any).sent.length = 0; });
+    await page.getByRole('button', { name: 'Terminal keys' }).click();
+    const ctrl = page.getByRole('button', { name: 'Ctrl', exact: true });
+    await ctrl.click();
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'true');
+    await input.press('c');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03']);
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'false');
+
+    await ctrl.click();
+    await input.press('l');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03', '\x0c']);
+    await input.press('Shift+Enter');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).at(-1))).toBe('\x1b[13;2u');
+
+    await ctrl.click();
+    await input.press('v');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).join(''))).toContain('virtual modifier paste');
+    await page.evaluate(() => { (window as any).sent.length = 0; });
+    await input.press('Control+v');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).join(''))).toContain('virtual modifier paste');
+
+    await ctrl.click();
+    await page.getByRole('button', { name: 'Alt', exact: true }).click();
+    await input.press('v');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).at(-1))).toBe('\x1b\x16');
+
+    const shift = page.getByRole('button', { name: 'Shift', exact: true });
+    await shift.click();
+    await page.getByRole('button', { name: 'Tab', exact: true }).click();
+    await shift.click();
+    await page.getByRole('button', { name: 'Enter', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).join(''))).toContain('\x1b[Z\x1b[13;2u');
+
+    const alt = page.getByRole('button', { name: 'Alt', exact: true });
+    await alt.click();
+    await input.press('f');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).at(-1))).toBe('\x1bf');
+    await expect(page.getByRole('button', { name: 'Hide terminal keys' })).toHaveAttribute('aria-expanded', 'true');
+    const mobileLayout = await page.evaluate(() => {
+      const terminal = document.querySelector('.terminals-container') ?? document.querySelector('.relative.flex-1.min-h-0')!;
+      const toolbar = document.querySelector<HTMLElement>('.mobile-terminal-keys')!;
+      const terminalRect = terminal.getBoundingClientRect(), toolbarRect = toolbar.getBoundingClientRect();
+      return { terminalBottom: terminalRect.bottom, toolbarTop: toolbarRect.top, toolbarBottom: toolbarRect.bottom, viewportHeight: innerHeight };
+    });
+    expect(Math.abs(mobileLayout.terminalBottom - mobileLayout.toolbarTop)).toBeLessThan(2);
+    expect(mobileLayout.toolbarBottom).toBeLessThanOrEqual(mobileLayout.viewportHeight);
+    await page.setViewportSize({ width: 390, height: 500 });
+    await expect.poll(() => page.locator('.relative.flex-1.min-h-0').evaluate(el => el.getBoundingClientRect().height)).toBeLessThan(600);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await expect(page.locator('.mobile-terminal-keys')).toHaveCSS('display', 'none');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole('button', { name: 'Ctrl', exact: true }).click();
+    await page.getByRole('button', { name: 'Hide terminal keys' }).click();
+    await expect(page.getByRole('toolbar', { name: 'Mobile terminal keys' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Terminal keys' }).click();
+    await expect(page.getByRole('button', { name: 'Ctrl', exact: true })).toHaveAttribute('aria-pressed', 'false');
+    await input.press('c');
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).at(-1))).toBe('c');
+  });
+
+  test('Android-style unidentified key input consumes a pending modifier exactly once', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const input = page.locator('.xterm-helper-textarea');
+    await input.focus();
+    await page.evaluate(() => { (window as any).sent.length = 0; });
+    await page.getByRole('button', { name: 'Terminal keys' }).click();
+    const ctrl = page.getByRole('button', { name: 'Ctrl', exact: true });
+    await ctrl.click();
+    await input.evaluate((element: HTMLTextAreaElement) => {
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+      element.value = 'c';
+      element.dispatchEvent(new InputEvent('input', { data: 'c', inputType: 'insertText', composed: true, isComposing: true, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03']);
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'false');
+
+    await page.getByRole('button', { name: 'Shift', exact: true }).click();
+    await input.evaluate(async (element: HTMLTextAreaElement) => {
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Process', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Process', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+      element.value = 'xy';
+      element.dispatchEvent(new InputEvent('input', { data: 'xy', inputType: 'insertText', composed: true, bubbles: true }));
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03', 'xy']);
+    await expect(page.getByRole('button', { name: 'Shift', exact: true })).toHaveAttribute('aria-pressed', 'false');
+
+    await ctrl.click();
+    await input.evaluate((element: HTMLTextAreaElement) => {
+      element.value = '';
+      element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+      element.value = 'z';
+      element.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'z', bubbles: true }));
+      element.dispatchEvent(new InputEvent('input', { data: 'z', inputType: 'insertCompositionText', composed: true, isComposing: true, bubbles: true }));
+      element.dispatchEvent(new CompositionEvent('compositionend', { data: 'z', bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03', 'xy', '\x1a']);
+
+    await ctrl.click();
+    await input.evaluate((element: HTMLTextAreaElement) => {
+      element.value = '';
+      element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      element.value = 'x';
+      element.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'x', bubbles: true }));
+      element.dispatchEvent(new InputEvent('input', { data: 'x', inputType: 'insertCompositionText', composed: true, isComposing: true, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, which: 13, isComposing: true, bubbles: true, cancelable: true }));
+    });
+    const candidateCommit = await page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')).slice(3));
+    expect(candidateCommit[0]).toBe('\x18');
+    expect(candidateCommit.some((data: string) => data.startsWith('\x1b[13;5u'))).toBe(false);
+    await input.evaluate((element: HTMLTextAreaElement) => {
+      element.dispatchEvent(new CompositionEvent('compositionend', { data: 'x', bubbles: true }));
+      element.dispatchEvent(new InputEvent('input', { data: 'x', inputType: 'insertText', composed: true, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03', 'xy', '\x1a', ...candidateCommit]);
+
+    await ctrl.click();
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { read: async () => [{ types: ['text/plain'], getType: async () => new Blob(['IME clipboard paste']) }] },
+      });
+    });
+    await input.evaluate((element: HTMLTextAreaElement) => {
+      element.value = '';
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+      element.value = 'v';
+      element.dispatchEvent(new InputEvent('input', { data: 'v', inputType: 'insertText', composed: true, isComposing: true, bubbles: true }));
+      element.dispatchEvent(new CompositionEvent('compositionend', { data: 'v', bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Unidentified', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+    });
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toEqual(['\x03', 'xy', '\x1a', ...candidateCommit, 'IME clipboard paste']);
+    await expect(ctrl).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  test('virtual Ctrl+V uses the clipboard bridge under a Firefox user agent', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 Firefox/128.0' });
+      let reads = 0;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { read: async () => { reads++; return [{ types: ['text/plain'], getType: async () => new Blob(['Firefox virtual paste']) }]; } },
+      });
+      (window as any).clipboardReads = () => reads;
+    });
+    await page.getByRole('button', { name: 'Terminal keys' }).click();
+    await page.getByRole('button', { name: 'Ctrl', exact: true }).click();
+    await page.locator('.xterm-helper-textarea').press('v');
+    await expect.poll(() => page.evaluate(() => (window as any).clipboardReads())).toBe(1);
+    await expect.poll(() => page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).toContain('Firefox virtual paste');
+    expect(await page.evaluate(() => (window as any).sent.filter((value: string) => !value.startsWith('{')))).not.toContain('\x16');
+  });
+
+  test('touch vertical gestures route through xterm mouse-wheel reporting and stay inside the terminal', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const input = page.locator('.xterm-helper-textarea');
+    await input.focus();
+    await page.evaluate(() => {
+      (window as any).sent.length = 0;
+      (window as any).emitOutput('\x1b[?1000h\x1b[?1006h\x1b[?1049h');
+    });
+    await page.waitForTimeout(30);
+    const gesture = await page.evaluate(() => {
+      const terminal = document.querySelector<HTMLElement>('.xterm')!;
+      const terminalRect = terminal.getBoundingClientRect();
+      const target = document.elementFromPoint(terminalRect.left + terminalRect.width / 2, terminalRect.top + terminalRect.height / 2)!;
+      let bubbledWheel: { x: number; y: number; target: string } | null = null;
+      terminal.parentElement!.addEventListener('wheel', event => {
+        const wheel = event as WheelEvent;
+        bubbledWheel = { x: wheel.clientX, y: wheel.clientY, target: (wheel.target as HTMLElement).className };
+      }, { capture: true, once: true });
+      const dispatch = (type: string, points: { x: number; y: number }[]) => {
+        const event = new Event(type, { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'touches', { value: points.map(point => ({ clientX: point.x, clientY: point.y, pageX: point.x, pageY: point.y })) });
+        Object.defineProperty(event, 'changedTouches', { value: [] });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      const tapPrevented = dispatch('touchstart', [{ x: 100, y: 100 }]);
+      dispatch('touchend', []);
+      const selectionPointer = new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' });
+      let selectionShiftKey = true;
+      target.addEventListener('pointerdown', event => { selectionShiftKey = (event as PointerEvent).shiftKey; }, { once: true });
+      target.dispatchEvent(selectionPointer);
+      const originalNow = Date.now;
+      let fakeNow = 1000;
+      Date.now = () => fakeNow;
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      fakeNow = 1500;
+      const longPressPrevented = dispatch('touchmove', [{ x: 100, y: 130 }]);
+      dispatch('touchend', []);
+      const sentAfterLongPress = (window as any).sent.filter((value: string) => !value.startsWith('{'));
+      fakeNow = 2000;
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      fakeNow = 2100;
+      dispatch('touchmove', [{ x: 100, y: 120 }]);
+      fakeNow = 2600;
+      dispatch('touchmove', [{ x: 100, y: 170 }]);
+      dispatch('touchend', []);
+      const sentAfterSlowSwipe = (window as any).sent.filter((value: string) => !value.startsWith('{'));
+      dispatch('touchstart', [{ x: 100, y: 100 }, { x: 140, y: 100 }]);
+      dispatch('touchmove', [{ x: 100, y: 150 }, { x: 140, y: 150 }]);
+      dispatch('touchend', []);
+      const sentAfterMultiTouch = (window as any).sent.filter((value: string) => !value.startsWith('{'));
+      Date.now = originalNow;
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      const verticalPrevented = dispatch('touchmove', [{ x: 100, y: 200 }]);
+      dispatch('touchend', []);
+      const sentAfterVertical = (window as any).sent.filter((value: string) => !value.startsWith('{'));
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      const horizontalPrevented = dispatch('touchmove', [{ x: 140, y: 100 }]);
+      dispatch('touchend', []);
+      const sentAfterHorizontal = (window as any).sent.filter((value: string) => !value.startsWith('{'));
+      return { tapPrevented, selectionShiftKey, longPressPrevented, sentAfterLongPress, sentAfterSlowSwipe, sentAfterMultiTouch, verticalPrevented, horizontalPrevented, sentAfterVertical, sentAfterHorizontal, bubbledWheel, touchAction: terminal.style.touchAction, overscroll: terminal.style.overscrollBehavior, targetInScreen: !!(target as HTMLElement).closest('.xterm-screen') };
+    });
+    expect(gesture.tapPrevented).toBe(false);
+    expect(gesture.selectionShiftKey).toBe(false);
+    expect(gesture.longPressPrevented).toBe(false);
+    expect(gesture.sentAfterLongPress).toEqual([]);
+    expect(gesture.sentAfterSlowSwipe.some((data: string) => /^\x1b\[<64;\d+;\d+M$/.test(data))).toBe(true);
+    expect(gesture.sentAfterMultiTouch).toEqual(gesture.sentAfterSlowSwipe);
+    expect(gesture.verticalPrevented).toBe(false);
+    expect(gesture.horizontalPrevented).toBe(false);
+    expect(gesture.bubbledWheel).toMatchObject({ x: 100, y: 120 });
+    expect(gesture.bubbledWheel.target).toContain('xterm');
+    expect(gesture.sentAfterVertical.some((data: string) => /^\x1b\[<64;\d+;\d+M$/.test(data))).toBe(true);
+    expect(gesture.sentAfterHorizontal).toEqual(gesture.sentAfterVertical);
+    expect(gesture.touchAction).toBe('pan-x pinch-zoom');
+    expect(gesture.overscroll).toBe('contain');
+    expect(gesture.targetInScreen).toBe(true);
+  });
+
+  test('touch scrolling uses xterm local scrollback when mouse reporting is off', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate(() => (window as any).emitOutput(Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\r\n')));
+    const viewport = page.locator('.xterm-viewport');
+    await expect.poll(() => viewport.evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+    const before = await viewport.evaluate(el => el.scrollTop);
+    const result = await viewport.evaluate((el: HTMLElement) => {
+      const terminal = el.closest('.xterm')!;
+      const rect = terminal.getBoundingClientRect();
+      const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)!;
+      const dispatch = (type: string, points: { x: number; y: number }[]) => {
+        const event = new Event(type, { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'touches', { value: points.map(point => ({ clientX: point.x, clientY: point.y, pageX: point.x, pageY: point.y })) });
+        Object.defineProperty(event, 'changedTouches', { value: [] });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      const prevented = dispatch('touchmove', [{ x: 100, y: 200 }]);
+      dispatch('touchend', []);
+      const afterVertical = el.scrollTop;
+
+      const originalNow = Date.now;
+      let fakeNow = 1000;
+      Date.now = () => fakeNow;
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      fakeNow = 1500;
+      dispatch('touchmove', [{ x: 100, y: 130 }]);
+      dispatch('touchend', []);
+      dispatch('touchstart', [{ x: 100, y: 100 }, { x: 140, y: 100 }]);
+      dispatch('touchmove', [{ x: 100, y: 150 }, { x: 140, y: 150 }]);
+      dispatch('touchend', []);
+      dispatch('touchstart', [{ x: 100, y: 100 }]);
+      dispatch('touchmove', [{ x: 140, y: 100 }]);
+      dispatch('touchend', []);
+      Date.now = originalNow;
+      return { prevented, afterVertical, afterGuards: el.scrollTop, targetInScreen: !!(target as HTMLElement).closest('.xterm-screen') };
+    });
+    expect(result.prevented).toBe(false);
+    expect(result.afterVertical).toBeLessThan(before);
+    expect(result.afterGuards).toBe(result.afterVertical);
+    expect(result.targetInScreen).toBe(true);
   });
 });

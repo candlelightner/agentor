@@ -40,6 +40,7 @@ export default defineConfig({
     "api/physical-gpu-access.spec.ts",
     "ui/physical-gpu-isolated.spec.ts",
     "api/terminal-copy.spec.ts",
+    "ui/terminal-copy-isolated.spec.ts",
     "api/management-logs-domain.spec.ts",
     "api/management-status-domain.spec.ts",
     "api/management-mcp-transport.spec.ts",
