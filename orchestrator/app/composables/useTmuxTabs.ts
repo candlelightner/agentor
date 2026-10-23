@@ -1,8 +1,10 @@
-import type { TmuxWindow } from '~/types';
+import type { ContainerInfo, TmuxWindow } from '~/types';
 
 const POLL_INTERVAL = 3000;
 
 export function useTmuxTabs(containerId: Ref<string>) {
+  const { data: workers } = useNuxtData<ContainerInfo[]>('workers');
+  const available = computed(() => workers.value?.some(worker => worker.id === containerId.value && worker.status === 'running') ?? false);
   const { getTmuxActiveWindow, setTmuxActiveWindow } = useUiState();
   const windows = ref<TmuxWindow[]>([]);
   const activeWindowIndex = ref<number | null>(null);
@@ -11,14 +13,18 @@ export function useTmuxTabs(containerId: Ref<string>) {
 
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let fetchGeneration = 0;
+  let destroyed = false;
+  let pollGeneration = 0;
+  let failures = 0;
 
   async function fetchWindows() {
+    if (destroyed || !available.value) return false;
     const currentGeneration = ++fetchGeneration;
     try {
-      const data = await $fetch<TmuxWindow[]>(`/api/containers/${containerId.value}/panes`);
+      const data = await $fetch<TmuxWindow[]>(`/api/containers/${containerId.value}/panes`, { retry: 0 });
 
       // Discard stale response if containerId changed during fetch
-      if (currentGeneration !== fetchGeneration) return;
+      if (destroyed || !available.value || currentGeneration !== fetchGeneration) return false;
 
       windows.value = data;
 
@@ -29,42 +35,34 @@ export function useTmuxTabs(containerId: Ref<string>) {
 
       // Auto-select first window when nothing is active
       if (activeWindowIndex.value == null && data.length > 0) {
-        activeWindowIndex.value = data[0]!.index;
+        const saved = getTmuxActiveWindow(containerId.value);
+        activeWindowIndex.value = data.some(window => window.index === saved) ? saved! : data[0]!.index;
       }
 
       // Persist for reopen
       if (activeWindowIndex.value != null) {
         setTmuxActiveWindow(containerId.value, activeWindowIndex.value);
       }
+      return true;
     } catch {
-      // Container may be stopped or removed
+      return false;
     }
   }
 
-  async function init() {
-    await fetchWindows();
-
-    // Restore last active window if it still exists
-    const saved = getTmuxActiveWindow(containerId.value);
-    if (saved != null && windows.value.some((w) => w.index === saved)) {
-      activeWindowIndex.value = saved;
-    } else if (windows.value.length > 0 && activeWindowIndex.value == null) {
-      activeWindowIndex.value = windows.value[0]!.index;
-    }
-
-    startPolling();
-  }
-
-  function startPolling() {
-    stopPolling();
-    pollTimer = setInterval(() => fetchWindows(), POLL_INTERVAL);
+  async function poll() {
+    const generation = pollGeneration;
+    const succeeded = await fetchWindows();
+    if (destroyed || !available.value || generation !== pollGeneration) return;
+    failures = succeeded ? 0 : Math.min(failures + 1, 4);
+    // Expected unavailable responses back off; inventory must still confirm running.
+    pollTimer = setTimeout(poll, POLL_INTERVAL * 2 ** failures);
   }
 
   function stopPolling() {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    pollGeneration++;
+    fetchGeneration++;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
   }
 
   async function createWindow(name?: string, lockPassword?: string): Promise<TmuxWindow | null> {
@@ -124,19 +122,17 @@ export function useTmuxTabs(containerId: Ref<string>) {
   }
 
   function destroy() {
+    destroyed = true;
     stopPolling();
   }
 
-  // Re-init when containerId changes
-  watch(containerId, () => {
+  watch([containerId, available], () => {
     stopPolling();
     windows.value = [];
     activeWindowIndex.value = null;
-    init();
-  });
-
-  // Start on creation
-  init();
+    failures = 0;
+    if (!destroyed && available.value) void poll();
+  }, { immediate: true });
 
   return {
     windows,

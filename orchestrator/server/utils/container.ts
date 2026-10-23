@@ -1,3 +1,4 @@
+import { createError } from 'h3';
 import { recoveryState, validateRecoveryMaxRetries, UNKNOWN_STATE_WARNING } from "../../shared/worker-recovery";
 import { workerStartupFailure } from "./worker-startup-error";
 import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
@@ -7788,13 +7789,40 @@ for p in sys.argv[1:]:
 
   async listTmuxWindows(id: string): Promise<TmuxWindow[]> {
     const info = this.containers.get(id);
-    if (!info) throw new Error("Container not found");
-    try {
-      return await this.workerCommands(id).execListTmuxWindows(info.containerId);
-    } catch (error) {
-      this.markRuntimeUnknown(info, "Docker terminal inspection", error);
-      throw error;
+    if (!info) throw createError({ statusCode: 404, statusMessage: "Worker not found" });
+    const unavailable = () => createError({
+      statusCode: info.status === 'stopped' ? 409 : 503,
+      statusMessage: 'Worker panes are unavailable; refresh worker status before retrying',
+      data: { code: 'WORKER_PANES_UNAVAILABLE', status: info.status },
+    });
+    if (info.status !== 'running' || isWorkerLifecycleMutationPending(id)) {
+      useLogger().debug('[panes] Discovery skipped: compute is not confirmed running or lifecycle is pending; no guest command issued.');
+      throw unavailable();
     }
+    // Admission errors are not failed runtime probes and must not erase stopped state.
+    let commands: DockerService | IncusWorkerCommands;
+    try { commands = this.workerCommands(id); }
+    catch {
+      useLogger().debug('[panes] Command admission refused; panes withheld, runtime state retained.');
+      throw unavailable();
+    }
+    const handle = info.containerId, generation = workerLifecycleGeneration(id);
+    let windows: TmuxWindow[];
+    try {
+      windows = await commands.execListTmuxWindows(handle);
+    } catch (error) {
+      if (this.containers.get(id) === info && info.containerId === handle && info.status === 'running' &&
+          workerLifecycleGeneration(id) === generation && !isWorkerLifecycleMutationPending(id))
+        this.reportRuntimeFailure(id, "Worker terminal inspection", error, handle);
+      useLogger().debug('[panes] Runtime inspection failed; panes withheld pending verified runtime status.');
+      throw unavailable();
+    }
+    if (this.containers.get(id) !== info || info.containerId !== handle || info.status !== 'running' ||
+        workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id)) {
+      useLogger().debug('[panes] Runtime changed during discovery; stale panes discarded, newer runtime state retained.');
+      throw unavailable();
+    }
+    return windows;
   }
 
   async createTmuxWindow(id: string, name?: string): Promise<TmuxWindow> {

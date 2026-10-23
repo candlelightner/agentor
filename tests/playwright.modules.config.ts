@@ -141,6 +141,7 @@ export default defineConfig({
     "api/admin-emergency-initialization.spec.ts",
     "api/incus-client.spec.ts",
     "api/incus-vcpu.spec.ts",
+    "api/pane-lifecycle.spec.ts",
     "api/vcpu-count.spec.ts",
     "api/incus-image-import.spec.ts",
     "api/incus-image-import-live.spec.ts",

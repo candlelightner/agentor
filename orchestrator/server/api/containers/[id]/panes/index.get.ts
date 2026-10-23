@@ -2,10 +2,12 @@ defineRouteMeta({
   openAPI: {
     tags: ['Tmux'],
     summary: 'List tmux windows',
-    description: 'Returns all tmux windows in the container session.',
+    description: 'Returns tmux windows only for confirmed running compute. A stopped worker returns 409; unknown, unresponsive, or changing compute returns 503 with WORKER_PANES_UNAVAILABLE. Refresh inventory before retrying.',
     operationId: 'listTmuxWindows',
     parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Container ID' }],
     responses: {
+      409: { description: 'Confirmed stopped worker; panes unavailable' },
+      503: { description: 'Runtime unconfirmed, unresponsive, or changing; panes unavailable' },
       200: {
         description: 'Array of tmux windows',
         content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/TmuxWindow' } } } },
