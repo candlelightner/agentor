@@ -11,7 +11,7 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl git jq tmux python3 build-essential pkg-config qemu-utils \
-       systemd openssl sudo tar gzip xz-utils zstd \
+       systemd openssl sudo tar gzip pigz xz-utils zstd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 runner && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner \
     && printf 'runner ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/ci-quality \

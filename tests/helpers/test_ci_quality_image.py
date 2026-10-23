@@ -58,6 +58,13 @@ class QualityImageTests(unittest.TestCase):
         self.assertIn('ineligible for publication', result.stderr)
         self.assertNotIn('Full candidate quality validation passed', result.stdout)
 
+    def test_optional_fixture_tools_are_installed_and_observed_instead_of_silently_skipped(self):
+        recipe = (ROOT / 'tests/ci-quality/Dockerfile').read_text()
+        guard = (ROOT / 'tests/ci-quality/check-image.mjs').read_text()
+        for tool, flag in (('jq', '--version'), ('tmux', '-V'), ('pigz', '--version')):
+            self.assertRegex(recipe, r'\b' + tool + r'\b')
+            self.assertIn("['" + tool + "', ['" + flag + "']]", guard)
+
     def test_quality_preserves_nonroot_and_explicit_sudo_split_without_daemon_or_install_fallback(self):
         recipe = (ROOT / 'tests/ci-quality/Dockerfile').read_text()
         run = (ROOT / 'tests/ci-quality/run-quality.sh').read_text()
