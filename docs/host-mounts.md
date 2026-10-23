@@ -89,6 +89,28 @@ failed because Docker was unavailable. Archived workers have no live container;
 their invalid desired mounts are removed and unarchive re-resolves the remaining
 configuration.
 
+## Native VM restart cleanup
+
+A stopped native VM can retain a busy host export after Incus shutdown cleanup
+fails. Before starting or removing that VM, Agentor retries a normal unmount of
+only its verified staging exports. The host service pins the installation,
+ordinary worker, native incarnation, stopped state and applied source inode;
+ambiguous, nested or still-busy mounts block the operation with diagnostics.
+Source directories and guest disks are retained. Cleanup uses the host mount
+namespace even when the policy service runs in its hardened private namespace.
+
+Restart also applies saved mount removals to a stopped native VM with a guarded
+ETag update. Retained devices and source identities must match exactly. Mount
+additions or source/access changes still require recreation; the durable
+`hostMountsRevoked` guard above still requires the existing rebuild workflow.
+A general `pendingRebuild` flag is retained because it can represent other
+settings that restart cannot apply.
+
+Update the installed host service with the supported
+[`--update-policy` procedure](incus-admin-private-networks.md) before deploying
+an orchestrator that uses this cleanup endpoint. A missing endpoint blocks
+cleanup instead of bypassing its checks. No worker-image conversion is needed.
+
 ## Dashboard and REST API
 
 The sidebar's **Host mount permissions** dialog is the central interface. It

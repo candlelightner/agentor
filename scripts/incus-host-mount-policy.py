@@ -9,8 +9,11 @@ operator restrictions and approved host-mount roots are never rewritten.
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import time
 from urllib.parse import quote
 
 
@@ -26,14 +29,26 @@ NETWORK = sibling("incus-managed-network-policy")
 OWNED_ROOTS = "user.agentor.host-mount-roots"
 
 
+def unmount_export(path, namespace="/proc/1/ns/mnt"):
+    try:
+        result = subprocess.run(["nsenter", "--mount=" + namespace, "--", "umount", "--internal-only", "--no-canonicalize", "--", str(path)],
+                                capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired as error:
+        raise SOURCES.SourceRejected("Host export cleanup timed out; VM remains stopped, source data retained") from error
+    if result.returncode:
+        raise SOURCES.SourceRejected("Host export is still busy; VM remains stopped, source data retained")
+
+
 class HostMountPolicy:
     def __init__(self, data_dir, installation, project, incus_dir, protected_paths, request, docker_list,
-                 mountinfo=lambda: Path("/proc/self/mountinfo").read_text()):
+                 mountinfo=lambda: Path("/proc/self/mountinfo").read_text(), unmount=unmount_export,
+                 host_mountinfo=lambda: Path("/proc/1/mountinfo").read_text()):
         self.data_dir = SOURCES.canonical(data_dir)
         self.installation, self.project = installation, project
         self.incus_dir = SOURCES.canonical(incus_dir)
         self.protected_paths = [SOURCES.canonical(path) for path in protected_paths]
         self.request, self.docker_list, self.mountinfo = request, docker_list, mountinfo
+        self.unmount, self.host_mountinfo = unmount, host_mountinfo
         if not SOURCES.UUID.fullmatch(installation) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,63}", project) or project == "default":
             raise SOURCES.SourceRejected("Pinned installation and dedicated project required")
 
@@ -178,6 +193,111 @@ class HostMountPolicy:
         if selected["sourcePath"] not in paths or selected["sourcePath"] not in roots:
             raise SOURCES.SourceRejected("Catalog export is not allowlisted by this installation")
         return self.result(selected)
+
+    def cleanup_worker_exports(self, payload):
+        """Retry failed Incus stop cleanup, never detach a live/foreign export."""
+        if not isinstance(payload, dict) or set(payload) != {"userId", "workerId", "incarnation"} or \
+                not isinstance(payload["userId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", payload["userId"]) or \
+                any(not isinstance(payload[k], str) or not SOURCES.UUID.fullmatch(payload[k]) for k in ("workerId", "incarnation")):
+            raise SOURCES.SourceRejected("Exact ordinary worker identity and incarnation required for export cleanup")
+        owner, worker_id, incarnation = (payload[k] for k in ("userId", "workerId", "incarnation"))
+        if self.read_authority(["backup-installation-id"], 128).strip() != self.installation:
+            raise SOURCES.SourceRejected("Installation identity changed; cleanup refused")
+        records = json.loads(self.read_authority(["users", owner, "workers.json"]))
+        workers = [w for w in records if isinstance(w, dict) and w.get("id") == worker_id] if isinstance(records, list) else []
+        if len(workers) != 1 or len(records) > 4096 or workers[0].get("userId") != owner or \
+                workers[0].get("runtimeKind") not in ("incus-vm", "legacy-docker") or \
+                workers[0].get("status") not in ("active", "archived") or \
+                any(k in workers[0] for k in ("kind", "administrativeKind")):
+            raise SOURCES.SourceRejected("Current ordinary worker authority required; cleanup refused")
+        instances, _ = self.request("GET", "/1.0/instances?recursion=1&project=" + quote(self.project))
+        if not isinstance(instances, list) or len(instances) > 4096 or any(not isinstance(v, dict) or not isinstance(v.get("config"), dict) for v in instances):
+            raise SOURCES.SourceRejected("Native worker inventory is unavailable; cleanup refused")
+        matches = [v for v in instances if v["config"].get("user.agentor.id") == worker_id]
+        if len(matches) != 1:
+            raise SOURCES.SourceRejected("Native worker identity is missing or ambiguous; cleanup refused")
+        baseline = matches[0]
+        if workers[0]["runtimeKind"] == "legacy-docker":
+            migration = workers[0].get("incusMigration", {})
+            if not isinstance(migration, dict) or migration.get("destinationIncarnation") != incarnation or \
+                    not isinstance(migration.get("nonce"), str) or not SOURCES.UUID.fullmatch(migration["nonce"]) or \
+                    baseline["config"].get("user.agentor.recreation") != migration["nonce"]:
+                raise SOURCES.SourceRejected("Staged migration destination is not authorized; cleanup refused")
+        name = baseline.get("name", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", name):
+            raise SOURCES.SourceRejected("Native worker name is invalid; cleanup refused")
+        endpoint = "/1.0/instances/" + quote(name) + "?project=" + quote(self.project)
+
+        def stopped():
+            current, _ = self.request("GET", endpoint)
+            config = current.get("config", {})
+            state, _ = self.request("GET", "/1.0/instances/" + quote(name) + "/state?project=" + quote(self.project))
+            if current != baseline or current.get("type") != "virtual-machine" or current.get("profiles") != [] or \
+                    config.get("user.agentor.installation") != self.installation or config.get("user.agentor.owner") != owner or \
+                    config.get("volatile.uuid") != incarnation or config.get("user.agentor.administrative") or \
+                    current.get("status") != "Stopped" or state.get("status") != "Stopped" or state.get("pid", 0) != 0:
+                raise SOURCES.SourceRejected("VM is live, replaced or changed; cleanup refused and source data retained")
+
+        stopped()
+        devices = baseline.get("devices", {})
+        expanded = baseline.get("expanded_devices", devices)
+        if not isinstance(devices, dict) or not isinstance(expanded, dict) or any(not isinstance(v, dict) for v in expanded.values()):
+            raise SOURCES.SourceRejected("Native device authority is malformed; cleanup refused")
+        identities = json.loads(baseline["config"].get("user.agentor.host-mounts", "[]"))
+        keys = {k for k in expanded if k.startswith("hm")}
+        if not isinstance(identities, list) or len(identities) > 4096 or len(identities) != len(keys) or \
+                any(not isinstance(i, dict) or set(i) != {"key", "pathId", "sourceIdentity"} or \
+                    not all(isinstance(i[k], str) for k in ("key", "pathId", "sourceIdentity")) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", i["sourceIdentity"]) for i in identities) or \
+                {i["key"] for i in identities} != keys:
+            raise SOURCES.SourceRejected("Applied host export identities are ambiguous; cleanup refused")
+        _, _, _, roots = self.project_policy()
+        planned = []
+        for identity in identities:
+            key, path_id = identity["key"], identity["pathId"]
+            if not isinstance(key, str) or not re.fullmatch(r"hm[0-9a-f]{6}", key) or \
+                    not isinstance(path_id, str) or not SOURCES.UUID.fullmatch(path_id) or devices.get(key) != expanded[key]:
+                raise SOURCES.SourceRejected("Applied host export key is invalid; cleanup refused")
+            device = devices[key]
+            target = device.get("path", "")
+            if device.get("type") != "disk" or not isinstance(target, str) or not target.startswith("/") or \
+                    target == "/" or os.path.normpath(target) != target or any(x in target for x in ("\0", "\\")):
+                raise SOURCES.SourceRejected("Applied host export target is invalid; cleanup refused")
+            expected_key = "hm" + hashlib.sha256(f"{path_id}:{target}".encode()).hexdigest()[:6]
+            # Reservations survive catalog/grant removal. Cleanup revokes an
+            # already-applied export; it must never regrant a removed source.
+            if key != expected_key or SOURCES.canonical(device.get("source")) not in roots:
+                raise SOURCES.SourceRejected("Applied host export source changed; cleanup refused")
+            encoded = ("disk." + key + "." + target[1:]).replace("-", "--").replace("/", "-")
+            stage = Path(self.incus_dir) / "devices" / (self.project + "_" + name) / encoded
+            planned.append((stage, identity["sourceIdentity"]))
+
+        def mounts():
+            # The hardened service has a private mount namespace; inspect and
+            # detach in the host namespace where Incus created the export.
+            text = self.host_mountinfo()
+            SOURCES.alias_mounts(text)  # Validate the bounded, complete mount table.
+            return [re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), row.split()[4]) for row in text.splitlines()]
+
+        cleaned = 0
+        deadline = time.monotonic() + 10
+        for stage, expected in planned:
+            if time.monotonic() >= deadline:
+                raise SOURCES.SourceRejected("Export cleanup exceeded its 10-second work budget; cleanup unconfirmed, source data retained")
+            current_mounts = mounts()
+            if str(stage) not in current_mounts:
+                continue
+            if current_mounts.count(str(stage)) != 1 or any(p.startswith(str(stage) + "/") for p in current_mounts) or \
+                    hashlib.sha256(":".join(map(str, SOURCES.directory_identity(str(stage)))).encode()).hexdigest() != expected:
+                raise SOURCES.SourceRejected("Stale export identity or nested mounts are ambiguous; cleanup refused")
+            stopped()
+            self.unmount(stage)
+            stopped()
+            if str(stage) in mounts():
+                raise SOURCES.SourceRejected("Host export cleanup is unconfirmed; source data retained")
+            cleaned += 1
+        return {"installation": self.installation, "project": self.project, "userId": owner,
+                "workerId": worker_id, "incarnation": incarnation, "cleaned": cleaned, "cleanupConfirmed": True}
 
     def account_sources(self, payload):
         if not isinstance(payload, dict) or set(payload) != {"userId", "workerId"} or \

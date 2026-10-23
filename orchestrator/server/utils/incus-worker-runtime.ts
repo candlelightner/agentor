@@ -1,3 +1,4 @@
+import { assertIncusHostMountRemoval } from './incus-device-layout';
 import { WorkerStartupError, workerStartupFailure } from "./worker-startup-error";
 import { sameIncusDevice as sameDevice } from './incus-device-layout';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
@@ -1868,7 +1869,7 @@ export class IncusWorkerRuntime {
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
     const name = opts.containerName;
-    const instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);
+    let instance = await this.assertOwned(name, opts.id, opts.userId, incarnation);
     if (opts.image) {
       const source = await (await this.storage()).imageIdentity(opts);
       if (!source || instance.config['volatile.base_image'] !== source.fingerprint)
@@ -1883,7 +1884,19 @@ export class IncusWorkerRuntime {
     assertIncusHardwareLayout(instance, hardware);
     const state = await this.client.getInstanceState(name);
     const hostMounts = await incusHostMountLayout(this.config, opts, 'inspect', undefined, instance);
-    assertIncusHostMountLayout(instance, hostMounts);
+    let removals: Record<string, IncusDevice> | undefined;
+    try { assertIncusHostMountLayout(instance, hostMounts); }
+    catch (error) {
+      const desired = { ...instance.devices };
+      for (const key of Object.keys(desired)) if (key.startsWith('hm')) delete desired[key];
+      Object.assign(desired, hostMounts.devices);
+      try { assertIncusHostMountRemoval(instance, desired, JSON.stringify(hostMounts.identities)); }
+      catch {
+        useLogger().warn(`[incus-worker] ${opts.id}: host mount change requires recreation; startup stopped, data retained`);
+        throw error;
+      }
+      removals = desired;
+    }
     const account = await this.accountDevices(opts);
     const managed = await this.managedDevices(opts);
     for (const [key, expected] of Object.entries(managed)) {
@@ -1901,6 +1914,15 @@ export class IncusWorkerRuntime {
       if (!sameDevice(instance.devices[role], persistent[role]!))
         throw new Error("Incus persistent layout is missing or ambiguous; explicit recovery is required");
     }
+    if (removals) {
+      recovery.assertStartAllowed?.();
+      await this.cleanupStoppedHostExports(instance);
+      recovery.assertStartAllowed?.();
+      await this.client.removeHostMounts(name, removals, JSON.stringify(hostMounts.identities), instance);
+      instance = await this.assertOwned(name, opts.id, opts.userId, instance.config['volatile.uuid']);
+      assertIncusHostMountLayout(instance, hostMounts);
+      useLogger().info(`[incus-worker] ${opts.id}: removed obsolete host exports from stopped VM; guest and source data retained`);
+    }
     if (persistent.docker && !sameDevice(instance.devices.docker, persistent.docker)) {
       if (instance.devices.docker && (instance.devices.docker.source !== persistent.docker.source || instance.devices.docker.pool !== this.config.incusStoragePool))
         throw new Error("Incus Docker device identity is ambiguous");
@@ -1912,7 +1934,11 @@ export class IncusWorkerRuntime {
       assertIncusHardwareLayout(current, await this.preflightHardware(opts, current, 'attach'));
     }
     recovery.assertStartAllowed?.();
-    if (state.status !== "Running") await this.client.startInstance(name);
+    if (state.status !== "Running") {
+      await this.cleanupStoppedHostExports(instance);
+      recovery.assertStartAllowed?.();
+      await this.client.startInstance(name);
+    }
     const deadline = Date.now() + 120_000;
     let ready = false;
     while (Date.now() < deadline) {
@@ -2076,12 +2102,25 @@ export class IncusWorkerRuntime {
       { mode: 0o600, uid: 1000, gid: 1000 });
   }
 
+  private async cleanupStoppedHostExports(instance: IncusInstance): Promise<void> {
+    if (!Object.keys(instance.devices).some(key => key.startsWith('hm'))) return;
+    const id = instance.config['user.agentor.id']!, owner = instance.config['user.agentor.owner']!;
+    try {
+      const cleaned = await new IncusHostMountClient(this.config).cleanupWorkerExports(owner, id, instance.config['volatile.uuid']!);
+      if (cleaned) useLogger().info(`[incus-worker] ${id}: recovered ${cleaned} stale host exports after confirmed VM shutdown; source data retained`);
+    } catch {
+      useLogger().warn(`[incus-worker] ${id}: host export cleanup unconfirmed; VM start/removal blocked, source data retained; inspect host policy diagnostics`);
+      throw new WorkerStartupError('host export cleanup');
+    }
+  }
+
   async remove(target: string | IncusStorageOwner, incarnation?: string): Promise<void> {
     const name = typeof target === 'string' ? target : target.containerName;
     try {
       await this.stop(target, incarnation);
-      await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
+      const stopped = await this.assertOwned(name, typeof target === 'string' ? undefined : target.id,
         typeof target === 'string' ? undefined : target.userId, incarnation);
+      await this.cleanupStoppedHostExports(stopped);
       await this.client.deleteInstance(name);
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) throw error;

@@ -252,6 +252,10 @@ function fakeClient() {
     },
     deleteCustomVolume: async (_pool: string, name: string) => { volumes.delete(name); },
     updateInstanceDevices: async (_name: string, devices: any) => { instance.devices = devices; },
+    removeHostMounts: async (_name: string, devices: any, metadata: string) => {
+      events.push({ operation: 'host-remove', args: [devices, metadata] });
+      instance.devices = devices; instance.config['user.agentor.host-mounts'] = metadata;
+    },
     createInstance: async (spec: any) => { events.push({ operation: "create", args: [spec] });
       instance = { ...spec, config: { ...spec.config, 'volatile.uuid': 'original-uuid', 'volatile.base_image': spec.source.fingerprint } };
       return instance; },
@@ -533,6 +537,8 @@ async function hostMountStartupFixture(hasMount = true) {
     (runtime as any).accountDevices = async () => ({});
   }
   const installation = await backupInstallationId(dataDir);
+  const originalCleanup = IncusHostMountClient.prototype.cleanupWorkerExports;
+  IncusHostMountClient.prototype.cleanupWorkerExports = async () => { fake.events.push({ operation: "host-cleanup", args: [] }); return 0; };
   const originalEnsure = IncusHostMountClient.prototype.ensure, originalInspect = IncusHostMountClient.prototype.inspect;
   for (const operation of ['ensure', 'inspect'] as const) {
     IncusHostMountClient.prototype[operation] = async mount => {
@@ -543,6 +549,7 @@ async function hostMountStartupFixture(hasMount = true) {
     };
   }
   return { ...fake, runtime, opts, cleanup: async () => {
+    IncusHostMountClient.prototype.cleanupWorkerExports = originalCleanup;
     IncusHostMountClient.prototype.ensure = originalEnsure;
     IncusHostMountClient.prototype.inspect = originalInspect;
     await rm(dataDir, { recursive: true, force: true });
@@ -554,6 +561,36 @@ function ownershipGuardEvent(event: { operation: string; args: any[] }): boolean
     event.args[1]?.[3] === 'prune+=( -o -path "$literal" )' &&
     event.args[1]?.[4] === '/usr/lib/agentor/agentor-private-storage.sh';
 }
+
+test('restart removes a revoked export only after confirmed cleanup, retaining the guest and other devices', async () => {
+  const f = await hostMountStartupFixture();
+  try {
+    const instance = await f.runtime.create({ ...f.opts, start: false });
+    instance.status = 'Stopped';
+    const retained = Object.fromEntries(Object.entries(instance.devices).filter(([key]) => !key.startsWith('hm')));
+    f.events.length = 0;
+    await f.runtime.start({ ...f.opts, mounts: [] });
+    expect(instance.devices).toEqual(retained);
+    expect(instance.config['user.agentor.host-mounts']).toBe('[]');
+    const cleanup = f.events.findIndex(event => event.operation === 'host-cleanup');
+    const remove = f.events.findIndex(event => event.operation === 'host-remove');
+    const start = f.events.findIndex(event => event.operation === 'start');
+    expect(cleanup).toBeGreaterThanOrEqual(0); expect(remove).toBeGreaterThan(cleanup); expect(start).toBeGreaterThan(remove);
+    expect(f.events.some(event => ['create', 'remove', 'volume-create', 'volume-update'].includes(event.operation))).toBe(false);
+  } finally { await f.cleanup(); }
+});
+
+test('busy export prevents device mutation and native boot with a safe startup phase', async () => {
+  const f = await hostMountStartupFixture();
+  try {
+    const instance = await f.runtime.create({ ...f.opts, start: false }); instance.status = 'Stopped';
+    const before = structuredClone(instance); f.events.length = 0;
+    IncusHostMountClient.prototype.cleanupWorkerExports = async () => { throw new Error('private-host-detail'); };
+    await expect(f.runtime.start({ ...f.opts, mounts: [] })).rejects.toThrow('host export cleanup');
+    expect(instance).toEqual(before);
+    expect(f.events.some(event => ['host-remove', 'start', 'file'].includes(event.operation))).toBe(false);
+  } finally { await f.cleanup(); }
+});
 
 test('old host-mount guest image is rejected before ownership repair or worker-service startup', async () => {
   const f = await hostMountStartupFixture();
