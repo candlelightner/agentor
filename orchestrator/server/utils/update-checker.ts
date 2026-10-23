@@ -18,6 +18,8 @@ const DOCKER_READ_TIMEOUT_MS = 8_000;
 const DOCKER_MUTATION_TIMEOUT_MS = 30_000;
 const DOCKER_PULL_TIMEOUT_MS = 30 * 60_000;
 
+type LocalImage = { digest: string; status: 'present' | 'missing' | 'unavailable'; reason?: NonNullable<ImageUpdateInfo['localDigestReason']> };
+
 export class UpdateChecker {
   private docker: Docker;
   private config: Config;
@@ -78,13 +80,16 @@ export class UpdateChecker {
 
     const now = new Date().toISOString();
     for (const { key, name } of images) {
-      const localDigest = await this.getLocalDigest(name);
+      const local = await this.getLocalDigest(name);
       this.status[key] = {
         name,
-        localDigest,
+        localDigest: local.digest,
         remoteDigest: '',
         updateAvailable: false,
         lastChecked: now,
+        localDigestStatus: local.status,
+        ...(local.reason ? { localDigestReason: local.reason } : {}),
+        remoteCheckStatus: (key === 'traefik' ? this.config.baseDomains.length > 0 : !!this.config.workerImagePrefix) ? 'pending' : 'disabled',
       };
     }
   }
@@ -148,25 +153,31 @@ export class UpdateChecker {
     // registry failure (now thrown by getRemoteDigest) still preserves the real
     // local digest in the status — the UI shows "check failed" rather than
     // both losing the version AND falsely showing the image as current.
-    const localDigest = await this.getLocalDigest(fullImageName);
+    const local = await this.getLocalDigest(fullImageName);
     try {
       const remoteDigest = await this.getRemoteDigest(fullImageName);
 
       return {
         name: fullImageName,
-        localDigest,
+        localDigest: local.digest,
         remoteDigest,
-        updateAvailable: !!localDigest && !!remoteDigest && localDigest !== remoteDigest,
+        updateAvailable: !!local.digest && !!remoteDigest && local.digest !== remoteDigest,
         lastChecked: now,
+        localDigestStatus: local.status,
+        ...(local.reason ? { localDigestReason: local.reason } : {}),
+        remoteCheckStatus: 'checked',
       };
     } catch (err: unknown) {
       return {
         name: fullImageName,
-        localDigest,
+        localDigest: local.digest,
         remoteDigest: '',
         updateAvailable: false,
         lastChecked: now,
         error: err instanceof Error ? err.message : String(err),
+        localDigestStatus: local.status,
+        ...(local.reason ? { localDigestReason: local.reason } : {}),
+        remoteCheckStatus: 'unavailable',
       };
     }
   }
@@ -230,7 +241,7 @@ export class UpdateChecker {
     return '';
   }
 
-  private async getLocalDigest(imageName: string): Promise<string> {
+  private async getLocalDigest(imageName: string): Promise<LocalImage> {
     try {
       const image = this.docker.getImage(imageName);
       const info = await withOperationDeadline(image.inspect(), DOCKER_READ_TIMEOUT_MS, 'Docker update image inspection');
@@ -239,7 +250,7 @@ export class UpdateChecker {
 
       // Try exact prefix match first (works for GHCR: ghcr.io/org/repo@sha256:...)
       const matching = repoDigests.find((d: string) => d.startsWith(repoName + '@'));
-      if (matching) return matching.split('@')[1] || '';
+      if (matching) return { digest: matching.split('@')[1] || '', status: 'present' };
 
       // Fallback: Docker Hub images may have fully-qualified RepoDigests
       // e.g. imageName="traefik:v3" but RepoDigest="docker.io/library/traefik@sha256:..."
@@ -248,16 +259,41 @@ export class UpdateChecker {
         ? `docker.io/${ref.repo}@`
         : `${ref.registry}/${ref.repo}@`;
       const qualifiedMatch = repoDigests.find((d: string) => d.startsWith(qualifiedPrefix));
-      if (qualifiedMatch) return qualifiedMatch.split('@')[1] || '';
+      if (qualifiedMatch) return { digest: qualifiedMatch.split('@')[1] || '', status: 'present' };
 
       // Last resort: use first digest entry
       const firstDigest = repoDigests.find((d: string) => d.includes('@'));
-      if (firstDigest) return firstDigest.split('@')[1] || '';
+      if (firstDigest) return { digest: firstDigest.split('@')[1] || '', status: 'present' };
 
       // Locally-built images have no RepoDigests — use the image ID
-      return info.Id || '';
+      if (info.Id) return { digest: info.Id, status: 'present' };
+      this.logLocalImageOutcome('present', 'version-unknown');
+      return { digest: '', status: 'present', reason: 'version-unknown' };
+    } catch (error: unknown) {
+      const statusCode = typeof error === 'object' && error !== null && 'statusCode' in error
+        ? (error as { statusCode?: unknown }).statusCode : undefined;
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code : undefined;
+      if (statusCode === 404) {
+        this.logLocalImageOutcome('missing', 'not-found');
+        return { digest: '', status: 'missing', reason: 'not-found' };
+      }
+      const reason = statusCode === 408 || statusCode === 504 || code === 'DOCKER_OPERATION_TIMEOUT' || code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT'
+        ? 'timeout'
+        : statusCode === 401 || statusCode === 403 || code === 'EACCES' || code === 'EPERM'
+          ? 'permission-denied'
+          : statusCode === undefined && code === undefined ? 'inspection-error' : 'transport-error';
+      this.logLocalImageOutcome('unavailable', reason);
+      return { digest: '', status: 'unavailable', reason };
+    }
+  }
+
+  private logLocalImageOutcome(outcome: 'missing' | 'unavailable' | 'present', reason: NonNullable<ImageUpdateInfo['localDigestReason']>): void {
+    // Keep diagnostics useful without exposing image names, Docker errors or other runtime details.
+    try {
+      useLogger().info(`[update-checker] local image inspection outcome=${outcome} reason=${reason}`);
     } catch {
-      return '';
+      try { console.warn(`[update-checker] local image inspection outcome=${outcome} reason=${reason}; logger unavailable`); } catch { /* logging must not change status */ }
     }
   }
 

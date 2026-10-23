@@ -26,6 +26,7 @@ export default defineConfig({
   testDir: ".",
   testMatch: [
     "api/orchestrator-update-network.spec.ts",
+    "ui/update-notification-isolated.spec.ts",
     "api/legacy-group-mcp-fixture.spec.ts",
     "api/docker-build-filter.spec.ts",
     "api/docker-build-cache.spec.ts",
