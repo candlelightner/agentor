@@ -1,3 +1,4 @@
+import { validateVcpuCount } from "../../shared/vcpu-count";
 import { randomUUID } from "node:crypto";
 import { validateAdminNativeState } from "./admin-native-authority";
 import { UserScopedJsonStore } from "./user-scoped-store";
@@ -14,11 +15,14 @@ export interface WorkerGroup {
   excludedInheritedEnvVarKeys?: string[];
   /** Inherited worker-self API policy for ordinary workers in this subtree. */
   workerSelfApiAccess?: WorkerSelfApiAccess;
+  /** Global-admin controlled maximum for each VM in this subtree; null inherits. */
+  maxVcpuCount?: number | null;
   adminWorkspace?: Record<string, any>;
   createdAt: string;
   updatedAt: string;
 }
 function validatedGroupId(group: WorkerGroup): string {
+  if (group.maxVcpuCount != null) validateVcpuCount(group.maxVcpuCount);
   const admin = group.adminWorkspace;
   if (admin !== undefined && (!admin || admin.schemaVersion !== 1 || admin.kind !== "group-administrative" ||
       typeof admin.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(admin.id) ||
@@ -46,6 +50,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     name: string,
     parentId?: string,
     workerSelfApiAccess?: WorkerSelfApiAccess,
+    maxVcpuCount?: number | null,
   ): Promise<WorkerGroup> {
     const stamp = new Date().toISOString();
     const group = {
@@ -54,10 +59,12 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
       name: name.trim(),
       workerIds: [],
       ...(parentId ? { parentId } : {}),
+      ...(maxVcpuCount === undefined ? {} : { maxVcpuCount }),
       ...(workerSelfApiAccess ? { workerSelfApiAccess } : {}),
       createdAt: stamp,
       updatedAt: stamp,
     };
+    validatedGroupId(group);
     await this.swap(userId, group.id, group);
     return group;
   }
@@ -66,6 +73,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
     id: string,
     patch: {
       name?: string;
+      maxVcpuCount?: number | null;
       workerIds?: string[];
       parentId?: string | null;
       excludedInheritedEnvVarKeys?: string[];
@@ -88,6 +96,7 @@ export class WorkerGroupStore extends UserScopedJsonStore<string, WorkerGroup> {
         workerIds: [...current.workerIds],
         updatedAt: new Date().toISOString(),
       };
+      if (patch.maxVcpuCount !== undefined) group.maxVcpuCount = patch.maxVcpuCount;
       if (patch.name !== undefined) group.name = patch.name.trim();
       if (patch.workerIds !== undefined)
         group.workerIds = [...new Set(patch.workerIds)];

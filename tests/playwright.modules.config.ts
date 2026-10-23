@@ -142,6 +142,8 @@ export default defineConfig({
     "api/incus-client.spec.ts",
     "api/incus-vcpu.spec.ts",
     "api/pane-lifecycle.spec.ts",
+    "api/management-cpu-domain.spec.ts",
+    "api/worker-vcpu-policy.spec.ts",
     "api/vcpu-count.spec.ts",
     "api/incus-image-import.spec.ts",
     "api/incus-image-import-live.spec.ts",

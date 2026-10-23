@@ -78,6 +78,8 @@ import {
   instanceSnapshotJobId,
 } from "./instance-snapshot-gate";
 import { effectiveWorkerSelfApiAccess } from "./worker-self-access";
+import { ManagementCpuDomain, managementCpuTools, MANAGEMENT_CPU_NAMES } from "./management-cpu-domain";
+import { assertGroupVcpuLimitChange, assertGroupVcpuReparent, validateGroupVcpuLimit } from "./worker-vcpu-policy";
 
 const GROUPS = [
   "read-only-status",
@@ -106,6 +108,7 @@ const GROUPS = [
  * current group members. Platform/global catalog, policy, group mutation and
  * import operations are intentionally absent. */
 const GROUP_ADMIN_TOOLS = new Set([
+  ...MANAGEMENT_CPU_NAMES,
   ...VOLUME_MCP_NAMES,
   "status.system",
   "workers.list",
@@ -225,6 +228,7 @@ const GROUP_ADMIN_IMAGE_TOOLS = new Set(
   [...GROUP_ADMIN_TOOLS].filter((name) => name.startsWith("images.")),
 );
 const GROUP_ADMIN_TARGET_FREE_TOOLS = new Set([
+  ...MANAGEMENT_CPU_NAMES,
   // Volume domain resolves opaque IDs and rechecks live worker-subtree scope
   // inside each queued operation, like the delegation domains below.
   ...VOLUME_MCP_NAMES,
@@ -375,6 +379,7 @@ for (const name of GROUP_ADMIN_TOOLS) {
     throw new Error(`Group administrative tool has no target policy: ${name}`);
 }
 type Group = (typeof GROUPS)[number];
+const cpuDomain = new ManagementCpuDomain();
 const workerDomain = new ManagementWorkerDomain();
 const imageBackupDomain = new ManagementImageBackupDomain();
 const migrationDomain = new ManagementWorkerMigrationDomain();
@@ -436,6 +441,7 @@ interface IdentityMetadata {
   scope: "platform" | "group";
   groupId?: string;
   ownerId?: string;
+  reauthorizeCpu?: () => void;
 }
 
 /** Bind an asynchronous storage authorizer to the exact trusted invocation
@@ -498,6 +504,7 @@ const TOOL_GROUP: Record<string, Group> = {
   "admin-workspace.startup-script.get": "groups",
   "admin-workspace.startup-script.set": "groups",
 };
+for (const tool of managementCpuTools) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of workerDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of migrationDomain.tools()) TOOL_GROUP[tool.name] = tool.group;
 for (const tool of workspaceMcpTools)
@@ -752,6 +759,7 @@ export class ManagementMcpStore {
         (name) => identity?.scope !== "group" || GROUP_ADMIN_TOOLS.has(name),
       )
       .map((name) => {
+        const cpu = managementCpuTools.find(tool => tool.name === name);
         const domain = workerDomain.tools().find((tool) => tool.name === name);
         const migration = migrationDomain.tools().find(tool => tool.name === name);
         const workspace = workspaceMcpTools.find((tool) => tool.name === name);
@@ -791,9 +799,10 @@ export class ManagementMcpStore {
                   ? `${imageBackup?.description || "Manage a backup"} only for workers in the bound group subtree and the calling administrative workspace. Owner identity is derived server-side.`
                 : identity?.scope === "group" && name.startsWith("networks.")
                   ? groupNetworkDescription(name)
-                  : identity?.scope === "group" && name.startsWith("groups.")
+                  : identity?.scope === "group" && name.startsWith("groups.") && !MANAGEMENT_CPU_NAMES.includes(name)
                     ? groupStructuralDescription(name)
                     : undefined) ||
+            cpu?.description ||
             adminStartupScriptToolDescription(name) ||
             domain?.description ||
             migration?.description ||
@@ -821,9 +830,10 @@ export class ManagementMcpStore {
                   ? groupBackupInputSchema(name)
                 : identity?.scope === "group" && name.startsWith("networks.")
                   ? groupNetworkInputSchema(name)
-                  : identity?.scope === "group" && name.startsWith("groups.")
+                  : identity?.scope === "group" && name.startsWith("groups.") && !MANAGEMENT_CPU_NAMES.includes(name)
                     ? groupStructuralInputSchema(name)
                     : undefined) ||
+            cpu?.inputSchema ||
             domain?.inputSchema ||
             migration?.inputSchema ||
             workspace?.inputSchema ||
@@ -842,6 +852,7 @@ export class ManagementMcpStore {
             volume?.inputSchema ||
             toolInputSchema(name),
           annotations:
+            cpu?.annotations ||
             domain?.annotations ||
             migration?.annotations ||
             workspace?.annotations ||
@@ -1070,7 +1081,7 @@ export class ManagementMcpStore {
         if (args.ownerId !== undefined) throw groupResourceNotFound();
         args = { ...args, ownerId: identity.ownerId };
       }
-      if (identity.scope === "group" && name.startsWith("groups.")) {
+      if (identity.scope === "group" && name.startsWith("groups.") && !MANAGEMENT_CPU_NAMES.includes(name)) {
         if (args.userId !== undefined || args.ownerId !== undefined)
           throw groupResourceNotFound();
         args = { ...args, userId: identity.ownerId };
@@ -1106,7 +1117,22 @@ export class ManagementMcpStore {
       } else if (name === "configuration.apply") {
         result = await this.applyConfigurationProposal(args);
       } else {
-        const executionIdentity = name.startsWith("volumes.size.")
+        const executionIdentity = MANAGEMENT_CPU_NAMES.includes(name)
+          ? { ...identity, reauthorizeCpu: () => {
+              const current = this.find(credential);
+              if (!current || current.expiresAt <= Date.now() || current.workspaceId !== identity.workspaceId ||
+                  current.groupId !== identity.groupId || current.ownerId !== identity.ownerId)
+                throw statusError(401, "Invalid or expired workload identity");
+              const bound = identity.scope === "group"
+                ? useGroupAdminWorkspaceStore().findByWorkspaceId(identity.workspaceId)
+                : useAdminWorkspaceStore().getRecord();
+              if (!bound || identity.scope === "group" &&
+                  ((bound as any).groupId !== identity.groupId || (bound as any).ownerId !== identity.ownerId) ||
+                  identity.scope === "platform" && (bound as any).id !== identity.workspaceId ||
+                  !this.state.policy.groups[TOOL_GROUP[name]!].enabled)
+                throw statusError(403, "CPU administration is no longer authorized");
+            } }
+          : name.startsWith("volumes.size.")
           ? createLiveManagementVolumeAuthority(
               identity,
               async () => {
@@ -1430,6 +1456,10 @@ export class ManagementMcpStore {
     // particular, missing ownerId must not trigger backup/image store
     // initialization or compatibility lookups that can take minutes.
     validateToolArguments(name, args);
+    if (MANAGEMENT_CPU_NAMES.includes(name)) {
+      if (!identity?.reauthorizeCpu) throw statusError(401, "Live administrative identity required");
+      return (await cpuDomain.execute(name, args, { ...identity, reauthorize: identity.reauthorizeCpu })).result;
+    }
     if (
       name === "admin-workspace.startup-script.get" ||
       name === "admin-workspace.startup-script.set"
@@ -1516,7 +1546,18 @@ export class ManagementMcpStore {
         name === "groups.create" ? undefined : String(args.groupId);
       const requestedParent = args.parentId;
       args.__scopeAuthorize = () => {
-        const hierarchy = new WorkerGroupHierarchy(useWorkerGroupStore());
+        const store = useWorkerGroupStore();
+        const hierarchy = new WorkerGroupHierarchy(store);
+        if (args.maxVcpuCount !== undefined) {
+          const candidateId = targetGroupId || "cpu-ceiling-candidate";
+          const groups = store.listForUser(ownerId);
+          const prospective = targetGroupId
+            ? groups.map(group => group.id === targetGroupId && requestedParent !== undefined ? { ...group, parentId: requestedParent as string } : group)
+            : [...groups, { id: candidateId, userId: ownerId, parentId: String(args.parentId || authorityGroupId), workerIds: [] } as any];
+          assertGroupVcpuLimitChange(ownerId, candidateId, args.maxVcpuCount, { globalAdmin: false, authorityGroupId }, prospective);
+        }
+        if (targetGroupId && requestedParent !== undefined)
+          assertGroupVcpuReparent(ownerId, targetGroupId, requestedParent as string | null, false, undefined, args.maxVcpuCount === undefined ? undefined : validateGroupVcpuLimit(args.maxVcpuCount));
         if (
           (targetGroupId &&
             !hierarchy.canAdminister(
@@ -2544,7 +2585,7 @@ function groupStructuralDescription(name: string): string {
     "groups.create":
       "Create a child group beneath the bound administrative group or one of its live descendants. parentId defaults to the bound group.",
     "groups.update":
-      "Rename an authorized group, change its inherited worker-self API policy, or reparent a descendant within the authorized subtree. Access-policy changes apply immediately without restarting or rebuilding workers. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
+      "Rename an authorized group, change its inherited worker-self API policy, set a descendant per-worker vCPU ceiling within its effective parent ceiling, or reparent a descendant within the authorized subtree. The bound group ceiling cannot be changed by its own administrator. Access-policy changes apply immediately without restarting or rebuilding workers. Direct membership replacement is intentionally unavailable; use groups.assign-worker. The bound administrative group itself cannot be moved.",
     "groups.delete":
       "Delete an empty descendant group. The bound administrative group itself cannot be deleted.",
     "groups.workers.stop":
@@ -2581,6 +2622,7 @@ function groupStructuralDescription(name: string): string {
 }
 function validateToolArguments(name: string, args: Record<string, unknown>) {
   const definitions = [
+    ...managementCpuTools,
     ...workerDomain.tools(),
     ...migrationDomain.tools(),
     ...workspaceMcpTools,

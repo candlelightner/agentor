@@ -8,6 +8,8 @@ const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{ containers: ContainerInfo[] }>();
 const emit = defineEmits<{ service: [workspaceId: string, service: string] }>();
 const { groups, refresh: refreshGroups, create, update, remove, assignWorker, adminAction } = useWorkerGroups();
+const { isAdmin } = useAuth();
+const vcpuDrafts = reactive<Record<string, string>>({});
 const name = ref("");
 const createParentId = ref("");
 const createWorkerSelfApiAccess = ref<import("~/types").WorkerSelfApiAccess>("inherit");
@@ -64,6 +66,15 @@ async function setWorkerSelfApiAccess(group: WorkerGroup, value: string) {
       workerSelfApiAccess: value as import("~/types").WorkerSelfApiAccess,
     }),
   );
+}
+function parentVcpuLimit(group: WorkerGroup) {
+  return groups.value.find(parent => parent.id === group.parentId)?.effectiveMaxVcpuCount ?? null;
+}
+async function saveVcpuLimit(group: WorkerGroup) {
+  const raw = vcpuDrafts[group.id] ?? String(group.maxVcpuCount ?? '');
+  const maximum = raw.trim() === '' ? null : Number(raw);
+  const saved = await run(`vcpu-${group.id}`, () => update(group.id, { maxVcpuCount: maximum }));
+  if (saved) delete vcpuDrafts[group.id];
 }
 const orderedGroups = computed(() => {
   const result: Array<{ group: WorkerGroup; depth: number }> = [];
@@ -195,6 +206,24 @@ function serviceIcon(service: string) {
         <p class="text-xs text-gray-500">
           Applies to ordinary workers in this subtree. Platform and group administrative workspaces remain reachable for management MCP.
         </p>
+        <form class="mt-3" @submit.prevent="saveVcpuLimit(entry.group)">
+          <label :for="`group-vcpu-${entry.group.id}`" class="block text-sm font-medium">Maximum vCPUs per worker</label>
+          <p class="text-xs text-gray-500">
+            Effective ceiling: {{ entry.group.effectiveMaxVcpuCount ?? 'not configured' }}.
+            Each VM has this limit independently, including group admin VMs.
+            <template v-if="entry.group.parentId">Parent ceiling: {{ parentVcpuLimit(entry.group) ?? 'not configured' }}.</template>
+          </p>
+          <div v-if="isAdmin || parentVcpuLimit(entry.group) !== null" class="mt-2 flex items-center gap-2">
+            <UInput
+              :id="`group-vcpu-${entry.group.id}`"
+              :model-value="vcpuDrafts[entry.group.id] ?? String(entry.group.maxVcpuCount ?? '')"
+              type="number" :min="1" :max="parentVcpuLimit(entry.group) ?? undefined" step="1" placeholder="Inherit"
+              @update:model-value="vcpuDrafts[entry.group.id] = String($event)"
+            />
+            <UButton type="submit" size="xs" :loading="busy === `vcpu-${entry.group.id}`">Save ceiling</UButton>
+          </div>
+          <p class="mt-1 text-xs text-gray-500">Leave blank to inherit. Group admins can resize only after a ceiling is configured; lowering it does not resize existing VMs.</p>
+        </form>
         <label
           v-for="worker in props.containers.filter(
             (c) => c.userId === entry.group.userId && !c.administrativeKind,

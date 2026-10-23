@@ -82,6 +82,7 @@ import { resolveDefaultIncusImage } from './incus-default-image';
 import { IncusWorkerRuntime, incusWorkerStatus, type IncusWorkerOptions } from "./incus-worker-runtime";
 import { IncusWorkerImageManager } from './incus-worker-image-manager';
 import { IncusRequestRejected, incusCpuDefinitionFingerprint } from './incus-client';
+import { effectiveWorkerVcpuLimit, assertWorkerVcpuLimit } from './worker-vcpu-policy';
 import { validateVcpuCount, type VcpuSettings } from '../../shared/vcpu-count';
 import { legacyMigrationMountIdentity } from './legacy-incus-migration-capture';
 import { assertOrdinaryWorkerIdentity, isAdministrativeWorkspaceId } from './ordinary-worker-identity';
@@ -1962,7 +1963,8 @@ export class ContainerManager {
       throw Object.assign(new Error('VM operation is in progress; refresh CPU settings after it settles.'), { statusCode: 409 });
     const target = this.cpuWorker(id), generation = workerLifecycleGeneration(id);
     const observed = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
-    const maximum = await this.incusRuntime.client.getCpuCapacity();
+    const capacity = await this.incusRuntime.client.getCpuCapacity();
+    const maximum = Math.min(capacity, effectiveWorkerVcpuLimit(target.info.userId, id) ?? capacity);
     const fresh = this.cpuWorker(id);
     if (fresh.incarnation !== target.incarnation || fresh.info.userId !== target.info.userId ||
         workerLifecycleGeneration(id) !== generation || isWorkerLifecycleMutationPending(id))
@@ -1976,16 +1978,24 @@ export class ContainerManager {
       ...(pending ? { pendingVcpuCount: pending.targetCount } : {}) };
   }
 
-  async setVcpuCount(id: string, value: unknown): Promise<VcpuSettings> {
+  async setVcpuCount(id: string, value: unknown, authorize?: () => void, reconcileOnly = false): Promise<VcpuSettings> {
+    authorize?.();
     const count = validateVcpuCount(value), initial = this.cpuWorker(id);
     return withOwnerWorkerLifecycleMutation(initial.info.userId, id, async () => {
       await this.assertOwnerExists(initial.info.userId);
+      authorize?.();
       const target = this.cpuWorker(id);
       if (target.info.userId !== initial.info.userId || target.incarnation !== initial.incarnation)
         throw Object.assign(new Error('VM CPU identity changed; refresh before retrying.'), { statusCode: 409 });
       await this.incusRuntime.assertWorkspaceReplacementSettled(target.owner);
       const observed = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
-      const maximum = await this.incusRuntime.client.getCpuCapacity();
+      const capacity = await this.incusRuntime.client.getCpuCapacity();
+      authorize?.();
+      const maximum = Math.min(capacity, effectiveWorkerVcpuLimit(target.info.userId, id) ?? capacity);
+      if (reconcileOnly && !target.record.incusCpuResize) {
+        useLogger().warn('[vcpu] Reconciliation has no recorded CPU operation; request stopped without submitting a resize.');
+        throw Object.assign(new Error('No pending CPU change remains to reconcile; refresh CPU settings.'), { statusCode: 409 });
+      }
       if (observed.instance.status !== 'Stopped')
         throw Object.assign(new Error('Stop the VM before changing its vCPU count. The change applies at next start.'), { statusCode: 409 });
       const fingerprint = incusCpuDefinitionFingerprint(observed.instance);
@@ -2009,6 +2019,7 @@ export class ContainerManager {
           failed = ['Failure', 'Cancelled'].includes(operation.status);
         }
         const verified = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
+        authorize?.();
         if (verified.instance.status !== 'Stopped' || incusCpuDefinitionFingerprint(verified.instance) !== fingerprint)
           throw Object.assign(new Error('VM changed during CPU reconciliation; preserve it for operator recovery.'), { statusCode: 409 });
         if (success && verified.vcpuCount === pending.targetCount) await publish(pending, pending.targetCount);
@@ -2018,9 +2029,10 @@ export class ContainerManager {
         } else throw Object.assign(new Error('CPU operation has no confirmed terminal outcome; preserve this VM and reconcile after backend recovery.'), { statusCode: 409 });
         return { vcpuCount: pending.targetCount, maxVcpuCount: maximum, status: 'stopped', pending: false };
       }
-      validateVcpuCount(count, maximum);
       if (count === observed.vcpuCount)
         return { vcpuCount: count, maxVcpuCount: maximum, status: 'stopped', pending: false };
+      validateVcpuCount(count, capacity);
+      assertWorkerVcpuLimit(target.info.userId, id, count);
       let intent: WorkerIncusCpuResize = { incarnation: target.incarnation, previousCount: observed.vcpuCount, targetCount: count, fingerprint };
       await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, undefined, intent);
       try {
@@ -2028,7 +2040,7 @@ export class ContainerManager {
           const next = { ...intent, accepted: true as const, ...(operation ? { operation } : {}) };
           await this.workerStore!.transitionIncusCpuResize(target.info.userId, id, intent, next);
           intent = next;
-        }, observed.instance);
+        }, observed.instance, () => { authorize?.(); assertWorkerVcpuLimit(target.info.userId, id, count); });
         const verified = await this.incusRuntime.inspectCpu(target.owner, target.incarnation);
         if (verified.instance.status !== 'Stopped' || verified.vcpuCount !== count ||
             incusCpuDefinitionFingerprint(verified.instance) !== fingerprint)

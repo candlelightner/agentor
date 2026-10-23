@@ -1,3 +1,4 @@
+import { effectiveGroupVcpuLimit, assertGroupVcpuLimit } from './worker-vcpu-policy';
 import { adminMemorySettings, validateAdminMemoryLimit } from '../../shared/admin-workspace-memory';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from "node:crypto";
@@ -275,6 +276,7 @@ export class GroupAdminWorkspaceStore {
     }
     let record = pending?.record ?? this.record(group.id);
     if (!record) {
+      const maximum = effectiveGroupVcpuLimit(group.userId, group.id, this.groups.list().filter(item => item.userId === group.userId));
       const stamp = new Date().toISOString();
       record = {
         schemaVersion: 1,
@@ -282,6 +284,7 @@ export class GroupAdminWorkspaceStore {
         kind: "group-administrative",
         trusted: true,
         runtimeKind: "incus-vm",
+        ...(maximum === null ? {} : { vcpuCount: Math.min(2, maximum) }),
         groupId: group.id,
         ownerId: group.userId,
         services: ["terminal", "editor", "desktop"],
@@ -463,10 +466,11 @@ export class GroupAdminWorkspaceStore {
       authorize?.();
       if (this.running.has(groupId) || this.pendingCommits.has(groupId) || !isDeepStrictEqual(record, this.record(groupId)))
         throw Object.assign(new Error('Group administrative workspace changed; refresh CPU settings'), { statusCode: 503 });
-      return result;
+      const maximum = effectiveGroupVcpuLimit(record.ownerId, groupId, this.groups.list().filter(group => group.userId === record.ownerId));
+      return { ...result, maxVcpuCount: Math.min(result.maxVcpuCount, maximum ?? result.maxVcpuCount) };
     });
   }
-  async setCpuCount(groupId: string, value: unknown, authorize?: () => void, expectedWorkspaceId?: string): Promise<VcpuSettings> {
+  async setCpuCount(groupId: string, value: unknown, authorize?: () => void, expectedWorkspaceId?: string, reconcileOnly = false): Promise<VcpuSettings> {
     const count = validateVcpuCount(value);
     return this.withNativeRuntimeTransaction(groupId, async (record, acknowledge) => {
       if (expectedWorkspaceId !== undefined && record.id !== expectedWorkspaceId)
@@ -474,7 +478,17 @@ export class GroupAdminWorkspaceStore {
       this.requireRuntime();
       if (!this.runtime!.setCpuCount) throw Object.assign(new Error('Group administrative CPU settings are unavailable'), { statusCode: 503 });
       authorize?.();
-      return this.runtime!.setCpuCount(record, count, acknowledge);
+      const pending = record.nativeRuntime?.pending?.kind === 'cpu';
+      if (reconcileOnly && !pending) {
+        useLogger().warn('[vcpu] Group reconciliation has no recorded CPU operation; request stopped without submitting a resize.');
+        throw Object.assign(new Error('No pending CPU change remains to reconcile; refresh CPU settings.'), { statusCode: 409 });
+      }
+      if (!pending && count !== (record.vcpuCount ?? 2))
+        assertGroupVcpuLimit(record.ownerId, groupId, count, false, this.groups.list().filter(group => group.userId === record.ownerId));
+      const result = await this.runtime!.setCpuCount(record, count, acknowledge, authorize);
+      authorize?.();
+      const maximum = effectiveGroupVcpuLimit(record.ownerId, groupId, this.groups.list().filter(group => group.userId === record.ownerId));
+      return { ...result, maxVcpuCount: Math.min(result.maxVcpuCount, maximum ?? result.maxVcpuCount) };
     }, authorize);
   }
   async setResources(groupId: string, value: unknown, authorize?: () => void) {

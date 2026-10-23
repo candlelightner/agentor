@@ -1,3 +1,4 @@
+import { assertGroupVcpuLimitChange, validateGroupVcpuLimit } from "./worker-vcpu-policy";
 import { useAdminWorkspaceStore } from "./admin-workspace-store";
 import { PREDEFINED_ENV_VAR_KEYS, type CreateContainerRequest, type UpdateContainerSettingsRequest } from "../../shared/types";
 import {
@@ -147,8 +148,8 @@ export class ManagementWorkerDomain {
       ["configuration.get", "configuration", "Read sanitized worker configuration.", objectWithWorker(), read],
       ["configuration.set", "configuration", "Replace worker-local variables/secrets/files; secrets are write-only.", objectWithWorker(), mutation],
       ["groups.list", "groups", "List groups for an owner or all groups, including direct total, active, and archived memberCounts. timeoutSeconds bounds the server-side request.", failFastInput({userId:{type:"string"}}), read],
-      ["groups.create", "groups", "Create a root or child worker group for an explicit owner. The inherited worker-self API policy is enforced immediately. timeoutSeconds bounds the operation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerSelfApiAccess:workerSelfApiAccessSchema()}, ["userId","name"]), mutation],
-      ["groups.update", "groups", "Rename, reparent, replace direct membership, or change the inherited worker-self API policy. Access changes apply immediately without worker restart or rebuild; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},workerSelfApiAccess:workerSelfApiAccessSchema(),lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
+      ["groups.create", "groups", "Create a root or child worker group for an explicit owner. The inherited worker-self API policy is enforced immediately. timeoutSeconds bounds the operation.", failFastInput({userId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},maxVcpuCount:{type:["integer","null"],minimum:1,description:"Per-worker vCPU ceiling; null inherits. Delegated callers may only tighten descendants within the effective parent ceiling."},workerSelfApiAccess:workerSelfApiAccessSchema()}, ["userId","name"]), mutation],
+      ["groups.update", "groups", "Rename, reparent, replace direct membership, or change the inherited worker-self API policy. Access changes apply immediately without worker restart or rebuild; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"},name:{type:"string"},parentId:{type:["string","null"]},workerIds:{type:"array",items:{type:"string"}},maxVcpuCount:{type:["integer","null"],minimum:1,description:"Per-worker vCPU ceiling; null inherits. Delegated callers may only tighten descendants within the effective parent ceiling."},workerSelfApiAccess:workerSelfApiAccessSchema(),lockPasswords:{type:"object",additionalProperties:{type:"string",writeOnly:true}}}, ["groupId"]), mutation],
       ["groups.delete", "groups", "Delete an empty group without deleting workers. Groups referenced by managed networks must be reconfigured first; timeoutSeconds bounds the operation.", failFastInput({groupId:{type:"string"}}, ["groupId"]), { ...mutation, destructiveHint:true }],
       ["groups.workers.stop", "groups", "Recursively stop every ordinary worker in a group and all descendant groups. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
       ["groups.workers.rebuild", "groups", "Recursively rebuild every ordinary worker in a group and all descendant groups, preserving durable data and group membership. Administrative workspaces are not affected; every protection lock is checked before any mutation.", groupWorkerLifecycleInput, mutation],
@@ -297,7 +298,21 @@ export class ManagementWorkerDomain {
         userId ? useWorkerStore().listForUser(userId) : useWorkerStore().list(),
       );
     }
-    if(name==="groups.create") { const userId=required(args.userId,"userId"), label=required(args.name,"name").trim(); if(!label||label.length>100) throw status(400,"Invalid group name"); const parent=args.parentId===null?null:optionalString(args.parentId),workerSelfApiAccess=parseWorkerSelfApiAccess(args.workerSelfApiAccess); return withWorkerNetworkMutation(userId,async()=>{if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();new WorkerGroupHierarchy(store).validateParent(userId,undefined,parent);const created=await store.create(userId,label,parent||undefined,workerSelfApiAccess);return workerGroupWithMemberCounts(created,useWorkerStore().listForUser(userId),store.listForUser(userId));}); }
+    if(name==="groups.create") {
+      const userId=required(args.userId,"userId"), label=required(args.name,"name").trim();
+      if(!label||label.length>100) throw status(400,"Invalid group name");
+      const parent=args.parentId===null?null:optionalString(args.parentId), workerSelfApiAccess=parseWorkerSelfApiAccess(args.workerSelfApiAccess);
+      const maximum=args.maxVcpuCount===undefined?undefined:validateGroupVcpuLimit(args.maxVcpuCount);
+      return withWorkerNetworkMutation(userId,async()=>{
+        if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();
+        new WorkerGroupHierarchy(store).validateParent(userId,undefined,parent);
+        if(maximum!==undefined) assertGroupVcpuLimitChange(userId,"cpu-ceiling-candidate",maximum,{globalAdmin:true},[
+          ...store.listForUser(userId), {id:"cpu-ceiling-candidate",userId,parentId:parent||undefined,workerIds:[]} as any,
+        ]);
+        const created=await store.create(userId,label,parent||undefined,workerSelfApiAccess,maximum);
+        return workerGroupWithMemberCounts(created,useWorkerStore().listForUser(userId),store.listForUser(userId));
+      });
+    }
     if(name==="groups.assign-worker") {
       const workerId=required(args.workerId,"workerId");
       const worker=useContainerManager().get(workerId)??useWorkerStore().findById(workerId);
@@ -351,11 +366,19 @@ export class ManagementWorkerDomain {
       if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId,authorize), deadline);
     }
     if(name==="groups.delete") { const workspaceStatus=group.adminWorkspace?.status;await deleteWorkerGroup(group.userId,group.id,async()=>{const workspaces=useGroupAdminWorkspaceStore();try{await workspaces.remove(group.id,true);}catch(error){await workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true).catch(()=>undefined);throw error;}return async()=>workspaces.restoreAfterFailedGroupDelete(group.id,workspaceStatus,true);},typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined); return {id:group.id,deleted:true}; }
-    const patch:{name?:string;workerIds?:string[];parentId?:string|null;workerSelfApiAccess?:import("../../shared/types").WorkerSelfApiAccess}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
+    const patch:{name?:string;workerIds?:string[];parentId?:string|null;maxVcpuCount?:number|null;workerSelfApiAccess?:import("../../shared/types").WorkerSelfApiAccess}={}; if(args.name!==undefined){const label=required(args.name,"name").trim();if(!label||label.length>100)throw status(400,"Invalid group name");patch.name=label;}
+    if(args.maxVcpuCount!==undefined)patch.maxVcpuCount=validateGroupVcpuLimit(args.maxVcpuCount);
     if(args.parentId!==undefined)patch.parentId=args.parentId===null?null:required(args.parentId,"parentId");
     if(args.workerIds!==undefined){const ids=strings(args.workerIds,"workerIds");for(const id of ids){const worker=useWorkerStore().findById(id);if(!worker||worker.userId!==group.userId)throw status(400,"All workers must belong to group owner");}patch.workerIds=ids;}
     if(args.workerSelfApiAccess!==undefined)patch.workerSelfApiAccess=parseWorkerSelfApiAccess(args.workerSelfApiAccess);
-    const updated=await updateWorkerGroupWithNetworks(group.userId,group.id,patch,args.lockPasswords,typeof args.__scopeAuthorize==="function"?args.__scopeAuthorize as ()=>void:undefined);
+    const updated=await updateWorkerGroupWithNetworks(group.userId,group.id,patch,args.lockPasswords,()=>{
+      if(typeof args.__scopeAuthorize==="function")(args.__scopeAuthorize as ()=>void)();
+      if(patch.maxVcpuCount!==undefined) {
+        const prospective=store.listForUser(group.userId).map(item=>item.id===group.id && patch.parentId!==undefined
+          ? {...item,parentId:patch.parentId??undefined}:item);
+        assertGroupVcpuLimitChange(group.userId,group.id,patch.maxVcpuCount,{globalAdmin:true},prospective);
+      }
+    });
     return workerGroupWithMemberCounts(updated,useWorkerStore().listForUser(group.userId),store.listForUser(group.userId));
   }
 }

@@ -1,3 +1,4 @@
+import { assertVcpuPolicyLimit, effectiveGroupVcpuLimit, assertWorkerVcpuMembershipChange } from './worker-vcpu-policy';
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createError } from "h3";
 import { useManagedNetworkManager } from "./managed-network-manager";
@@ -18,7 +19,7 @@ import { operationSettlement, type OperationFailureWithSettlement } from './oper
 
 type WorkerGroupPatch = Pick<
   Partial<WorkerGroup>,
-  "name" | "workerIds" | "workerSelfApiAccess"
+  "name" | "workerIds" | "workerSelfApiAccess" | "maxVcpuCount"
 > & {
   parentId?: string | null;
 };
@@ -64,6 +65,7 @@ export interface WorkerGroupNetworkDependencies {
   manager: NetworkManagerLike;
   verify(workerIds: Iterable<string>, passwords: unknown): Promise<void>;
   workerExists(userId: string, workerId: string): boolean;
+  validateVcpuAssignments?(userId: string, groups: WorkerGroup[]): Promise<void>;
 }
 
 /** One owner-scoped queue spans group mutations and managed-network reference
@@ -131,7 +133,7 @@ export class WorkerGroupNetworkCoordinator {
   ) {
     return this.withOwner(userId, () => {
       authorize?.();
-      return this.updateLocked(userId, groupId, () => patch, lockPasswords);
+      return this.updateLocked(userId, groupId, () => patch, lockPasswords, authorize);
     });
   }
 
@@ -152,6 +154,7 @@ export class WorkerGroupNetworkCoordinator {
           workerIds: [...new Set([...current.workerIds, workerId])],
         }),
         lockPasswords,
+        authorize,
       );
     });
   }
@@ -199,6 +202,11 @@ export class WorkerGroupNetworkCoordinator {
       );
       const coverage = await this.authorizeNetworks(userId, networkIds,
         [workerId, ...[...previousTopology.values()].flat()], lockPasswords);
+      const prospective = groups.listForUser(userId).map(group => ({ ...group,
+        workerIds: [...group.workerIds.filter(id => id !== workerId), ...(group.id === targetGroupId ? [workerId] : [])] }));
+      assertWorkerVcpuMembershipChange(userId, groups.listForUser(userId), prospective);
+      await this.dependencies.validateVcpuAssignments?.(userId, prospective);
+      authorize?.(source?.id, target?.id);
       await groups.assignWorker(userId, workerId, source?.id, targetGroupId);
 
       const failures = await this.reconcileAll(userId, networkIds, undefined, coverage);
@@ -224,6 +232,7 @@ export class WorkerGroupNetworkCoordinator {
     groupId: string,
     resolvePatch: (current: WorkerGroup) => WorkerGroupPatch,
     lockPasswords?: unknown,
+    authorize?: () => void,
   ) {
     const { groups } = this.dependencies;
     const existing = groups.get(userId, groupId);
@@ -243,6 +252,7 @@ export class WorkerGroupNetworkCoordinator {
       workerIds: [...existing.workerIds],
       parentId: existing.parentId ?? null,
       workerSelfApiAccess: existing.workerSelfApiAccess ?? "inherit",
+      maxVcpuCount: existing.maxVcpuCount ?? null,
     };
     const affectedGroups = new Set<string>();
     if (patch.workerIds !== undefined || patch.parentId !== undefined)
@@ -258,6 +268,18 @@ export class WorkerGroupNetworkCoordinator {
       [...[...previousTopology.values()].flat(), ...hierarchy.subtreeWorkerIds(userId, groupId), ...(patch.workerIds ?? [])],
       lockPasswords) : undefined;
 
+    const membershipChanged = patch.workerIds !== undefined &&
+      (patch.workerIds.length !== existing.workerIds.length || patch.workerIds.some(id => !existing.workerIds.includes(id)));
+    const parentChanged = patch.parentId !== undefined && (patch.parentId || undefined) !== existing.parentId;
+    if (parentChanged || membershipChanged) {
+      const prospective = groups.listForUser(userId).map(group => group.id === groupId
+        ? { ...group, workerIds: patch.workerIds ?? group.workerIds,
+          maxVcpuCount: patch.maxVcpuCount === undefined ? group.maxVcpuCount : patch.maxVcpuCount,
+          parentId: patch.parentId === null ? undefined : patch.parentId ?? group.parentId } : group);
+      if (membershipChanged) assertWorkerVcpuMembershipChange(userId, groups.listForUser(userId), prospective);
+      await this.dependencies.validateVcpuAssignments?.(userId, prospective);
+    }
+    authorize?.();
     const updated = await groups.update(userId, groupId, patch);
     if (!networkIds.length) return updated;
 
@@ -495,6 +517,30 @@ function productionDependencies(): WorkerGroupNetworkDependencies {
     networks: useManagedNetworkStore(),
     manager: useManagedNetworkManager(),
     verify: verifyWorkerMutationUnlocks,
+    validateVcpuAssignments: async (userId, groups) => {
+      const { DEFAULT_ENVIRONMENT_ID } = await import('./environments');
+      const { useContainerManager, useEnvironmentStore, useConfig } = await import('./services');
+      const manager = useContainerManager();
+      for (const group of groups) {
+        const maximum = effectiveGroupVcpuLimit(userId, group.id, groups);
+        if (maximum === null) continue;
+        const previous = useWorkerGroupStore().get(userId, group.id);
+        const previousMaximum = previous ? effectiveGroupVcpuLimit(userId, group.id) : null;
+        const tighter = previousMaximum === null || maximum < previousMaximum;
+        if (tighter && group.adminWorkspace) assertVcpuPolicyLimit(group.adminWorkspace.vcpuCount ?? 2, maximum);
+        for (const id of group.workerIds) {
+          if (!tighter && previous?.workerIds.includes(id)) continue;
+          const worker = useWorkerStore().get(userId, id);
+          if (!worker) continue;
+          const info = manager.get(id);
+          const count = info?.runtimeKind === 'incus-vm' && worker.status === 'active'
+            ? (await manager.getVcpuSettings(id)).vcpuCount
+            : worker.vcpuCount ?? Math.max(1, Math.ceil(useEnvironmentStore().getById(worker.environmentId || DEFAULT_ENVIRONMENT_ID)?.cpuLimit ?? useConfig().defaultCpuLimit ?? 1));
+          assertVcpuPolicyLimit(count, maximum);
+          if (worker.incusCpuResize) assertVcpuPolicyLimit(worker.incusCpuResize.targetCount, maximum);
+        }
+      }
+    },
     workerExists: (userId, workerId) =>
       Boolean(useWorkerStore().get(userId, workerId)),
   };

@@ -1,3 +1,4 @@
+import { effectiveGroupVcpuLimit } from "./worker-vcpu-policy";
 import type { WorkerGroup } from "./worker-group-store";
 import type { WorkerRecord } from "./worker-store";
 import { effectiveGroupWorkerSelfApiAccess } from "./worker-self-access";
@@ -13,6 +14,7 @@ export interface WorkerGroupMemberCounts {
 
 export type WorkerGroupResponse = WorkerGroup & {
   memberCounts: WorkerGroupMemberCounts;
+  effectiveMaxVcpuCount: number | null;
   effectiveWorkerSelfApiAccess: import("../../shared/types").EffectiveWorkerSelfApiAccess;
 };
 
@@ -36,6 +38,7 @@ export function workerGroupsWithMemberCounts(
     return {
       ...group,
       ...(group.adminWorkspace ? { adminWorkspace } : {}),
+      effectiveMaxVcpuCount: effectiveGroupVcpuLimit(group.userId, group.id, groups),
       memberCounts: {
         total: group.workerIds.length,
         active,
