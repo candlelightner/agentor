@@ -58,6 +58,13 @@ import { IncusError } from "../utils/incus-client";
 
 export default defineNitroPlugin(async (nitroApp) => {
   await useInstanceBackupManager().assertStartupSafe();
+  // Shutdown must remain available if ordinary runtime initialization stalls.
+  // This narrow binding cannot provision or start before the startup gates.
+  const adminRuntime = useAdministrativeWorkspaceRuntime();
+  const adminWorkspace = useAdminWorkspaceStore();
+  const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
+  adminWorkspace.setEmergencyRuntimeAdapter(adminRuntime);
+  groupAdminWorkspaces.setEmergencyRuntimeAdapter(adminRuntime);
   const instanceRecoveryMode =
     process.env.AGENTOR_INSTANCE_RECOVERY_MODE === "true";
   // Initialize logging infrastructure first
@@ -337,12 +344,9 @@ export default defineNitroPlugin(async (nitroApp) => {
   // The MCP listener binds only to the orchestrator's address on the internal
   // management network and still authenticates + authorizes every JSON-RPC
   // call through ManagementMcpStore.
-  const adminRuntime = useAdministrativeWorkspaceRuntime();
   const managementMcp = new ManagementMcpTransport(useManagementMcpStore());
   adminRuntime.setManagementListener((host) => managementMcp.start(host));
-  const adminWorkspace = useAdminWorkspaceStore();
   adminWorkspace.setRuntimeAdapter(adminRuntime);
-  const groupAdminWorkspaces = useGroupAdminWorkspaceStore();
   groupAdminWorkspaces.setRuntimeAdapter(adminRuntime);
   const materializeAdminIdentity = async (
     record: AdministrativeWorkspaceRecord,

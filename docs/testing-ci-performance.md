@@ -282,3 +282,28 @@ for that missing case. Cache eviction, unavailable release seeds, or changed bas
 source, platform, and dependency inputs can cause misses and reduce the gain.
 Configured cache API timeouts do not cap an entire export stage. Keep subsequent
 cold/miss runs separate from these cache-hit samples when evaluating regressions.
+
+## Ubuntu 26 runner notice check — 22 October 2026
+
+The [latest main run](https://github.com/candlelightner/agentor/actions/runs/39852687750)
+after the announced rollout date succeeded, but its `ubuntu-latest` jobs still
+reported Ubuntu 24.04.5 LTS, image release `ubuntu24/20261012.334.1`, and runner
+2.338.0. The [PR run](https://github.com/candlelightner/agentor/actions/runs/39851715209)
+also resolved `ubuntu-latest` to Ubuntu 24.04.5. No Ubuntu 26 run is available to
+establish post-migration compatibility, so this check does not close issue #24.
+
+On the main run, locked npm dependency installation (including `better-sqlite3`),
+`apt-get` installation of `qemu-utils`, Playwright Chromium with system
+dependencies, typecheck, no-server module/helper tests, and the isolated Docker
+regression suite all passed. Root-owned archive
+metadata fixtures passed 61 tests; the isolated regression passed 35. The
+orchestrator built successfully for amd64 on `ubuntu-latest` and arm64 on the
+explicit `ubuntu-24.04-arm` runner, and its manifest merge succeeded. Worker
+publication was skipped because worker inputs had not changed. The last run that
+built and merged both worker and orchestrator images for amd64 and arm64 is
+[main run 39298193747](https://github.com/candlelightner/agentor/actions/runs/39298193747);
+it also used the pre-migration runner image and is not Ubuntu 26 evidence.
+
+Keep the runner labels unchanged until a real Ubuntu 26 run demonstrates a
+compatibility failure. Recheck the runner OS/version and require a full worker
+and orchestrator publication matrix after the label changes before closing #24.

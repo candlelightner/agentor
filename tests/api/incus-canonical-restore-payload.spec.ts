@@ -12,8 +12,8 @@ test('isolated canonical account parents initialize only absent directories and 
   try {
     await mkdir(join(dir, 'restore/.agent-data'), { recursive: true });
     await mkdir(join(dir, 'restore/workspace'));
-    // Real local filesystem operations; only systemd/mount observation is
-    // substituted for deterministic execution outside an actual guest.
+    // Real local filesystem operations; only guest marker and systemd/mount
+    // observations are substituted for deterministic execution on a worker.
     const script = INCUS_CANONICAL_RESTORE_SCRIPT.replaceAll('/restore', join(dir, 'restore'));
     execFileSync('sudo', ['python3', '-c', String.raw`
 import os,sys,stat,types,io,base64
@@ -22,13 +22,15 @@ source=base64.b64decode(sys.argv[1]).decode();base=sys.argv[2];root=base+'/.agen
 assert os.path.isdir(root) and os.path.isdir(base+'/workspace')
 os.mkdir(root+'/.codex');os.chown(root+'/.codex',12345,23456);os.chmod(root+'/.codex',0o751)
 os.utime(root+'/.codex',ns=(1700000000123456789,1700000000987654321));os.setxattr(root+'/.codex','user.keep',b'unchanged')
-before=os.stat(root+'/.codex');original_open=open
+before=os.stat(root+'/.codex');original_open=open;original_lexists=os.path.lexists
 mounts=''.join('1 0 0:1 / '+p+' rw - virtiofs fixture rw\n' for p in (root,base+'/workspace'))
 def observed_open(path,*args,**kwargs):
  return io.BytesIO(mounts.encode()) if path=='/proc/self/mountinfo' else original_open(path,*args,**kwargs)
+def observed_lexists(path):
+ return False if path in ('/run/agentor/provisioned','/run/agentor/worker.env') else original_lexists(path)
 def run():
  sys.argv=['script','agents','account-parents']
- with patch('builtins.open',observed_open),patch('subprocess.run',return_value=types.SimpleNamespace(returncode=3)):
+ with patch('builtins.open',observed_open),patch('os.path.lexists',observed_lexists),patch('subprocess.run',return_value=types.SimpleNamespace(returncode=3)):
   try: exec(compile(source,'canonical-account-parents','exec'),{})
   except SystemExit as e: assert e.code==0
 run()

@@ -115,6 +115,8 @@ export interface AdminWorkspaceRuntimeAdapter {
   ): Promise<void>;
 }
 
+export type AdminWorkspaceEmergencyRuntime = Pick<AdminWorkspaceRuntimeAdapter, "stop"> & Required<Pick<AdminWorkspaceRuntimeAdapter, "observeStatus">>;
+
 const ADMIN_IMAGE =
   process.env.AGENTOR_ADMIN_WORKER_IMAGE || "agentor-admin-worker:latest";
 const ADMIN_DIGEST = process.env.AGENTOR_ADMIN_WORKER_DIGEST?.match(
@@ -129,6 +131,7 @@ export class AdminWorkspaceStore {
   private loading?: Promise<void>;
   private unavailable = false;
   private runtime?: AdminWorkspaceRuntimeAdapter;
+  private emergencyRuntime?: AdminWorkspaceEmergencyRuntime;
   private identityMaterializer?: AdminWorkspaceIdentityMaterializer;
   private operationTail: Promise<void> = Promise.resolve();
   private pendingOperations = 0;
@@ -146,6 +149,9 @@ export class AdminWorkspaceStore {
   }
   setRuntimeAdapter(runtime: AdminWorkspaceRuntimeAdapter) {
     this.runtime = runtime;
+  }
+  setEmergencyRuntimeAdapter(runtime: AdminWorkspaceEmergencyRuntime) {
+    this.emergencyRuntime = runtime;
   }
   setIdentityMaterializer(
     materializer: AdminWorkspaceIdentityMaterializer,
@@ -292,7 +298,9 @@ export class AdminWorkspaceStore {
       new Error('Administrative workspace operation is in progress or awaiting settlement. Refresh status before retrying.'), { statusCode: 503 });
     const record = this.readSettledRecord();
     if (!record) return null;
-    const status = await this.runtime?.observeStatus?.(record) ?? record.status;
+    const runtime = this.runtime ?? this.emergencyRuntime;
+    if (!runtime) this.requireRuntime();
+    const status = await runtime?.observeStatus?.(record) ?? record.status;
     if (this.pendingOperations || !isDeepStrictEqual(record, this.readSettledRecord()))
       throw Object.assign(new Error('Administrative workspace changed during status inspection; refresh status'), { statusCode: 503 });
     return { ...this.publicRecord(record), status };
@@ -357,8 +365,10 @@ export class AdminWorkspaceStore {
     return this.publicRecord(candidate);
   }
   async setStatus(status: "running" | "stopped", force = false, expectedId?: string) {
-    return this.exclusive(async () => {
-      this.requireRuntime();
+    const emergency = force && status === "stopped";
+    const result = this.exclusive(async () => {
+      const runtime = this.runtime ?? (emergency ? this.emergencyRuntime : undefined);
+      if (!runtime) this.requireRuntime();
       await this.init();
       if (expectedId && this.record?.id !== expectedId)
         throw Object.assign(new Error("Administrative workspace identity changed"), { statusCode: 409 });
@@ -370,7 +380,7 @@ export class AdminWorkspaceStore {
         throw Object.assign(new Error("Administrative workspace is not provisioned"), { statusCode: 404 });
       if (!this.record) await this.ensureLocked();
       const candidate = structuredClone(this.record!);
-      if (this.runtime) {
+      if (runtime) {
         if (status === "running") {
           if (this.identityMaterializer)
             await this.identityMaterializer(
@@ -379,20 +389,21 @@ export class AdminWorkspaceStore {
             );
           this.applyRuntimeImage(
             candidate,
-            await this.runtime.start(structuredClone(candidate), this.nativeAcknowledge(candidate)),
+            await (runtime as AdminWorkspaceRuntimeAdapter).start(structuredClone(candidate), this.nativeAcknowledge(candidate)),
           );
           await this.identityMaterializer?.(
             structuredClone(candidate),
             "refresh-running",
           );
-        } else await this.runtime.stop(structuredClone(candidate), this.nativeAcknowledge(candidate), force);
+        } else await runtime.stop(structuredClone(candidate), this.nativeAcknowledge(candidate), force);
       }
       candidate.status = status;
       candidate.updatedAt = new Date().toISOString();
-      if (this.runtime) await this.commitExternal(operation, candidate);
+      if (runtime) await this.commitExternal(operation, candidate);
       else await this.commit(candidate);
       return this.publicRecord(candidate);
     });
+    return emergency ? withOperationDeadline(result, 15_000, "Administrative emergency stop") : result;
   }
   async rebuild(ownerId?: string) {
     return this.exclusive(async () => {
@@ -459,7 +470,9 @@ export class AdminWorkspaceStore {
     return { marker: this.record!.marker ?? null };
   }
   async getResources() {
-    await this.getStatus();
+    await this.init();
+    if (this.pendingOperations) throw Object.assign(
+      new Error('Administrative workspace operation is in progress or awaiting settlement. Refresh status before retrying.'), { statusCode: 503 });
     const record = this.readSettledRecord();
     if (!record) throw Object.assign(new Error('Administrative workspace not provisioned'), { statusCode: 404 });
     return adminMemorySettings(record);

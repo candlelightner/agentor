@@ -17,6 +17,8 @@ defineRouteMeta({
       404: { description: 'Worker not found' },
       409: { description: 'Worker lifecycle or recovery operation pending' },
       423: { description: 'Protection-lock password required' },
+      503: { description: 'Runtime unavailable or stopped state cannot be confirmed; refresh status' },
+      504: { description: 'Stop deadline exceeded; lifecycle remains fenced until runtime settlement' },
     },
   },
 });

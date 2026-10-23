@@ -3,6 +3,11 @@ import { mkdir, writeFile, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
+import { createRequire } from 'node:module';
+import { once } from 'node:events';
+import { WebSocket, WebSocketServer } from 'ws';
+import { requireContainerAccess } from '../../orchestrator/server/utils/auth-helpers';
+import * as wsUtils from '../../orchestrator/server/utils/ws-utils';
 import { useConfig, useContainerManager, useDockerService, useAdministrativeWorkspaceRuntime, useWorkerGroupStore } from '../../orchestrator/server/utils/services';
 import { useGroupAdminWorkspaceStore } from '../../orchestrator/server/utils/group-admin-workspace-store';
 import { useAdminWorkspaceStore } from '../../orchestrator/server/utils/admin-workspace-store';
@@ -282,4 +287,88 @@ test('captured native authority keeps primitive owner and role when a registry e
     await expect(commands.execCapture(f.info.containerId,['fixture'])).rejects.toThrow('authority changed');
     expect(f.probes()).toBe(0); expect(f.calls).toEqual([]);
   } finally { await f.cleanup(); }
+});
+
+
+for (const kind of ['platform', 'group'] as const) test(`${kind} emergency stop and recovery restore authenticated panes and WebSocket terminal output`, async () => {
+  const f = await fixture(kind), store = kind === 'platform' ? useAdminWorkspaceStore() : useGroupAdminWorkspaceStore();
+  const savedStore = { runtime: (store as any).runtime, emergencyRuntime: (store as any).emergencyRuntime,
+    identityMaterializer: (store as any).identityMaterializer };
+  const original = { execStream: f.native.client.execStream, execInteractive: f.native.client.execInteractive };
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await once(server, 'listening');
+  const port = (server.address() as any).port;
+  let nativeSocket: WebSocket | undefined, terminalHandler: any, browser: WebSocket | undefined;
+  const peers: any[] = [];
+  const auth = { user: { id: kind === 'platform' ? 'operator' : owner, role: kind === 'platform' ? 'admin' : 'user' }, session: {} };
+  const require = createRequire(new URL('../../orchestrator/package.json', import.meta.url)), ts = require('typescript');
+  const compile = async (path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}) => {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+    const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const exports: any = {};
+    new Function('require', 'exports', ...Object.keys(globals), compiled)((name: string) => {
+      if (!(name in dependencies)) throw Error('Unexpected dependency: ' + name);
+      return dependencies[name];
+    }, exports, ...Object.values(globals));
+    return exports;
+  };
+  try {
+    const runtime = { ensure: async () => { throw Error('Emergency stop must not provision'); },
+      start: async () => { f.info.status = 'running'; }, stop: async (_record: unknown, _ack: unknown, force?: boolean) => {
+        expect(force).toBe(true); f.info.status = 'stopped';
+      }, rebuild: async () => {}, observeStatus: async () => f.info.status as 'running' | 'stopped' };
+    Object.assign(store, { runtime: undefined, identityMaterializer: undefined });
+    store.setEmergencyRuntimeAdapter(runtime);
+    if (kind === 'platform') await useAdminWorkspaceStore().setStatus('stopped', true, f.record.id);
+    else await useGroupAdminWorkspaceStore().setStatus((f.record as any).groupId, 'stopped', undefined, true, f.record.id);
+    const panes = await compile('../../orchestrator/server/api/containers/[id]/panes/index.get.ts', {
+      '../../../../utils/services': { useContainerManager: () => f.cm }, '../../../../utils/auth-helpers': { requireContainerAccess },
+    }, { defineRouteMeta() {}, defineEventHandler: (handler: unknown) => handler, getRouterParam: () => f.record.id });
+    await expect(panes.default({ context: { auth } })).rejects.toThrow();
+    store.setRuntimeAdapter(runtime);
+    if (kind === 'platform') await useAdminWorkspaceStore().setStatus('running');
+    else await useGroupAdminWorkspaceStore().setStatus((f.record as any).groupId, 'running');
+    f.native.client.execStream = async (...args: any[]) => {
+      const session = await (original.execStream as any)(...args);
+      // The fixture transport emits the same tmux format consumed by the real native command parser.
+      const stdout = new PassThrough(); stdout.end('0:recovered-shell:1\n');
+      return { ...session, stdout };
+    };
+    await expect(panes.default({ context: {} })).rejects.toMatchObject({ statusCode: 401 });
+    await expect(panes.default({ context: { auth: { ...auth, user: { id: 'foreign', role: 'user' } } } })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(panes.default({ context: { auth } })).resolves.toEqual([{ index: 0, name: 'recovered-shell', active: true }]);
+    terminalHandler = (await compile('../../orchestrator/server/utils/terminal-handler.ts', {
+      './services': { useContainerManager: () => f.cm }, './ws-utils': wsUtils,
+      './auth-helpers': { authenticateWsPeer: async (peer: any) => peer.request.headers.get('cookie') === 'fixture-session=valid' ? auth : null },
+    }, { useLogger: () => ({ error() {} }) })).terminalWsHandler;
+    server.on('connection', (socket, request) => {
+      if (request.url === '/native') { nativeSocket = socket; return; }
+      const peer = { id: randomUUID(), request: { url: request.url, headers: new Headers({ cookie: request.headers.cookie ?? '' }) },
+        send: (bytes: any) => socket.send(bytes), close: () => socket.close() };
+      peers.push(peer); terminalHandler.open(peer);
+      socket.on('close', () => terminalHandler.close(peer));
+    });
+    f.native.client.execInteractive = async (_name: string, _command: string[], _options: any, onSocket: any) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/native`);
+      await once(socket, 'open'); onSocket(socket);
+      return { close: () => socket.close(), resize() {} } as any;
+    };
+    const unauthorized = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal/${f.record.id}/0`);
+    const denied = once(unauthorized, 'message');
+    expect(String((await denied)[0])).toContain('Unauthorized'); unauthorized.close();
+    browser = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal/${f.record.id}/0`, { headers: { cookie: 'fixture-session=valid' } });
+    const received = once(browser, 'message');
+    await expect.poll(() => Boolean(nativeSocket)).toBe(true);
+    // Allow authenticated handler attachment to finish before emitting guest output.
+    await new Promise(resolve => setImmediate(resolve));
+    nativeSocket!.send('recovered-terminal-output');
+    expect(String((await received)[0])).toContain('recovered-terminal-output');
+  } finally {
+    for (const peer of peers) terminalHandler?.close(peer);
+    browser?.terminate(); for (const socket of server.clients) socket.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    Object.assign(f.native.client, original); Object.assign(store, savedStore);
+    if (kind === 'platform') await useAdminWorkspaceStore().setStatus('running');
+    await f.cleanup();
+  }
 });

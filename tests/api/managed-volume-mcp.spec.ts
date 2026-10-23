@@ -1,5 +1,5 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
-import { createWorker, cleanupWorker } from '../helpers/worker-lifecycle';
+import { createWorker, cleanupWorker, waitForWorkerRunning } from '../helpers/worker-lifecycle';
 import { createTestUser, deleteTestUser } from '../helpers/test-users';
 import { ApiClient } from '../helpers/api-client';
 import { legacyGroupMcpPrincipal } from '../helpers/legacy-group-mcp-fixture';
@@ -21,6 +21,8 @@ test('legacy diagnostic group-principal volume MCP confines inventory and mutati
     // not new admin compute. Fresh admin provisioning remains native-only.
     principal = await legacyGroupMcpPrincipal(ownerRequest, owner.id, groupId);
     await principal.insert();
+    // Group metadata may load before restarted ordinary-worker inventory.
+    for (const worker of workers) await waitForWorkerRunning(ownerRequest, worker);
     const workspaceId = principal.workspaceId;
     const policy = await (await request.get('/api/admin/management-mcp/policy')).json();
     previous = policy.groups['storage-maintenance'].enabled;
