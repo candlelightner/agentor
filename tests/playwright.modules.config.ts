@@ -160,6 +160,8 @@ export default defineConfig({
     "api/incus-worker-experience.spec.ts",
     "api/incus-derived-image.spec.ts",
     "api/incus-worker-runtime.spec.ts",
+    "api/incus-docker-storage-startup.spec.ts",
+    "api/worker-start-feedback.spec.ts",
     "api/incus-canonical-archive.spec.ts",
     "api/incus-offline-archive-helper.spec.ts",
     "api/incus-original-workspace-live.spec.ts",

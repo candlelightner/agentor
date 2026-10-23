@@ -25,6 +25,7 @@ import { incusImageIdentity, sameIncusImageSource, validateIncusImageIdentity } 
 import { IncusWorkerStorage } from '../../orchestrator/server/utils/incus-worker-storage';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import { ManagedVolumeStore } from '../../orchestrator/server/utils/managed-volume-store';
+import { workerStartupFailure } from '../../orchestrator/server/utils/worker-startup-error';
 import { IncusManagedVolumeRuntime } from '../../orchestrator/server/utils/incus-managed-volume-runtime';
 import { HostMountStore } from '../../orchestrator/server/utils/host-mount-store';
 import { WorkerGroupStore } from '../../orchestrator/server/utils/worker-group-store';
@@ -1282,6 +1283,22 @@ test("Docker initialization authority is revoked before the worker can start", a
   const workerStart = events.findIndex((event) => event.operation === "exec" && event.args[1].join(" ") === "systemctl start agentor-worker.service");
   expect(revoked).toBeGreaterThan(events.indexOf(disk));
   expect(revoked).toBeLessThan(workerStart);
+});
+
+test('storage exec timeout retains its public phase without exposing transport details or starting the worker', async () => {
+  const { client, events } = fakeClient();
+  const original = client.exec;
+  client.exec = async (...args: any[]) => {
+    if (args[1].join(' ') === 'systemctl start agentor-docker-storage')
+      throw Object.assign(new Error('private-transport-detail-and-secret'), { statusCode: 408 });
+    return original(...args);
+  };
+  const opts = options(); opts.dockerEnabled = opts.environmentJson.dockerEnabled = true;
+  const error = await new IncusWorkerRuntime(config, client as any).create(opts).catch(error => error);
+  expect(workerStartupFailure(error)).toMatchObject({ code: 'WORKER_BOOTSTRAP_FAILED', phase: 'Docker storage preparation' });
+  expect(JSON.stringify(workerStartupFailure(error))).not.toContain('private-transport');
+  expect(events.some(event => event.operation === 'exec' && event.args[1].join(' ') === 'systemctl start agentor-worker.service')).toBe(false);
+  expect(events.some(event => event.operation === 'stop')).toBe(true);
 });
 
 test("shell configuration preserves literal quotes/newlines without executing substitutions", () => {
