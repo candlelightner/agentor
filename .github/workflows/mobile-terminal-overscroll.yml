@@ -1,0 +1,53 @@
+name: Firefox terminal overscroll boundary
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'orchestrator/app/assets/css/main.css'
+      - 'orchestrator/app/components/PaneContent.vue'
+      - 'orchestrator/app/composables/useTerminal.ts'
+      - 'tests/ui/terminal-copy-isolated.spec.ts'
+      - '.github/workflows/mobile-terminal-overscroll.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  terminal-overscroll:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            orchestrator/package-lock.json
+            tests/package-lock.json
+
+      - name: Install orchestrator dependencies
+        working-directory: orchestrator
+        run: npm ci --no-audit --no-fund
+
+      - name: Install test dependencies
+        working-directory: tests
+        run: npm ci --no-audit --no-fund
+
+      - name: Install locked Firefox and system dependencies
+        working-directory: tests
+        run: npx --no-install playwright install --with-deps firefox
+
+      - name: Verify terminal scroll boundary in Firefox
+        working-directory: tests
+        run: >-
+          npx --no-install playwright test
+          --config=playwright.modules.config.ts
+          ui/terminal-copy-isolated.spec.ts
+          --grep="document overscroll containment follows the active available terminal pane"
+          --browser firefox
+          --workers=1

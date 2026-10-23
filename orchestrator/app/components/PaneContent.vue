@@ -38,6 +38,7 @@ watch(() => props.group.tabs, (tabs) => {
         v-if="mountedTabIds.has(tab.id)"
         v-show="tab.id === activeTabId"
         class="absolute inset-0"
+        :data-terminal-pane-active="tab.id === activeTabId && tab.type === 'terminal' && terminalAvailable(tab.containerId) ? '' : undefined"
       >
         <TerminalPane
           v-if="tab.type === 'terminal' && terminalAvailable(tab.containerId)"

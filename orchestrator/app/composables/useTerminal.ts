@@ -176,7 +176,6 @@ export function useTerminal() {
       // Keep the browser from scrolling the page; route vertical gestures through
       // xterm so both local scrollback and tmux mouse reporting use their normal paths.
       terminalRoot.style.touchAction = 'pan-x pinch-zoom';
-      terminalRoot.style.overscrollBehavior = 'contain';
       const onTouchStart = (event: TouchEvent) => {
         lastTouchAt = Date.now();
         if (event.touches.length !== 1 || term.hasSelection()) { touchGesture = null; return; }
