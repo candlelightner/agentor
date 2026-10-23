@@ -139,6 +139,7 @@ export default defineConfig({
     "api/incus-image-import.spec.ts",
     "api/incus-image-import-live.spec.ts",
     "api/incus-image-converter.spec.ts",
+    "ui/image-catalog-readiness-isolated.spec.ts",
     "api/incus-image-converter-live.spec.ts",
     "api/incus-converted-image-boot-live.spec.ts",
     "api/incus-image-artifact.spec.ts",

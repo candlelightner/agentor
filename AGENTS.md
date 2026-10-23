@@ -1,5 +1,13 @@
 # Repository instructions
 
+## Visible failure reasons
+
+When adding a timeout, limit, guard, or other behavior that can abort an
+operation, block progress, or cause a crash, document why it exists and log
+the reason when it triggers and the resulting outcome. Include whether the
+operation stopped, cleanup completed, or recovery is still needed. Do not
+leave silent blockers; keep diagnostics bounded and free of secrets.
+
 ## Publication privacy
 
 Do not publish deployment-specific server information to GitHub. Keep real

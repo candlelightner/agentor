@@ -135,6 +135,9 @@ export interface GitCatalogConnection {
   credential?: { type: string; configured: boolean; shortLived: boolean };
   lastSyncAt?: string;
 }
+export interface ImageBuilderSettings {
+  agentReadyTimeoutSeconds: number;
+}
 
 function active(build: ImageBuild) {
   if (["succeeded", "failed", "cancelled"].includes(build.status)) return false;
@@ -176,7 +179,11 @@ export function useImageCatalog() {
     gitSyncResult = ref<any>(null),
     loading = ref(false),
     error = ref("");
+  const readinessSettings = ref<ImageBuilderSettings | null>(null),
+    readinessSettingsLoading = ref(false),
+    readinessSettingsSaving = ref(false);
   const pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let readinessSettingsRequest: Promise<ImageBuilderSettings> | undefined;
   let liveTimer: ReturnType<typeof setInterval> | undefined;
   async function refreshPlugins() {
     // Plugins predate image composition in some deployments. Treat a missing
@@ -226,6 +233,51 @@ export function useImageCatalog() {
     stop();
     void refresh();
     liveTimer = setInterval(() => void refresh(), 2_000);
+  }
+  async function refreshReadinessSettings() {
+    if (readinessSettingsRequest) return readinessSettingsRequest;
+    readinessSettings.value = null;
+    readinessSettingsLoading.value = true;
+    const request = $fetch<ImageBuilderSettings>(
+      "/api/image-builder/settings",
+    ).then((settings) => {
+      if (
+        !Number.isInteger(settings?.agentReadyTimeoutSeconds) ||
+        settings.agentReadyTimeoutSeconds < 1 ||
+        settings.agentReadyTimeoutSeconds > 3600
+      )
+        throw new Error("The server returned an invalid readiness timeout.");
+      readinessSettings.value = settings;
+      return settings;
+    });
+    readinessSettingsRequest = request;
+    try {
+      return await request;
+    } finally {
+      if (readinessSettingsRequest === request) {
+        readinessSettingsRequest = undefined;
+        readinessSettingsLoading.value = false;
+      }
+    }
+  }
+  async function updateReadinessSettings(agentReadyTimeoutSeconds: number) {
+    readinessSettingsSaving.value = true;
+    try {
+      const settings = await $fetch<ImageBuilderSettings>(
+        "/api/image-builder/settings",
+        { method: "PUT", body: { agentReadyTimeoutSeconds } },
+      );
+      if (
+        !Number.isInteger(settings?.agentReadyTimeoutSeconds) ||
+        settings.agentReadyTimeoutSeconds < 1 ||
+        settings.agentReadyTimeoutSeconds > 3600
+      )
+        throw new Error("The server returned an invalid readiness timeout.");
+      readinessSettings.value = settings;
+      return settings;
+    } finally {
+      readinessSettingsSaving.value = false;
+    }
   }
   async function create(
     input: Omit<ImageDefinition, "id" | "versions" | "promotedVersion">,
@@ -397,12 +449,17 @@ export function useImageCatalog() {
     plugins,
     usage,
     effectiveDefault,
+    readinessSettings,
+    readinessSettingsLoading,
+    readinessSettingsSaving,
     gitConnection,
     gitRecovery,
     gitSyncResult,
     loading,
     error,
     refresh,
+    refreshReadinessSettings,
+    updateReadinessSettings,
     refreshPlugins,
     start,
     create,

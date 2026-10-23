@@ -57,7 +57,49 @@ const gitPatPermissionHelp = computed(() =>
     .filter(Boolean)
     .join(" "),
 );
-watch(open, (shown) => (shown ? api.start() : api.stop()));
+const readinessTimeoutDraft = ref<number | null>(null);
+const readinessTimeoutError = ref("");
+const readinessTimeoutSaved = ref(false);
+const readinessTimeoutValid = computed(
+  () =>
+    typeof readinessTimeoutDraft.value === "number" &&
+    Number.isInteger(readinessTimeoutDraft.value) &&
+    readinessTimeoutDraft.value >= 1 &&
+    readinessTimeoutDraft.value <= 3600,
+);
+async function loadReadinessTimeout() {
+  readinessTimeoutError.value = "";
+  try {
+    const settings = await api.refreshReadinessSettings();
+    if (open.value && settings)
+      readinessTimeoutDraft.value = settings.agentReadyTimeoutSeconds;
+  } catch (e: any) {
+    readinessTimeoutError.value =
+      e?.data?.statusMessage || e?.message || "Could not load readiness settings.";
+  }
+}
+async function saveReadinessTimeout() {
+  const seconds = readinessTimeoutDraft.value;
+  if (!readinessTimeoutValid.value) return;
+  readinessTimeoutError.value = "";
+  readinessTimeoutSaved.value = false;
+  try {
+    const settings = await api.updateReadinessSettings(seconds!);
+    readinessTimeoutDraft.value = settings.agentReadyTimeoutSeconds;
+    readinessTimeoutSaved.value = true;
+  } catch (e: any) {
+    readinessTimeoutError.value =
+      e?.data?.statusMessage || e?.message || "Could not save readiness settings.";
+  }
+}
+watch(open, (shown) => {
+  if (shown) {
+    api.start();
+    readinessTimeoutDraft.value = null;
+    readinessTimeoutSaved.value = false;
+    void loadReadinessTimeout();
+  } else api.stop();
+});
 onBeforeUnmount(api.stop);
 const current = computed(
   () =>
@@ -447,6 +489,53 @@ function close() {
         >
           {{ api.error.value || actionError }}
         </p>
+        <section
+          class="border rounded p-4 space-y-3"
+          data-testid="converter-readiness-settings"
+        >
+          <div>
+            <h3 class="font-medium">Converter guest readiness</h3>
+            <p class="text-xs text-gray-500">
+              Set how long image conversion waits for its guest agent. Saving
+              also updates readiness waits already in progress.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-end gap-2">
+            <label class="grid gap-1 text-sm">
+              <span>Agent readiness timeout (seconds)</span>
+              <input
+                v-model.number="readinessTimeoutDraft"
+                type="number"
+                min="1"
+                max="3600"
+                step="1"
+                class="w-44 border rounded p-2"
+                aria-label="Agent readiness timeout in seconds"
+                @input="readinessTimeoutSaved = false"
+                :disabled="api.readinessSettingsLoading.value || api.readinessSettingsSaving.value || !api.readinessSettings.value"
+              />
+            </label>
+            <UButton
+              size="sm"
+              :loading="api.readinessSettingsSaving.value"
+              :disabled="api.readinessSettingsLoading.value || api.readinessSettingsSaving.value || !api.readinessSettings.value || !readinessTimeoutValid || readinessTimeoutDraft === api.readinessSettings.value?.agentReadyTimeoutSeconds"
+              @click="saveReadinessTimeout"
+              >Save timeout</UButton
+            >
+            <UButton
+              v-if="readinessTimeoutError && !api.readinessSettings.value"
+              size="sm"
+              color="neutral"
+              variant="outline"
+              :loading="api.readinessSettingsLoading.value"
+              @click="loadReadinessTimeout"
+              >Retry load</UButton
+            >
+          </div>
+          <p v-if="api.readinessSettingsLoading.value" class="text-xs text-gray-500" role="status">Loading readiness settings…</p>
+          <p v-if="readinessTimeoutSaved" class="text-sm text-green-700" role="status">Readiness timeout saved. Active waits use the new setting.</p>
+          <p v-if="readinessTimeoutError" class="text-sm text-red-600" role="alert">{{ readinessTimeoutError }}</p>
+        </section>
         <section
           class="border rounded p-4 space-y-3"
           data-testid="git-image-catalog"

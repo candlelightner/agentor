@@ -90,10 +90,12 @@ export class IncusWorkerImageManager {
       await current();
     }
     const execute = async (buildId: string) => {
-      const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory);
+      const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory,
+        () => this.catalog.converterReadiness());
       const raw = await converter.convert({ jobId: buildId, ownerId: requesterId,
         installationId: context.installationId, sourceImageId: source.sourceImageId,
         seedFingerprint: this.seedFingerprint, validateAuthority: current, signal,
+        log: message => this.catalog.appendNativeConverterLog(buildId, message),
         acknowledge: receipt => this.catalog.acknowledgeNativeConverter(buildId, receipt) });
       if (raw.sourceImageId !== context.sourceImageId || raw.recipeId !== context.recipeId)
         throw new Error('Canonical conversion inputs changed during execution');

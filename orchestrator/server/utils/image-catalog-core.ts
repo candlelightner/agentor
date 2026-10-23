@@ -278,6 +278,7 @@ type ImageDefinitionSnapshot = Omit<ImageDefinition, "pluginComposition"> & {
   pluginComposition?: ImagePluginSnapshot[];
 };
 interface State {
+  converterSettings: { agentReadyTimeoutSeconds: number };
   definitions: ImageDefinition[];
   builds: ImageBuild[];
   userDefaults: Record<string, { definitionId: string; version: string }>;
@@ -529,6 +530,7 @@ function publicBuild(build: ImageBuild) {
  * by the existing public wrapper; cold restore imports never load services. */
 export class ImageCatalogCore {
   private state: State = {
+    converterSettings: { agentReadyTimeoutSeconds: 120 },
     definitions: [],
     builds: [],
     userDefaults: {},
@@ -539,6 +541,8 @@ export class ImageCatalogCore {
     approvedDefaultImages: [],
   };
   private initialized?: Promise<void>;
+  private committedConverterSettings = { agentReadyTimeoutSeconds: 120 };
+  private converterSettingsChange = new AbortController();
   private mutationChain = Promise.resolve();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private buildStreams = new Map<string, Readable>();
@@ -567,6 +571,7 @@ export class ImageCatalogCore {
       this.state = normalizeState(
         JSON.parse(await readFile(this.path(), "utf8")),
       );
+      this.committedConverterSettings = { ...this.state.converterSettings };
     } catch (error: any) {
       // A missing file is the only empty-catalog case. Treating a corrupt or
       // transiently unreadable catalog as empty would let the recovery write
@@ -658,6 +663,7 @@ export class ImageCatalogCore {
     return result;
   }
   private restoreState(previous: State) {
+    this.state.converterSettings = structuredClone(previous.converterSettings);
     const restoreObjects = <T extends { id: string }>(
       current: T[],
       saved: T[],
@@ -691,6 +697,27 @@ export class ImageCatalogCore {
       // their MCP path is listForGroup(), which remains group-bound.
       (d) => admin || d.ownerId === ownerId,
     );
+  }
+  getConverterSettings() {
+    return { ...this.committedConverterSettings };
+  }
+  converterReadiness() {
+    return { timeoutMs: this.committedConverterSettings.agentReadyTimeoutSeconds * 1000,
+      signal: this.converterSettingsChange.signal };
+  }
+  async setConverterSettings(input: unknown) {
+    const next = { agentReadyTimeoutSeconds: converterAgentTimeout((input as any)?.agentReadyTimeoutSeconds) };
+    try { await this.mutate(() => { this.state.converterSettings = next; }); }
+    catch (error) {
+      console.warn('[image-builder] Converter readiness settings could not be persisted; prior timeout and active waits remain unchanged.');
+      throw error;
+    }
+    this.committedConverterSettings = next;
+    const changed = this.converterSettingsChange;
+    this.converterSettingsChange = new AbortController();
+    changed.abort();
+    console.info(`[image-builder] Converter readiness timeout saved: ${next.agentReadyTimeoutSeconds}s; active waits will reevaluate without resetting elapsed time.`);
+    return this.getConverterSettings();
   }
   listForGroup(ownerId: string, groupId: string) {
     return this.state.definitions.filter(
@@ -1003,6 +1030,13 @@ export class ImageCatalogCore {
     validateNativeDerivation(build.nativeDerivation, build);
     if (!acknowledgement) this.assertNativeSource(build.nativeDerivation.source);
     return build as ImageBuild & { nativeDerivation: NativeImageDerivation };
+  }
+  async appendNativeConverterLog(id: string, message: string) {
+    await this.mutate(() => {
+      const build = this.nativeBuild(id, true);
+      build.logs.push(`[native converter] ${safeLog(message).slice(0, 1024)}`);
+      if (build.logs.length > 2000) build.logs.splice(0, build.logs.length - 2000);
+    });
   }
 
   /** Explicit terminal-job cleanup shares the native-key execution table and
@@ -3407,7 +3441,9 @@ function normalizeState(value: any): State {
   }
   const approvedDefaultImages = value?.approvedDefaultImages ?? [];
   if (!Array.isArray(approvedDefaultImages) || approvedDefaultImages.length > 4096) throw new Error('Approved default image inventory is invalid');
+  const timeout = value?.converterSettings === undefined ? 120 : value.converterSettings?.agentReadyTimeoutSeconds;
   return {
+    converterSettings: { agentReadyTimeoutSeconds: converterAgentTimeout(timeout) },
     definitions,
     builds,
     platformDefaultSources,
@@ -3422,6 +3458,13 @@ function normalizeState(value: any): State {
     deletions: normalizeDeletions(value?.deletions, definitions, builds),
     nativeBindings: normalizeNativeBindings(value?.nativeBindings),
   };
+}
+function converterAgentTimeout(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 3600) {
+    console.warn('[image-builder] Invalid converter readiness timeout: expected integer seconds from 1 to 3600; setting not applied.');
+    httpError(400, 'agentReadyTimeoutSeconds must be an integer between 1 and 3600');
+  }
+  return value;
 }
 function normalizeDeletions(
   value: unknown,
