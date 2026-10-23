@@ -77,8 +77,8 @@ test('unbound admin status and failed emergency observation never report stale d
     f.platform.setEmergencyRuntimeAdapter(runtime); f.groups.setEmergencyRuntimeAdapter(runtime);
     for (const stop of [() => f.platform.setStatus('stopped', true), () => f.groups.setStatus(f.group.id, 'stopped', undefined, true)])
       await expect(stop()).rejects.toMatchObject({ statusCode: 503 });
-    expect(f.platform.getRecord()?.status).toBe('running');
-    expect(f.groups.findByWorkspaceId('group-emergency')?.status).toBe('running');
+    expect(f.platform.getRecord()?.status).toBe('stopped');
+    expect(f.groups.findByWorkspaceId('group-emergency')?.status).toBe('stopped');
     for (const read of [() => f.platform.getStatus(), () => f.groups.getStatus(f.group.id)])
       await expect(read()).rejects.toMatchObject({ statusCode: 503 });
   } finally { await f.cleanup(); }
@@ -95,11 +95,11 @@ test('emergency timeout returns bounded feedback while both admin lifecycle fenc
   globalThis.setTimeout = ((callback: any, delay: number, ...args: any[]) => originalTimeout(callback, delay === 15_000 ? 50 : delay, ...args)) as any;
   try {
     const stopping = [f.platform.setStatus('stopped', true), f.groups.setStatus(f.group.id, 'stopped', undefined, true)];
-    for (const result of stopping) await expect(result).rejects.toMatchObject({ statusCode: 504 });
+    await Promise.all(stopping.map(result => expect(result).rejects.toMatchObject({ statusCode: 504 })));
     for (const id of ['platform-emergency', 'group-emergency']) expect(isWorkerLifecycleMutationPending(id)).toBe(true);
     await expect(f.platform.getStatus()).rejects.toMatchObject({ statusCode: 503 });
-    await expect(f.platform.setStatus('stopped', true)).rejects.toMatchObject({ statusCode: 409 });
-    await expect(f.groups.setStatus(f.group.id, 'stopped', undefined, true)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(f.platform.setStatus('stopped', true)).rejects.toMatchObject({ statusCode: 504 });
+    await expect(f.groups.setStatus(f.group.id, 'stopped', undefined, true)).rejects.toMatchObject({ statusCode: 504 });
     release();
     await expect.poll(() => isWorkerLifecycleMutationPending('platform-emergency') || isWorkerLifecycleMutationPending('group-emergency')).toBe(false);
     await expect(f.platform.getStatus()).resolves.toMatchObject({ status: 'stopped' });

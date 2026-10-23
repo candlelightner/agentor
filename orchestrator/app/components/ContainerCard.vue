@@ -137,6 +137,9 @@ function onHScrollWheel(e: WheelEvent) {
       <WorkerRuntimeIcon :runtime-kind="container.runtimeKind" />
     </div>
 
+    <p v-if="container.recovery && container.recovery.attempts >= container.recovery.maxRetries" role="status" class="mb-2 text-xs text-amber-700 dark:text-amber-400">
+      Automatic recovery paused ({{ container.recovery.attempts }}/{{ container.recovery.maxRetries }}). Open settings to retry.
+    </p>
     <!-- Per-worker live metrics: non-wrapping, scrollable when the card is narrow -->
     <div
       v-if="isRunning"

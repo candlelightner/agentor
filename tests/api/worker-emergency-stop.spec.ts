@@ -85,9 +85,9 @@ test('emergency stop handler enforces confirmation, lock passwords and separate 
     const pending = withWorkerLifecycleMutation(workerId, async () => { entered(); await new Promise<void>(resolve => { release = resolve; }); });
     try {
       await ready;
-      await expect(route(event(workerId))).rejects.toMatchObject({ statusCode: 409 });
+      await expect(route(event(workerId))).resolves.toEqual({ ok: true });
     } finally { release(); await pending; }
-    expect(calls).toEqual(['ordinary', 'platform', 'group', 'ordinary', 'platform', 'group']);
+    expect(calls).toEqual(['ordinary', 'platform', 'group', 'ordinary', 'platform', 'group', 'ordinary']);
   } finally {
     containers.get = saved.get; containers.emergencyStop = saved.emergency;
     groups.findByWorkspaceId = saved.groupFind; groups.setStatus = saved.groupStatus;

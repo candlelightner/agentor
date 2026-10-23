@@ -2,7 +2,7 @@ defineRouteMeta({
   openAPI: {
     tags: ['Containers'],
     summary: 'Emergency stop a worker',
-    description: 'Immediately force-stops the existing worker without a graceful shutdown. Requires explicit confirmation and the protection-lock password when protected. Administrative workspaces retain their dedicated authorization. Pending lifecycle or recovery operations must settle before this action is allowed.',
+    description: 'Immediately force-stops the existing worker without a graceful shutdown. Requires explicit confirmation and the protection-lock password when protected. Administrative workspaces retain their dedicated authorization. Requests are accepted while lifecycle status is unknown; stopped intent is retained while pending runtime operations settle.',
     operationId: 'emergencyStopContainer',
     parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
     requestBody: { required: true, content: { 'application/json': { schema: {
@@ -30,7 +30,6 @@ import { useWorkerProtectionLockStore } from '../../../utils/worker-protection-l
 import { readAdministrativeRuntimeRecord } from '../../../utils/admin-native-authority';
 import { useAdminWorkspaceStore } from '../../../utils/admin-workspace-store';
 import { useGroupAdminWorkspaceStore, type GroupAdministrativeWorkspaceRecord } from '../../../utils/group-admin-workspace-store';
-import { isWorkerLifecycleMutationPending } from '../../../utils/worker-lifecycle-coordinator';
 import { rethrowAsHttpError } from '../../../utils/http-errors';
 
 export default defineEventHandler(async (event) => {
@@ -48,8 +47,6 @@ export default defineEventHandler(async (event) => {
     if (body?.confirmed !== true)
       throw createError({ statusCode: 400, statusMessage: 'Explicit confirmation is required for emergency stop' });
     await useWorkerProtectionLockStore().verify(id, body.lockPassword);
-    if (isWorkerLifecycleMutationPending(id))
-      throw createError({ statusCode: 409, statusMessage: 'Worker lifecycle operation is still pending; refresh status before retrying emergency stop' });
     if (administrative?.kind === 'administrative') await useAdminWorkspaceStore().setStatus('stopped', true, id);
     else if (administrative) {
       const groupId = (administrative as GroupAdministrativeWorkspaceRecord).groupId;

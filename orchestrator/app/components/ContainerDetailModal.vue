@@ -274,6 +274,8 @@ const formattedCreatedAt = computed(() => {
           </div>
         </div>
 
+        <WorkerRecoveryPanel v-if="!container.administrativeKind" :worker-id="container.id" />
+
         <!-- Pending rebuild banner -->
         <div
           v-if="container.pendingRebuild"

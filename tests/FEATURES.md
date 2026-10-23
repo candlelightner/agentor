@@ -1515,3 +1515,9 @@ Existing native administrative status/start preparation re-admits exact host pol
 Codex MCP subprocess endpoint allowlists are reconciled for canonical management and worker-self commands, including existing sections and existing account profiles, without replacing user configuration or persisting credentials/endpoint values.
 
 Terminal WebSocket attachment preserves only the latest validated early resize across authentication/runtime setup; early keystrokes remain discarded and disconnect cancels pending resize delivery. The shared handler covers ordinary and administrative terminals.
+
+
+- Bounded automatic worker recovery: configurable finite per-worker retry limits (default 3; 0 disables), durable counters, explicit reset and safe failure phases.
+- Operator desired-state controls remain available with an explicit warning when actual runtime state is unknown; desired and observed state remain distinct.
+- Emergency-stop intent is accepted during pending worker/platform/group lifecycle operations, preserves runtime identity/settlement fences and reports confirmation separately.
+- Equivalent REST/GUI/management MCP controls; group administrators are restricted to live descendant groups and member workers, while platform administrative shutdown is platform-only.

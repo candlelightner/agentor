@@ -1,3 +1,4 @@
+(globalThis as any).useLogger ??= () => ({ info() {}, warn() {}, error() {}, debug() {} });
 import { expect, test } from "@playwright/test";
 import {
   AdminWorkspaceStore,
@@ -617,4 +618,28 @@ for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} confi
     await expect(set()).rejects.toMatchObject({ statusCode: 409 });
   } finally { release(); await stopping; }
   await expect(get()).resolves.toMatchObject({ memoryLimit: '4GiB' });
+});
+
+for (const scoped of [false, true]) test(`${scoped ? 'group' : 'platform'} emergency stop saves intent before queued startup settles`, async () => {
+  const fake = new FakeGroups(), { group } = groupRecord('queued-owner', `queued-${scoped}-${Date.now()}`);
+  fake.records.set(group.id, group);
+  const platform = new AdminWorkspaceStore(`/tmp/agentor-queued-${Date.now()}`, async () => {});
+  const groups = new GroupAdminWorkspaceStore(fake as any);
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; }), blocked = new Promise<void>(resolve => { release = resolve; });
+  const calls: string[] = [];
+  const adapter = runtime({ start: async () => { entered(); await blocked; }, stop: async (_record, _ack, force) => {
+    expect(force).toBe(true); calls.push('forced-stop');
+  } });
+  platform.setRuntimeAdapter(adapter); groups.setRuntimeAdapter(adapter);
+  if (!scoped) await platform.ensure();
+  const start = scoped ? groups.setStatus(group.id, 'running') : platform.setStatus('running');
+  await ready;
+  const stop = scoped ? groups.setStatus(group.id, 'stopped', () => {}, true) : platform.setStatus('stopped', true);
+  try {
+    await expect.poll(() => scoped ? fake.findById(group.id)?.adminWorkspace?.status : platform.getRecord()?.status).toBe('stopped');
+    expect(calls).toEqual([]);
+  } finally { release(); await start; await stop; }
+  expect(calls).toEqual(['forced-stop']);
+  expect(scoped ? fake.findById(group.id)?.adminWorkspace?.status : platform.getRecord()?.status).toBe('stopped');
 });
