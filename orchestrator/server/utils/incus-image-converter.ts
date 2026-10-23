@@ -21,12 +21,18 @@ export interface IncusImageConverterReceipt {
   pending?: { kind: 'create' | 'start' | 'stop' | 'delete'; operation?: string };
   removed?: true;
 }
+export const NATIVE_IMAGE_PHASES = ['checking-source', 'creating-converter', 'starting-converter', 'waiting-for-agent',
+  'preparing-tools', 'copying-bootstrap', 'checking-space', 'transferring-source', 'checking-source-image',
+  'converting-disk', 'receiving-disk', 'removing-converter', 'normalizing-image', 'preparing-image-metadata',
+  'importing-vm', 'publishing-image'] as const;
+export type NativeImagePhase = typeof NATIVE_IMAGE_PHASES[number];
 export interface IncusImageConversionInput {
   jobId: string; ownerId: string; installationId: string; sourceImageId: string; seedFingerprint: string;
   validateAuthority: () => Promise<void>;
   acknowledge: (receipt: Readonly<IncusImageConverterReceipt>) => Promise<void>;
   signal?: AbortSignal;
   log?: (message: string) => Promise<void>;
+  onPhase?: (phase: NativeImagePhase) => Promise<void>;
 }
 export interface CanonicalIncusBootstrapFile { name: string; mode: number; size: number; sha256: string; bytes: Buffer }
 export interface IncusConvertedRaw {
@@ -257,6 +263,10 @@ export class IncusImageConverter {
       try { await request.log?.(message); }
       catch { console.warn(`[converter] Build diagnostic persistence failed: ${message.slice(0, 1024)}`); }
     };
+    const phase = async (value: NativeImagePhase) => {
+      try { await request.onPhase?.(value); }
+      catch { await log(`Phase ${value} could not be recorded; conversion continues with its prior visible state.`); }
+    };
     const pool = this.config.incusConverterStoragePool || this.config.incusStoragePool;
     if (!UUID.test(request.jobId) || !UUID.test(request.installationId) || !HEX.test(request.seedFingerprint) ||
         !/^sha256:[a-f0-9]{64}$/.test(request.sourceImageId) || assertSafeUserId(request.ownerId).length > 128 ||
@@ -336,6 +346,7 @@ export class IncusImageConverter {
     await mkdir(directory, { mode: 0o700 });
     let raw: FileHandle | undefined;
     try {
+      await phase('creating-converter'); await active();
       let created: IncusInstance | undefined;
       await submit('create', async accepted => {
         created = await this.client.createInstance(spec, accepted);
@@ -343,7 +354,9 @@ export class IncusImageConverter {
         if (!UUID.test(uuid ?? '')) throw new Error('Converter create omitted native incarnation');
         await persist({ ...receipt, incarnation: uuid });
       });
+      await phase('starting-converter');
       await check(); await submit('start', accepted => this.client.startInstance(receipt.name, accepted));
+      await phase('waiting-for-agent');
       // A live finite budget prevents an unavailable agent from wedging conversion.
       const started = Date.now(); let ready = false, previousTimeout: number | undefined;
       while (true) {
@@ -383,13 +396,16 @@ export class IncusImageConverter {
         await log(`Readiness expired after ${Date.now() - started}ms against a ${previousTimeout}ms limit; conversion stopped before guest preparation.`);
         throw new Error('Converter guest agent did not become ready');
       }
+      await phase('preparing-tools');
       await execute('guest-tools', ['/bin/bash', '-ec', PREPARE_GUEST]);
+      await phase('copying-bootstrap');
       for (const file of files) {
         await check(); await this.client.pushFile(receipt.name, '/root/agentor-convert/' + file.name, file.bytes,
           { uid: 0, gid: 0, mode: file.mode }); await check();
       }
       // Root device enlargement alone does not grow the guest partition/FS.
       // A small conservative preflight is not permission to resize anything.
+      await phase('checking-space');
       await execute('guest-space', ['/bin/bash', '-ec', String.raw`
 available=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
 case "$available" in ''|*[!0-9]*) echo 'Converter root free-space observation is invalid' >&2; exit 1;; esac
@@ -398,9 +414,11 @@ if [ "$available" -lt "$1" ]; then
  exit 1
 fi`, 'agentor-converter-space', String(required)]);
       await check();
+      await phase('transferring-source'); await check();
       const exported = await source.get();
       try { await execute('OCI-load', ['/usr/bin/docker', 'load'], exported); }
       finally { if (exported instanceof Readable) exported.destroy(); }
+      await phase('checking-source-image');
       await execute('OCI-identity', ['/bin/bash', '-ec', String.raw`
 diagnose_source() {
  docker info --format '{{json .DriverStatus}}' >&2 || true
@@ -409,6 +427,7 @@ diagnose_source() {
 if ! actual=$(docker image inspect --format '{{.Id}}' "$1"); then diagnose_source; exit 1; fi
 if [ "$actual" != "$1" ]; then echo 'Loaded source OCI identity does not match the authorized immutable source' >&2; diagnose_source; exit 1; fi
 `, 'agentor-converter-source', request.sourceImageId]);
+      await phase('converting-disk');
       await execute('raw-convert', ['/bin/bash', '-ec', String.raw`
 if /bin/bash "$@"; then exit 0; else converter_exit=$?; fi
 printf '\nConverter failure filesystem/kernel diagnostics:\n' >&2
@@ -419,6 +438,7 @@ exit "$converter_exit"
         '--source-image', request.sourceImageId, '--expected-source-id', request.sourceImageId, '--expected-recipe-id', recipeId,
         '--size', '10G', '--raw-only', '--output-dir', '/root/agentor-convert/output']);
       await check();
+      await phase('receiving-disk'); await check();
       raw = await open(rawPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       const session = await this.client.execStream(receipt.name, ['/usr/bin/cat', '/root/agentor-convert/output/disk.raw'],
         { command: [], user: 0, group: 0, cwd: '/', signal: request.signal, timeoutMs: 30 * 60_000 });
@@ -439,6 +459,7 @@ exit "$converter_exit"
       await raw.sync(); const stat = await raw.stat();
       if (bytes !== INCUS_CONVERSION_RAW_BYTES || stat.size !== bytes) throw new Error('Converter RAW size is not the fixed conversion artifact');
       await check();
+      await phase('removing-converter');
       await removeConverter(); await active();
       return { rawPath, rawBytes: bytes, rawIdentity: { dev: stat.dev, ino: stat.ino, size: stat.size }, sourceImageId: request.sourceImageId, recipeId };
     } catch (error) {

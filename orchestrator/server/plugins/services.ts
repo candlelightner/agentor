@@ -64,6 +64,7 @@ export default defineNitroPlugin(async (nitroApp) => {
   const logStore = useLogStore();
   await logStore.init();
   const logger = useLogger();
+  useImageCatalogManager().setNativeDiagnosticLogger(logger);
 
   // Surface stray promise rejections / uncaught exceptions in the centralized
   // log instead of relying on the stdout self-capture (which may not flush in

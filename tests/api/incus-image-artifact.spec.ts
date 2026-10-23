@@ -56,6 +56,8 @@ async function fixture(run: (f: { raw: IncusConvertedRaw; scratch: string; paren
 test('actual trusted qemu FD normalization treats hostile qcow-looking RAW as opaque and cleans only acknowledged owned artifacts', async () => {
   test.setTimeout(60_000);
   await fixture(async f => {
+    const phases: string[] = [];
+    f.hooks.onPhase = async phase => { phases.push(phase); };
     const original = f.client.importImage;
     f.client.importImage = async (...args) => {
       const info = JSON.parse(execFileSync('qemu-img', ['info', '-f', 'qcow2', '--output=json', args[1]], { encoding: 'utf8' }));
@@ -66,6 +68,7 @@ test('actual trusted qemu FD normalization treats hostile qcow-looking RAW as op
       return original(...args);
     };
     expect((await normalizeAndImportIncusImage(f.client, f.raw, f.scratch, f.hooks)).type).toBe('virtual-machine');
+    expect(phases).toEqual(['normalizing-image', 'preparing-image-metadata', 'importing-vm']);
     expect(f.acknowledgements.map(ack => ack.pending)).toEqual([true, true, false]);
     expect(f.acknowledgements.at(-1)?.fingerprint).toBe('e'.repeat(64));
     expect(await readdir(f.parent)).toEqual([]); // Source RAW + normalized artifacts only; parent retained.
@@ -119,5 +122,32 @@ test('normalization cancellation kills and awaits the trusted tool before closin
       expect((await lstat(f.raw.rawPath)).size).toBe(INCUS_CONVERSION_RAW_BYTES);
     } finally { clearInterval(checking); process.env.PATH = priorPath;
       if (priorPid === undefined) delete process.env.AGENTOR_QEMU_TEST_PID; else process.env.AGENTOR_QEMU_TEST_PID = priorPid; }
+  });
+});
+
+test('abort or revocation during the phase callback prevents trusted qemu work and import', async () => {
+  for (const outcome of ['abort', 'revoke']) await fixture(async f => {
+    const binaries = join(f.root, 'bin'), marker = join(f.root, 'started'); await mkdir(binaries);
+    await writeFile(join(binaries, 'qemu-img'), '#!/bin/sh\nprintf started > "$AGENTOR_QEMU_TEST_PID"\nexit 73\n', { mode: 0o700 });
+    const priorPath = process.env.PATH, priorMarker = process.env.AGENTOR_QEMU_TEST_PID;
+    process.env.PATH = binaries + ':' + priorPath; process.env.AGENTOR_QEMU_TEST_PID = marker;
+    const controller = new AbortController(), abort = Error('Synthetic operation cancelled during telemetry');
+    let imports = 0;
+    f.client.importImage = async () => { imports++; throw Error('Import must not start'); };
+    f.hooks.onPhase = async phase => {
+      expect(phase).toBe('normalizing-image');
+      if (outcome === 'abort') controller.abort(abort); else f.fail('revoked');
+    };
+    try {
+      const operation = normalizeAndImportIncusImage(f.client, f.raw, f.scratch, f.hooks, controller.signal);
+      if (outcome === 'abort') await expect(operation).rejects.toBe(abort);
+      else await expect(operation).rejects.toThrow('permission revoked');
+      await expect(lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(imports).toBe(0); expect(f.acknowledgements).toEqual([]);
+      expect((await lstat(f.raw.rawPath)).size).toBe(INCUS_CONVERSION_RAW_BYTES);
+    } finally {
+      process.env.PATH = priorPath;
+      if (priorMarker === undefined) delete process.env.AGENTOR_QEMU_TEST_PID; else process.env.AGENTOR_QEMU_TEST_PID = priorMarker;
+    }
   });
 });

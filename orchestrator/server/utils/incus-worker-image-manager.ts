@@ -5,7 +5,7 @@ import type { Config } from './config';
 import { IncusClient, IncusError } from './incus-client';
 import { backupInstallationId } from './backup-installation';
 import type { ImageCatalogCore, NativeImageContext, NativeImageBinding, NativeImageSource } from './image-catalog-core';
-import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap } from './incus-image-converter';
+import { IncusImageConverter, incusConversionRecipeId, readCanonicalIncusBootstrap, type NativeImagePhase } from './incus-image-converter';
 import { normalizeAndImportIncusImage } from './incus-image-artifact';
 import { incusImageIdentity, sameIncusImageSource } from './incus-worker-image';
 import { parseWorkerBackupRuntime, type WorkerBackupRuntimeSource } from './worker-backup-runtime';
@@ -90,27 +90,44 @@ export class IncusWorkerImageManager {
       await current();
     }
     const execute = async (buildId: string) => {
-      const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory,
-        () => this.catalog.converterReadiness());
-      const raw = await converter.convert({ jobId: buildId, ownerId: requesterId,
-        installationId: context.installationId, sourceImageId: source.sourceImageId,
-        seedFingerprint: this.seedFingerprint, validateAuthority: current, signal,
-        log: message => this.catalog.appendNativeConverterLog(buildId, message),
-        acknowledge: receipt => this.catalog.acknowledgeNativeConverter(buildId, receipt) });
-      if (raw.sourceImageId !== context.sourceImageId || raw.recipeId !== context.recipeId)
-        throw new Error('Canonical conversion inputs changed during execution');
-      await current();
-      const image = await normalizeAndImportIncusImage(this.client, raw,
-        join(this.config.dataDir, 'incus-image-converters', 'incus-image-' + buildId, 'normalized'), {
-          validateAuthority: current,
-          acknowledgeImport: acknowledgement => this.catalog.acknowledgeNativeImageImport(buildId, acknowledgement, current),
-        }, signal);
-      const identity = incusImageIdentity(image);
-      if (identity.sourceImageId !== context.sourceImageId || identity.recipeId !== context.recipeId ||
-          identity.bootstrapGeneration !== context.bootstrapGeneration || identity.converterVersion !== context.converterVersion)
-        throw new Error('Trusted normalized image import does not match conversion inputs');
-      await current();
-      await this.catalog.publishNativeImageBinding(buildId, identity, 'agentor-storage-ownership-v1', current);
+      const onPhase = (phase: NativeImagePhase) => this.catalog.reportNativeImagePhase(buildId, phase);
+      let waiting: Promise<void> | undefined;
+      // Keep the existing durable job visible during opaque guest commands and
+      // trusted host normalization. This reports waiting, never measured work.
+      const heartbeat = setInterval(() => {
+        if (waiting) return;
+        waiting = this.catalog.noteNativeImageWaiting(buildId).catch(() => {
+          console.warn(`[image-builder] job=${buildId} Waiting observation could not be persisted; conversion continues with prior visible state.`);
+        }).finally(() => { waiting = undefined; });
+      }, 15_000);
+      heartbeat.unref?.();
+      try {
+        const converter = new IncusImageConverter(this.config, this.client, this.docker, this.bootstrapDirectory,
+          () => this.catalog.converterReadiness());
+        const raw = await converter.convert({ jobId: buildId, ownerId: requesterId,
+          installationId: context.installationId, sourceImageId: source.sourceImageId,
+          seedFingerprint: this.seedFingerprint, validateAuthority: current, signal,
+          onPhase,
+          log: message => this.catalog.appendNativeConverterLog(buildId, message),
+          acknowledge: receipt => this.catalog.acknowledgeNativeConverter(buildId, receipt) });
+        if (raw.sourceImageId !== context.sourceImageId || raw.recipeId !== context.recipeId)
+          throw new Error('Canonical conversion inputs changed during execution');
+        await current();
+        const image = await normalizeAndImportIncusImage(this.client, raw,
+          join(this.config.dataDir, 'incus-image-converters', 'incus-image-' + buildId, 'normalized'), {
+            validateAuthority: current, onPhase,
+            acknowledgeImport: acknowledgement => this.catalog.acknowledgeNativeImageImport(buildId, acknowledgement, current),
+          }, signal);
+        const identity = incusImageIdentity(image);
+        if (identity.sourceImageId !== context.sourceImageId || identity.recipeId !== context.recipeId ||
+            identity.bootstrapGeneration !== context.bootstrapGeneration || identity.converterVersion !== context.converterVersion)
+          throw new Error('Trusted normalized image import does not match conversion inputs');
+        await current();
+        // A visibility write must not turn a settled import into a failed operation.
+        try { await onPhase('publishing-image'); }
+        catch { console.warn('[image-builder] Publication stage could not be persisted; publication continues with prior visible state.'); }
+        await this.catalog.publishNativeImageBinding(buildId, identity, 'agentor-storage-ownership-v1', current);
+      } finally { clearInterval(heartbeat); await waiting; }
     };
     let binding = await this.catalog.ensureNativeImageBinding(source, context, current, execute);
     // A private cache entry is only a hint. Re-query this exact project and

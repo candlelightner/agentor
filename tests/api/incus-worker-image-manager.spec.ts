@@ -176,3 +176,38 @@ test(`descriptive restore source preserves current authorization and private his
     }
   } finally { client.dispose(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('execution-owned waiting heartbeat settles before original conversion failure escapes and is always cleared', async () => {
+  const { IncusImageConverter } = await import('../../orchestrator/server/utils/incus-image-converter');
+  const root = await mkdtemp(join(tmpdir(), 'agentor-image-heartbeat-')), assets = join(root, 'assets');
+  await promisify(execFile)('node', ['../orchestrator/build-incus-worker-assets.mjs', assets]);
+  const client = new IncusClient({ endpoint: 'https://fixture.invalid', project: 'agentor-private' });
+  const originalConvert = IncusImageConverter.prototype.convert;
+  const originalInterval = globalThis.setInterval, originalClear = globalThis.clearInterval;
+  let tick!: () => void, cleared = false, settled = false, ticks = 0, release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const timer = { unref() {} }, failure = Error('Original conversion failure');
+  const catalog = {
+    authorizeNativeImageSource: async () => ({ sourceImageId: 'sha256:' + 'a'.repeat(64) }),
+    ensureNativeImageBinding: async (_source: unknown, _context: unknown, _validate: unknown, execute: (id: string) => Promise<void>) => execute(randomUUID()),
+    noteNativeImageWaiting: async () => { ticks++; await held; settled = true; throw Error('Private telemetry failure'); },
+  } as unknown as ImageCatalogManager;
+  const manager = new IncusWorkerImageManager({ dataDir: root, incusNetwork: 'workers', incusStoragePool: 'workers' },
+    client, {} as any, catalog, assets, 'b'.repeat(64));
+  try {
+    globalThis.setInterval = ((callback: () => void, ms: number) => { expect(ms).toBe(15_000); tick = callback; return timer; }) as any;
+    globalThis.clearInterval = ((value: unknown) => { expect(value).toBe(timer); cleared = true; }) as any;
+    IncusImageConverter.prototype.convert = async () => { tick(); tick(); throw failure; };
+    let escaped = false;
+    const operation = manager.ensure('owner', {}, async () => {}).catch(error => { escaped = true; throw error; });
+    const observed = operation.catch(error => error);
+    await expect.poll(() => ticks).toBe(1); // Concurrent ticks cannot pile up writes.
+    expect(cleared).toBe(true); expect(escaped).toBe(false);
+    release();
+    expect(await observed).toBe(failure); expect(settled).toBe(true); expect(ticks).toBe(1);
+  } finally {
+    release(); IncusImageConverter.prototype.convert = originalConvert;
+    globalThis.setInterval = originalInterval; globalThis.clearInterval = originalClear;
+    client.dispose(); await rm(root, { recursive: true, force: true });
+  }
+});

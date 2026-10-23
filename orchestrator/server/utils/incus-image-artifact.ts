@@ -6,10 +6,11 @@ import { createGzip } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
 import { once } from 'node:events';
 import * as tar from 'tar-stream';
-import { INCUS_CONVERSION_RAW_BYTES, type IncusConvertedRaw } from './incus-image-converter';
+import { INCUS_CONVERSION_RAW_BYTES, type IncusConvertedRaw, type NativeImagePhase } from './incus-image-converter';
 import type { IncusClient, IncusImage } from './incus-client';
 
 export interface IncusImageArtifactHooks {
+  onPhase?: (phase: NativeImagePhase) => Promise<void>;
   validateAuthority: () => Promise<void>;
   acknowledgeImport: (acknowledgement: Readonly<{ pending: boolean; operation?: string; fingerprint?: string }>) => Promise<void>;
 }
@@ -19,6 +20,10 @@ export interface IncusImageArtifactHooks {
  * Root hooks bind these artifacts to the removed converter and existing job. */
 export async function normalizeAndImportIncusImage(client: IncusClient, raw: IncusConvertedRaw,
   trustedScratchDirectory: string, hooks: IncusImageArtifactHooks, signal?: AbortSignal): Promise<IncusImage> {
+  const phase = async (value: NativeImagePhase) => {
+    try { await hooks.onPhase?.(value); }
+    catch { console.warn(`[image-builder] Phase ${value} could not be recorded; image preparation continues with its prior visible state.`); }
+  };
   raw = structuredClone(raw);
   const active = async () => { signal?.throwIfAborted(); await hooks.validateAuthority(); signal?.throwIfAborted(); };
   if (!/^sha256:[a-f0-9]{64}$/.test(raw.sourceImageId) || !/^[a-f0-9]{64}$/.test(raw.recipeId) ||
@@ -53,6 +58,7 @@ export async function normalizeAndImportIncusImage(client: IncusClient, raw: Inc
     await active();
     // Fixed raw input format is security-critical. Source bytes never select
     // a qemu driver, backing file, partition/filesystem parser or extra argv.
+    await phase('normalizing-image'); await active();
     const child = spawn('qemu-img', ['convert', '-f', 'raw', '-O', 'qcow2', '-c', '/proc/self/fd/3', '/proc/self/fd/4'],
       { stdio: ['ignore', 'ignore', 'pipe', input.fd, qcow.fd] });
     let stderr = Buffer.alloc(0), interrupted: Error | undefined;
@@ -75,6 +81,7 @@ export async function normalizeAndImportIncusImage(client: IncusClient, raw: Inc
       throw new Error('Trusted qcow output identity is unavailable');
     await input.close(); input = undefined;
     await removeFile(raw.rawPath, raw.rawIdentity); // Known normalization complete; release reconstructable RAW disk space.
+    await phase('preparing-image-metadata'); await active();
     const properties: Record<string, string> = {
       description: `Agentor Worker VM (Derived from ${raw.sourceImageId})`, os: 'ubuntu', release: 'noble',
       source_image: raw.sourceImageId, source_image_id: raw.sourceImageId, recipe_id: raw.recipeId,
@@ -101,6 +108,7 @@ export async function normalizeAndImportIncusImage(client: IncusClient, raw: Inc
     await active();
     if (!sameFile(await lstat(qcowPath), qcowIdentity) || !sameFile(await lstat(metadataPath), metadataIdentity))
       throw new Error('Trusted image artifact identity changed before import');
+    await phase('importing-vm'); await active();
     await hooks.acknowledgeImport({ pending: true }); await active();
     let acceptedOperation: string | undefined;
     const image = await client.importImage(metadataPath, qcowPath, async operation => {

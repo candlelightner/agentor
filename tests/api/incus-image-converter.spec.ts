@@ -716,3 +716,29 @@ test('converter recovery acknowledges only typed settled absence and stops on au
     } finally { f.client.dispose(); }
   }
 });
+
+
+test('only trusted execution boundaries report phases and a visibility failure does not skip converter cleanup', async () => {
+  await fixture(async f => {
+    const phases: string[] = [];
+    f.input.onPhase = async phase => { phases.push(phase); if (phase === 'preparing-tools') throw Error('Private telemetry write failure'); };
+    f.fail('docker-load');
+    await expect(f.converter.convert(f.input)).rejects.toThrow('OCI-load');
+    expect(phases).toEqual(['creating-converter', 'starting-converter', 'waiting-for-agent', 'preparing-tools',
+      'copying-bootstrap', 'checking-space', 'transferring-source']);
+    expect(f.logs).toContain('Phase preparing-tools could not be recorded; conversion continues with its prior visible state.');
+    expect(f.receipts.at(-1)?.removed).toBe(true);
+    expect(f.logs.join(' ')).not.toContain('Private telemetry write failure');
+  });
+});
+
+test('revocation during phase persistence cannot allocate or export and still cleans an existing exact converter', async () => {
+  for (const stage of ['creating-converter', 'transferring-source', 'receiving-disk']) await fixture(async f => {
+    f.input.onPhase = async phase => { if (phase === stage) f.revoke(); };
+    await expect(f.converter.convert(f.input)).rejects.toThrow('permission revoked');
+    if (stage === 'creating-converter') { expect(f.events).not.toContain('create'); expect(f.receipts).toEqual([]); }
+    else expect(f.receipts.at(-1)?.removed).toBe(true);
+    if (stage === 'transferring-source') expect(f.events).not.toContain('export');
+    if (stage === 'receiving-disk') expect(f.commands.some(command => command[0] === '/usr/bin/cat')).toBe(false);
+  });
+});

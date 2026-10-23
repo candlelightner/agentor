@@ -5,7 +5,8 @@ import Docker from "dockerode";
 import { pack } from "tar-stream";
 import type { Readable } from "node:stream";
 import type { PluginCommand } from "./plugin-manifest";
-import type { IncusImageConverterReceipt } from './incus-image-converter';
+import type { Logger } from './logger';
+import { NATIVE_IMAGE_PHASES, type IncusImageConverterReceipt, type NativeImagePhase } from './incus-image-converter';
 import { validateIncusImageIdentity, sameIncusImageSource, type IncusWorkerImageIdentity } from './incus-worker-image';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -151,6 +152,8 @@ export interface ImageBuild {
   status: ImageBuildStatus;
   phase: string;
   progress?: number;
+  /** Trusted stage observations; waitingAt is controller waiting, never measured guest progress. */
+  nativeActivity?: { progressMode: 'indeterminate'; phase: NativeImagePhase; phaseStartedAt: string; waitingAt?: string };
   outcome?: ImageBuildOutcome;
   createdAt: string;
   updatedAt: string;
@@ -523,6 +526,9 @@ function followDockerProgressBounded(
 }
 function publicBuild(build: ImageBuild) {
   const { logs: _logs, nativeDerivation: _nativeDerivation, ...result } = build;
+  // Legacy persisted native jobs used 0/100 as lifecycle markers, not measured
+  // work. Never expose those numbers as conversion percentages, even on failure.
+  if (_nativeDerivation) delete result.progress;
   return result;
 }
 
@@ -556,6 +562,11 @@ export class ImageCatalogCore {
     private readonly applicationServices?: () => Promise<Pick<typeof import('./services'),
       'usePluginDefinitionStore' | 'useContainerManager' | 'useWorkerStore'>>,
   ) {}
+
+  private nativeLogger?: Pick<Logger, 'info' | 'warn'>;
+  /** Application startup supplies its already initialized log sink. Cold
+   * catalog operations never initialize application services for telemetry. */
+  setNativeDiagnosticLogger(logger: Pick<Logger, 'info' | 'warn'>) { this.nativeLogger = logger; }
 
   private services() {
     if (!this.applicationServices) throw new Error('This catalog operation requires the running application');
@@ -979,7 +990,7 @@ export class ImageCatalogCore {
     validateAuthority: () => Promise<void>): Promise<string> {
     source = structuredClone(source); context = structuredClone(context);
     await this.init();
-    return this.mutate(async () => {
+    const id = await this.mutate(async () => {
       await validateAuthority();
       this.assertNativeSource(source); const key = nativeContextKey(context);
       if (context.sourceImageId !== source.sourceImageId) throw new Error('Native derivation source differs');
@@ -993,11 +1004,14 @@ export class ImageCatalogCore {
         throw new Error('Native conversion already owns this immutable key; retain its exact acknowledgement');
       const stamp = now(), id = randomUUID();
       this.state.builds.push({ id, definitionId: source.definitionId, ownerId: source.requesterId, groupId: source.groupId,
-        operation: 'build', builder: 'controlled', status: 'running', phase: 'deriving-vm', progress: 0,
+        operation: 'build', builder: 'controlled', status: 'running', phase: 'checking-source',
+        nativeActivity: { progressMode: 'indeterminate', phase: 'checking-source', phaseStartedAt: stamp },
         createdAt: stamp, updatedAt: stamp, startedAt: stamp, logs: [], digest: source.sourceImageId, version: source.version,
         imageCreated: true, nativeDerivation: { source, context } });
       return id;
     });
+    this.nativeDiagnostic(id, 'Native image preparation accepted; waiting for confirmed stages.');
+    return id;
   }
 
   /** Reconstructable cache eviction only. Keep the settled job/receipts as
@@ -1031,12 +1045,55 @@ export class ImageCatalogCore {
     if (!acknowledgement) this.assertNativeSource(build.nativeDerivation.source);
     return build as ImageBuild & { nativeDerivation: NativeImageDerivation };
   }
+  private nativeDiagnostic(id: string, message: string, level: 'info' | 'warn' = 'info') {
+    const build = this.state.builds.find(item => item.id === id);
+    const elapsed = build?.startedAt ? Math.max(0, Date.now() - Date.parse(build.startedAt)) : 0;
+    const line = `[image-build] job=${id} phase=${build?.phase ?? 'unknown'} elapsedMs=${elapsed} ${safeLog(message).slice(0, 1024)}`;
+    try {
+      if (this.nativeLogger) { this.nativeLogger[level](line); return; }
+    } catch { console.warn('[image-build] Official logger unavailable; retaining bounded operation diagnostics on the process log.'); }
+    console[level](line);
+  }
   async appendNativeConverterLog(id: string, message: string) {
+    this.nativeDiagnostic(id, message);
     await this.mutate(() => {
       const build = this.nativeBuild(id, true);
       build.logs.push(`[native converter] ${safeLog(message).slice(0, 1024)}`);
       if (build.logs.length > 2000) build.logs.splice(0, build.logs.length - 2000);
     });
+  }
+  async reportNativeImagePhase(id: string, phase: NativeImagePhase) {
+    const current = this.state.builds.find(item => item.id === id);
+    if (!current?.nativeDerivation || current.status !== 'running' || current.nativeActivity?.phase === phase) return;
+    const message = `Entered stage: ${phase}; progress is indeterminate.`;
+    const changed = await this.mutate(() => {
+      const build = this.state.builds.find(item => item.id === id);
+      if (!build?.nativeDerivation || build.status !== 'running' || build.nativeActivity?.phase === phase) return false;
+      build.phase = phase;
+      build.nativeActivity = { progressMode: 'indeterminate', phase, phaseStartedAt: now() };
+      build.updatedAt = build.nativeActivity.phaseStartedAt;
+      build.logs.push(`[native converter] ${message}`);
+      if (build.logs.length > 2000) build.logs.splice(0, build.logs.length - 2000);
+      return true;
+    });
+    if (changed) this.nativeDiagnostic(id, message);
+  }
+  async noteNativeImageWaiting(id: string) {
+    // Execution-owned heartbeat, never an API read side effect. A waiting
+    // observation says only that the parent is alive, not that guest work advanced.
+    const due = (build?: ImageBuild) => !!build?.nativeDerivation && build.status === 'running' &&
+      !!build.nativeActivity && Date.now() - Date.parse(build.nativeActivity.waitingAt ?? build.nativeActivity.phaseStartedAt) >= 15_000;
+    if (!due(this.state.builds.find(item => item.id === id))) return;
+    const message = 'Controller still waiting; no measured converter progress is available.';
+    const changed = await this.mutate(() => {
+      const build = this.state.builds.find(item => item.id === id);
+      if (!due(build)) return false;
+      build!.nativeActivity!.waitingAt = build!.updatedAt = now();
+      build!.logs.push(`[native converter] ${message}`);
+      if (build!.logs.length > 2000) build!.logs.splice(0, build!.logs.length - 2000);
+      return true;
+    });
+    if (changed) this.nativeDiagnostic(id, message);
   }
 
   /** Explicit terminal-job cleanup shares the native-key execution table and
@@ -1116,7 +1173,7 @@ export class ImageCatalogCore {
   async publishNativeImageBinding(id: string, identity: IncusWorkerImageIdentity,
     capability: NativeImageBinding['capability'], validateAuthority: () => Promise<void>): Promise<NativeImageBinding> {
     identity = validateIncusImageIdentity(identity);
-    return this.mutate(async () => {
+    const binding = await this.mutate(async () => {
       await validateAuthority();
       const build = this.nativeBuild(id), state = build.nativeDerivation;
       if (!state.converter?.removed || !state.converter.incarnation || state.converter.pending || state.imageImport?.pending !== false ||
@@ -1133,6 +1190,8 @@ export class ImageCatalogCore {
       build.outcome = 'ready'; build.completedAt = build.updatedAt = now();
       return structuredClone(binding);
     });
+    this.nativeDiagnostic(id, 'Native image preparation completed and published; worker startup is a separate operation.');
+    return binding;
   }
 
   /** Parent reuses the existing per-definition execution table for identical
@@ -1153,6 +1212,7 @@ export class ImageCatalogCore {
             if (build.logs.length > 2000) build.logs.splice(0, build.logs.length - 2000);
             build.outcome = 'build-failed'; build.error = 'Native image conversion failed; exact acknowledged authority is retained.';
             build.completedAt = build.updatedAt = now(); } });
+        this.nativeDiagnostic(id, 'Native image preparation failed; exact acknowledged authority is retained and recovery may be required.', 'warn');
         throw error;
       }
     });
@@ -3353,6 +3413,21 @@ function normalizeCompatibility(
       : {}),
   };
 }
+function normalizeNativeActivity(build: any): ImageBuild['nativeActivity'] {
+  if (!build?.nativeDerivation || build.nativeActivity === undefined) return undefined;
+  const activity = build.nativeActivity;
+  const timestamp = (value: unknown) => typeof value === 'string' && value.length === 24 &&
+    Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+  if (!activity || activity.progressMode !== 'indeterminate' || !NATIVE_IMAGE_PHASES.includes(activity.phase) ||
+      !timestamp(activity.phaseStartedAt) || activity.waitingAt !== undefined &&
+        (!timestamp(activity.waitingAt) || activity.waitingAt < activity.phaseStartedAt)) {
+    console.warn('[image-builder] Malformed native activity discarded; exact job authority is retained and status recovery continues.');
+    return undefined;
+  }
+  return { progressMode: 'indeterminate', phase: activity.phase, phaseStartedAt: activity.phaseStartedAt,
+    ...(activity.waitingAt ? { waitingAt: activity.waitingAt } : {}) };
+}
+
 function normalizeState(value: any): State {
   const definitions = Array.isArray(value?.definitions)
     ? value.definitions
@@ -3400,6 +3475,7 @@ function normalizeState(value: any): State {
   const builds: ImageBuild[] = Array.isArray(value?.builds)
     ? value.builds.map((build: any) => ({
         ...build,
+        nativeActivity: normalizeNativeActivity(build),
         operation:
           build?.operation === "validation" ||
           build?.operation === "test-worker"
