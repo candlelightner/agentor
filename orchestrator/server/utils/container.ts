@@ -465,6 +465,7 @@ export async function removeFailedImportedImage(
 
 export class ContainerManager {
   private stoppedIntent = new Set<string>();
+  private intentVersions = new Map<string, number>();
   private recoveryPaused = new Set<string>();
   private managedNetworks?: ManagedNetworkManager;
   /** Restart-persistent ownership handles for custom environments created
@@ -3699,6 +3700,7 @@ for p in sys.argv[1:]:
     assertOrdinaryWorkerIdentity(id, info.userId);
     if (desired !== "running" && desired !== "stopped") throw Object.assign(new Error("Invalid desired state"), { statusCode: 400 });
     await this.assertOwnerExists(info.userId);
+    this.intentVersions.set(id, (this.intentVersions.get(id) ?? 0) + 1);
     const wasStopped = this.stoppedIntent.has(id);
     if (desired === "stopped") this.stoppedIntent.add(id);
     else this.stoppedIntent.delete(id);
@@ -3953,7 +3955,7 @@ for p in sys.argv[1:]:
       info.status = "starting";
       try {
         await this.incusRuntime.stop(info, incarnation);
-        await this.incusRuntime.start(options, incarnation);
+        await this.incusRuntime.start(options, incarnation, { assertStartAllowed: () => this.assertStartAllowed(id) });
         info.status = "running";
         info.updatedAt = new Date().toISOString();
         info.runtimeDiagnostic = undefined;
@@ -5210,23 +5212,30 @@ for p in sys.argv[1:]:
   }
 
   async unarchive(userId: string, id: string, imageResolution?: WorkerImportOptions['imageResolution'], automatic = false): Promise<ContainerInfo> {
+    const intentVersion = automatic ? undefined : this.intentVersions.get(id) ?? 0;
     return withOwnerWorkerLifecycleMutation(userId, id, async () => {
       await this.assertOwnerExists(userId);
       const record = this.workerStore?.get(userId, id);
       if (automatic && record?.desiredRuntimeStatus !== "running") throw new Error("Automatic unarchive cancelled by stopped intent");
-      if (!automatic && record?.status === "archived") {
-        this.stoppedIntent.delete(id);
-        await this.workerStore!.setDesiredRuntimeStatus(userId, id, "running", true);
-        await this.workerStore!.updateRecovery(userId, id, { reset: true });
-      }
-      return this.unarchiveUnlocked(userId, id, imageResolution);
+      return this.unarchiveUnlocked(userId, id, imageResolution, intentVersion);
     });
+  }
+
+  private async resetUnarchiveRetry(userId: string, id: string, version: number) {
+    if ((this.intentVersions.get(id) ?? 0) !== version) {
+      useLogger().warn(`[container] unarchive cancelled for ${id}; newer operator intent retained, compute unchanged`);
+      throw Object.assign(new Error('Unarchive cancelled by a newer desired-state request'), { statusCode: 409 });
+    }
+    this.stoppedIntent.delete(id);
+    await this.workerStore!.setDesiredRuntimeStatus(userId, id, 'running', true);
+    await this.workerStore!.updateRecovery(userId, id, { reset: true });
   }
 
   private async unarchiveUnlocked(
     userId: string,
     id: string,
     imageResolution?: WorkerImportOptions['imageResolution'],
+    operatorVersion?: number,
   ): Promise<ContainerInfo> {
     assertOrdinaryWorkerIdentity(id, userId);
     this.assertMigrationSettled({ id, userId });
@@ -5253,7 +5262,7 @@ for p in sys.argv[1:]:
       const containerName = this.buildContainerName(worker.id);
       return this.recreateIncusWorker({ ...this.workerRuntimeRecord(worker), runtimeKind: 'incus-vm',
         containerName, containerId: containerName, imageName: this.config.incusWorkerImage,
-        imageId: worker.imageDigest ?? '', status: 'creating' });
+        imageId: worker.imageDigest ?? '', status: 'creating' }, undefined, false, operatorVersion);
     }
     const authorizedMounts = await this.resolveAuthorizedHostMounts(
       worker.userId,
@@ -5356,6 +5365,7 @@ for p in sys.argv[1:]:
     this.containers.set(worker.id, containerInfo);
 
     try {
+      if (operatorVersion !== undefined) await this.resetUnarchiveRetry(worker.userId, worker.id, operatorVersion);
       const container = await this.dockerService.createWorkerContainer({
         userId: worker.userId,
         id: worker.id,
@@ -5414,7 +5424,7 @@ for p in sys.argv[1:]:
 
   /** Replace disposable Incus compute. All desired inputs and canonical data
    * are checked before removing a running original; no Docker helper is used. */
-  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false): Promise<ContainerInfo> {
+  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false, operatorVersion?: number): Promise<ContainerInfo> {
     await this.incusRuntime.assertWorkspaceReplacementSettled(snapshot);
     if (!this.workerStore) throw new Error('WorkerStore is required for Incus recreation');
     const record = this.workerStore.get(snapshot.userId, snapshot.id);
@@ -5445,6 +5455,7 @@ for p in sys.argv[1:]:
     // recreation and unarchive retain their captured immutable VM recipe.
     const existing = await this.incusRuntime.preflightRecreation(options, applied && options.dockerEnabled, !!original && !applied);
     if (applied && !original) await assertMissing();
+    if (operatorVersion !== undefined) await this.resetUnarchiveRetry(info.userId, info.id, operatorVersion);
     const marker = { nonce: randomUUID(), originalIncarnation,
       replacementIncarnation: undefined as string | undefined };
     // Persist stopped intent before any destructive operation. The bounded
@@ -5482,7 +5493,7 @@ for p in sys.argv[1:]:
       marker.replacementIncarnation = incarnation;
       await this.workerStore.transitionIncusRecreation(info.userId, info.id,
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
-      await this.incusRuntime.start({ ...options, recreationNonce: marker.nonce }, incarnation);
+      await this.incusRuntime.start({ ...options, recreationNonce: marker.nonce }, incarnation, { assertStartAllowed: () => this.assertStartAllowed(info.id) });
       await (await import('./managed-volume-manager')).useManagedVolumeManager().markDeclared(info.userId, info.id, info.containerId);
       if (!applied) await useWorkerConfigStore().markApplied(info.userId, info.id,
         this.appliedIncusBootstrap(options, info), options.configurationRevision);

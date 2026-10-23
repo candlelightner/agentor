@@ -1646,3 +1646,14 @@ test('emergency stop accepts intent without bypassing late native settlement', a
     expect(calls.filter(value => value === 'failed-start')).toHaveLength(3);
   });
 });
+
+test('a queued unarchive cannot reset a newer operator intent or recovery budget', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    await manager.setRecovery(info.id, 1);
+    await manager.setDesiredState(info.id, 'stopped');
+    const before = store.get(info.userId, info.id);
+    await expect((manager as any).resetUnarchiveRetry(info.userId, info.id, 0)).rejects.toMatchObject({ statusCode: 409 });
+    expect(store.get(info.userId, info.id)).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+});
