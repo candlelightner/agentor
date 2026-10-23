@@ -248,6 +248,7 @@ export interface ContainerInfo extends UserOwnedResource {
   status: ContainerStatus;
   /** Durable operator intent, distinct from an unreliable Docker observation. */
   desiredRuntimeStatus?: "running" | "stopped";
+  recovery?: import("./worker-recovery").WorkerRecoveryState;
   /** Safe, value-free explanation when the runtime cannot be verified. */
   runtimeDiagnostic?: WorkerRuntimeDiagnostic;
   repos?: RepoConfig[];

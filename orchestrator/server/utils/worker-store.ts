@@ -1,3 +1,4 @@
+import { recoveryState, validateRecoveryMaxRetries, type WorkerRecoveryState } from "../../shared/worker-recovery";
 import { UserScopedJsonStore } from "./user-scoped-store";
 import type {
   RepoConfig,
@@ -60,6 +61,7 @@ export interface WorkerRecord extends UserOwnedResource {
   /** Desired runtime state survives daemon/orchestrator restarts. Legacy
    * records are migrated from the first successfully verified observation. */
   desiredRuntimeStatus?: "running" | "stopped";
+  recovery?: WorkerRecoveryState;
   archivedAt?: string;
   /** Internal fail-closed marker: Docker is already gone, but permanent
    * resource cleanup must be retried. Such a record cannot be unarchived. */
@@ -108,6 +110,7 @@ export interface WorkerRecord extends UserOwnedResource {
 
 export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   private initialization?: Promise<void>;
+  private operatorStops = new Set<string>();
 
   /** Bootstrap this store once. Repeated live reads must not reload another
    * owner's in-flight lifecycle state from its JSON representation (which
@@ -123,7 +126,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   }
 
   constructor(dataDir: string) {
-    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); assertCpuResize(w); return w.id; });
+    super(dataDir, "workers.json", (w) => { assertImportIncompleteMarker(w); assertIncusMigration(w); assertCpuResize(w); recoveryState(w.recovery); return w.id; });
   }
 
   override get(userId: string, key: string): WorkerRecord | undefined {
@@ -203,6 +206,7 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
           normalizeWorkerRuntimeKind(previous.runtimeKind) !== normalized.runtimeKind))
         throw new Error('Incus migration authority requires its exact guarded transition');
       if (!map) { map = new Map(); this.items.set(normalized.userId, map); }
+      if (this.operatorStops.has(normalized.userId + "/" + normalized.id)) normalized.desiredRuntimeStatus = "stopped";
       map.set(normalized.id, structuredClone(normalized));
       try { await this.persistUser(normalized.userId); }
       catch (error) {
@@ -298,6 +302,10 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
   private async persistMigration(userId: string, id: string, map: Map<string, WorkerRecord>, previous: WorkerRecord,
     candidate: WorkerRecord): Promise<WorkerRecord> {
     const next = { ...candidate, updatedAt: new Date().toISOString() };
+    if (this.operatorStops.has(userId + "/" + id)) {
+      if (next.desiredRuntimeStatus === "running") this.storeLogger().warn('[worker-store] late runtime update retained operator stopped intent; startup remains blocked');
+      next.desiredRuntimeStatus = "stopped";
+    }
     assertImportIncompleteMarker(next); assertIncusMigration(next);
     map.set(id, structuredClone(next));
     try { await this.persistUser(userId); }
@@ -377,15 +385,39 @@ export class WorkerStore extends UserScopedJsonStore<string, WorkerRecord> {
     });
   }
 
+  async updateRecovery(userId: string, id: string, change: { maxRetries?: unknown; reset?: boolean; attempt?: boolean; failure?: WorkerRecoveryState["lastFailure"] }): Promise<WorkerRecoveryState & { claimed?: boolean }> {
+    return this.withUserMutation(userId, async () => {
+      const map = this.items.get(userId), current = map?.get(id);
+      if (!map || !current) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+      const recovery = recoveryState(current.recovery);
+      if (change.maxRetries !== undefined) recovery.maxRetries = validateRecoveryMaxRetries(change.maxRetries);
+      if (change.reset) { recovery.attempts = 0; delete recovery.lastFailure; }
+      if (change.attempt) {
+        if (current.desiredRuntimeStatus !== "running" || recovery.attempts >= recovery.maxRetries) return recovery;
+        recovery.attempts++;
+      }
+      if (change.failure) recovery.lastFailure = change.failure;
+      await this.persistMigration(userId, id, map, current, { ...current, recovery });
+      return { ...recovery, ...(change.attempt ? { claimed: true } : {}) };
+    });
+  }
+
   async setDesiredRuntimeStatus(
     userId: string,
     id: string,
     desiredRuntimeStatus: "running" | "stopped",
+    operatorIntent = false,
   ): Promise<WorkerRecord> {
     return this.withUserMutation(userId, async () => {
       const map = this.items.get(userId), current = map?.get(id);
       if (!map || !current) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
-      return this.persistMigration(userId, id, map, current, { ...current, desiredRuntimeStatus });
+      const key = userId + "/" + id, stopped = this.operatorStops.has(key);
+      if (operatorIntent) {
+        if (desiredRuntimeStatus === "stopped") this.operatorStops.add(key);
+        else this.operatorStops.delete(key);
+      }
+      try { return await this.persistMigration(userId, id, map, current, { ...current, desiredRuntimeStatus }); }
+      catch (error) { if (stopped) this.operatorStops.add(key); else this.operatorStops.delete(key); throw error; }
     });
   }
 

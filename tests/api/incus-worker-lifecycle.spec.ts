@@ -1576,19 +1576,21 @@ test('emergency stop reaches captured native runtime even with stale stopped hea
   });
 });
 
-test('emergency stop rejects a pending lifecycle request promptly and retains its fence', async () => {
-  await fixture(async (manager, _store, calls, info) => {
+test('emergency stop saves intent during pending lifecycle work and confirms stop after settlement', async () => {
+  await fixture(async (manager, store, calls, info) => {
     let release!: () => void, admitted!: () => void;
     const entered = new Promise<void>(resolve => { admitted = resolve; });
     const settlement = new Promise<void>(resolve => { release = resolve; });
-    const mutation = withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => {
-      admitted(); await settlement;
-    });
+    (manager as any).incusRuntime.stop = async () => { calls.push('forced-stop'); };
+    const mutation = withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => { admitted(); await settlement; });
+    await entered;
+    const stopping = manager.emergencyStop(info.id);
     try {
-      await entered;
-      await expect(manager.emergencyStop(info.id)).rejects.toMatchObject({ statusCode: 409 });
+      await expect.poll(() => store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('stopped');
       expect(calls).toEqual([]); expect(isWorkerLifecycleMutationPending(info.id)).toBe(true);
-    } finally { release(); await mutation; }
+      await expect((manager as any).persistDesiredRuntimeStatus(info, 'running')).rejects.toMatchObject({ code: 'WORKER_STOP_REQUESTED' });
+    } finally { release(); await mutation; await stopping; }
+    expect(calls).toEqual(['forced-stop']); expect(info.status).toBe('stopped');
   });
 });
 
@@ -1608,15 +1610,50 @@ test('ordinary Docker emergency stop dispatches SIGKILL without graceful stop an
   });
 });
 
-test('emergency stop cannot bypass a timed-out request whose native mutation has not settled', async () => {
-  await fixture(async (manager, _store, calls, info) => {
+test('emergency stop accepts intent without bypassing late native settlement', async () => {
+  await fixture(async (manager, store, calls, info) => {
     let release!: () => void;
     const settlement = new Promise<void>(resolve => { release = resolve; });
     const error = Object.assign(Error('request timed out'), { [operationSettlement]: settlement });
+    (manager as any).incusRuntime.stop = async () => { calls.push('forced-stop'); };
+    await expect(withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => { throw error; })).rejects.toThrow('timed out');
+    const stopping = manager.emergencyStop(info.id);
     try {
-      await expect(withOwnerWorkerLifecycleMutation(info.userId, info.id, async () => { throw error; })).rejects.toThrow('timed out');
-      await expect(manager.emergencyStop(info.id)).rejects.toMatchObject({ statusCode: 409 });
+      await expect.poll(() => store.get(info.userId, info.id)?.desiredRuntimeStatus).toBe('stopped');
       expect(isWorkerLifecycleMutationPending(info.id)).toBe(true); expect(calls).toEqual([]);
-    } finally { release(); await settlement; }
+    } finally { release(); await stopping; }
+    expect(calls).toEqual(['forced-stop']);
+  });
+});
+
+ test('native startup failures exhaust a durable configurable retry budget without promoting readiness', async () => {
+  await reconciliationFixture(async (manager, store, calls, info, state) => {
+    state.status = 'Stopped'; state.provisioned = false; state.serviceReady = false;
+    await manager.setRecovery(info.id, 2);
+    (manager as any).incusRuntime.start = async () => { calls.push('failed-start'); throw new Error('PRIVATE-STDERR-SENTINEL'); };
+    for (let i = 0; i < 5; i++) await manager.reconcileIncusWorkers();
+    expect(calls.filter(value => value === 'failed-start')).toHaveLength(2);
+    expect(manager.getRecovery(info.id)).toMatchObject({ maxRetries: 2, attempts: 2, paused: true });
+    expect(info.status).not.toBe('running');
+    const reloaded = new WorkerStore((store as any).dataDir); await reloaded.init();
+    expect(reloaded.get(info.userId, info.id)?.recovery).toMatchObject({ attempts: 2, maxRetries: 2 });
+    expect(JSON.stringify(reloaded.get(info.userId, info.id)?.recovery)).not.toContain('PRIVATE-STDERR-SENTINEL');
+    await manager.setDesiredState(info.id, 'stopped');
+    await manager.reconcileIncusWorkers();
+    expect(calls.filter(value => value === 'failed-start')).toHaveLength(2);
+    await manager.setDesiredState(info.id, 'running');
+    await manager.reconcileIncusWorkers();
+    expect(calls.filter(value => value === 'failed-start')).toHaveLength(3);
+  });
+});
+
+test('a queued unarchive cannot reset a newer operator intent or recovery budget', async () => {
+  await fixture(async (manager, store, calls, info) => {
+    await manager.setRecovery(info.id, 1);
+    await manager.setDesiredState(info.id, 'stopped');
+    const before = store.get(info.userId, info.id);
+    await expect((manager as any).resetUnarchiveRetry(info.userId, info.id, 0)).rejects.toMatchObject({ statusCode: 409 });
+    expect(store.get(info.userId, info.id)).toEqual(before);
+    expect(calls).toEqual([]);
   });
 });

@@ -1,3 +1,5 @@
+import { recoveryState, validateRecoveryMaxRetries, UNKNOWN_STATE_WARNING } from "../../shared/worker-recovery";
+import { workerStartupFailure } from "./worker-startup-error";
 import { MANAGED_KILO_PARENT } from './managed-volume-kilo-parent';
 import { randomUUID } from "node:crypto";
 import Docker from 'dockerode';
@@ -462,6 +464,9 @@ export async function removeFailedImportedImage(
 }
 
 export class ContainerManager {
+  private stoppedIntent = new Set<string>();
+  private intentVersions = new Map<string, number>();
+  private recoveryPaused = new Set<string>();
   private managedNetworks?: ManagedNetworkManager;
   /** Restart-persistent ownership handles for custom environments created
    * implicitly by imports. */
@@ -581,16 +586,20 @@ export class ContainerManager {
   private async persistDesiredRuntimeStatus(
     info: ContainerInfo,
     desired: "running" | "stopped",
+    operatorIntent = false,
   ): Promise<void> {
-    info.desiredRuntimeStatus = desired;
-    info.updatedAt = new Date().toISOString();
+    if (desired === "running" && this.stoppedIntent.has(info.id))
+      throw Object.assign(new Error("Start cancelled by a newer stop request; stopped intent retained"), { code: "WORKER_STOP_REQUESTED", statusCode: 409 });
     const record = this.workerStore?.get(info.userId, info.id);
     if (record)
       await this.workerStore!.setDesiredRuntimeStatus(
         info.userId,
         info.id,
         desired,
+        operatorIntent,
       );
+    info.desiredRuntimeStatus = desired;
+    info.updatedAt = new Date().toISOString();
   }
 
   private markRuntimeUnknown(
@@ -604,7 +613,7 @@ export class ContainerManager {
       code: (error as { code?: string })?.code || "WORKER_RUNTIME_UNRESPONSIVE",
       operation,
       message:
-        "Agentor could not verify the worker runtime. Retry the operation or use managed recovery; persistent volumes were not changed.",
+        workerStartupFailure(error).message + ". Retry the operation or inspect recovery status; persistent volumes were not changed.",
       retryable: true,
       observedAt: info.updatedAt,
     };
@@ -2087,7 +2096,10 @@ export class ContainerManager {
       }
       return info;
     }
-    const migration = this.workerStore?.get(info.userId, info.id)?.incusMigration;
+    const record = this.workerStore?.get(info.userId, info.id);
+    info.recovery = record?.recovery;
+    if (record?.desiredRuntimeStatus) info.desiredRuntimeStatus = record.desiredRuntimeStatus;
+    const migration = record?.incusMigration;
     return migration && migration.phase !== 'retained' ? { ...info, status: 'error', runtimeDiagnostic: {
       code: 'WORKER_MIGRATION_RECOVERY_REQUIRED',
       message: 'Migration is incomplete; original source and destination are retained for explicit administrator recovery',
@@ -2752,7 +2764,7 @@ export class ContainerManager {
         marker.replacementIncarnation = incarnation;
         await this.workerStore.transitionIncusRecreation(userId, id,
           { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
-        await this.incusRuntime.start(options, incarnation);
+        await this.incusRuntime.start(options, incarnation, { assertStartAllowed: () => this.assertStartAllowed(id) });
         appliedBootstrap = this.appliedIncusBootstrap(options, containerInfo);
       } else {
         const container = await this.dockerService.createWorkerContainer(options);
@@ -3682,10 +3694,95 @@ for p in sys.argv[1:]:
     );
   }
 
+  async setDesiredState(id: string, desired: "running" | "stopped") {
+    const info = this.containers.get(id);
+    if (!info) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    assertOrdinaryWorkerIdentity(id, info.userId);
+    if (desired !== "running" && desired !== "stopped") throw Object.assign(new Error("Invalid desired state"), { statusCode: 400 });
+    await this.assertOwnerExists(info.userId);
+    this.intentVersions.set(id, (this.intentVersions.get(id) ?? 0) + 1);
+    const wasStopped = this.stoppedIntent.has(id);
+    if (desired === "stopped") this.stoppedIntent.add(id);
+    else this.stoppedIntent.delete(id);
+    try { await this.persistDesiredRuntimeStatus(info, desired, true); }
+    catch (error) {
+      if (desired === "running" && wasStopped) this.stoppedIntent.add(id);
+      useLogger().error(`[container] desired state persistence failed for ${id}; runtime unchanged, operator retry required`);
+      throw error;
+    }
+    if (desired === "running") {
+      await this.workerStore?.updateRecovery(info.userId, id, { reset: true });
+      this.recoveryPaused.delete(id);
+    }
+    useLogger().info(`[container] desired state ${desired} accepted for ${id}; observed ${info.status}, runtime confirmation pending`);
+    return { workerId: id, desiredRuntimeStatus: desired, status: info.status, warning: UNKNOWN_STATE_WARNING };
+  }
+
+  getRecovery(id: string) {
+    const info = this.containers.get(id);
+    if (!info) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    assertOrdinaryWorkerIdentity(id, info.userId);
+    const recovery = recoveryState(this.workerStore?.get(info.userId, id)?.recovery);
+    return { ...recovery, paused: recovery.attempts >= recovery.maxRetries, desiredRuntimeStatus: info.desiredRuntimeStatus };
+  }
+
+  async setRecovery(id: string, maxRetries: unknown) {
+    const info = this.containers.get(id);
+    if (!info || !this.workerStore) throw Object.assign(new Error("Worker not found"), { statusCode: 404 });
+    assertOrdinaryWorkerIdentity(id, info.userId);
+    await this.workerStore.updateRecovery(info.userId, id, { maxRetries: validateRecoveryMaxRetries(maxRetries) });
+    useLogger().info(`[container] recovery retry limit updated for ${id}; attempts retained, no runtime action requested`);
+    return this.getRecovery(id);
+  }
+
+  private assertStartAllowed(id: string) {
+    if (this.stoppedIntent.has(id)) throw Object.assign(new Error("Start cancelled by a newer stop request; stopped intent retained"), { code: "WORKER_STOP_REQUESTED", statusCode: 409 });
+  }
+
+  private async automaticRecovery(info: Pick<ContainerInfo, "id" | "userId">, operation: () => Promise<unknown>) {
+    const current = this.workerStore?.get(info.userId, info.id);
+    if (!current || current.desiredRuntimeStatus !== "running" || this.stoppedIntent.has(info.id)) return;
+    const recovery = recoveryState(current.recovery);
+    if (recovery.attempts >= recovery.maxRetries) {
+      if (!this.recoveryPaused.has(info.id)) {
+        this.recoveryPaused.add(info.id);
+        useLogger().warn(`[container] automatic recovery paused for ${info.id}: ${recovery.attempts}/${recovery.maxRetries} retries used; runtime unchanged, persistent data retained; explicit Start/Retry required`);
+      }
+      return;
+    }
+    this.recoveryPaused.delete(info.id);
+    const attempt = await this.workerStore!.updateRecovery(info.userId, info.id, { attempt: true });
+    if (!attempt.claimed || this.workerStore?.get(info.userId, info.id)?.desiredRuntimeStatus !== "running") return;
+    useLogger().info(`[container] automatic recovery ${attempt.attempts}/${attempt.maxRetries} starting for ${info.id}`);
+    try {
+      await operation();
+      await this.workerStore!.updateRecovery(info.userId, info.id, { reset: true });
+      useLogger().info(`[container] automatic recovery completed for ${info.id}; retry budget reset`);
+      return true;
+    } catch (error) {
+      const failure = workerStartupFailure(error);
+      await this.workerStore!.updateRecovery(info.userId, info.id, { failure });
+      useLogger().warn(`[container] automatic recovery ${attempt.attempts}/${attempt.maxRetries} failed for ${info.id}: ${failure.message}; ${attempt.attempts >= attempt.maxRetries ? "automatic recovery paused; explicit Start/Retry required" : "retry pending"}; persistent data retained`);
+      throw error;
+    }
+  }
+
   async emergencyStop(id: string): Promise<void> {
-    if (isWorkerLifecycleMutationPending(id))
-      throw Object.assign(new Error("Worker lifecycle operation is still pending; refresh status before retrying emergency stop"), { statusCode: 409 });
-    return this.withExistingWorkerLifecycleMutation(id, () => this.stopUnlocked(id, false, true), true);
+    await this.setDesiredState(id, "stopped");
+    const info = this.containers.get(id)!;
+    useLogger().warn(`[container] emergency stop accepted for ${id}; ${isWorkerLifecycleMutationPending(id) ? "waiting for in-flight runtime mutation to settle" : "confirming runtime shutdown"}`);
+    const operation = withOwnerWorkerLifecycleMutation(info.userId, id, async () => {
+      await this.assertOwnerExists(info.userId);
+      const current = this.containers.get(id);
+      if (!current || current.userId !== info.userId) throw new Error("Worker identity changed during emergency stop");
+      await this.stopUnlocked(id, false, true);
+      useLogger().info(`[container] emergency stop confirmed for ${id}; persistent data retained`);
+    });
+    try { await withOperationDeadline(operation, 15_000, "Worker emergency stop; stopped intent retained, shutdown confirmation pending"); }
+    catch (error) {
+      useLogger().warn(`[container] emergency stop unconfirmed for ${id}; stopped intent retained, runtime settlement or operator recovery still required`);
+      throw error;
+    }
   }
 
   /** Apply a lifecycle action to all ordinary workers directly contained in a
@@ -3790,8 +3887,9 @@ for p in sys.argv[1:]:
   private async stopUnlocked(id: string, verifyRevokedIncus = false, force = false): Promise<void> {
     const info = this.containers.get(id);
     if (!info) throw new Error("Container not found");
-    this.assertOrdinaryMutation(info, true);
-    if (info.runtimeKind === 'incus-vm') {
+    if (force) assertOrdinaryWorkerIdentity(info.id, info.userId);
+    else this.assertOrdinaryMutation(info, true);
+    if (!force && info.runtimeKind === 'incus-vm') {
       const { useManagedVolumeManager } = await import('./managed-volume-manager');
       const volumes = useManagedVolumeManager(); await volumes.init();
       volumes.assertLiveRecoveryResolved(info.userId, info.id);
@@ -3821,7 +3919,12 @@ for p in sys.argv[1:]:
     useLogger().info(`[container] stopped ${info.containerName}`);
   }
 
-  async restart(id: string): Promise<void> {
+  async restart(id: string, automatic = false): Promise<void> {
+    if (!automatic) {
+      const info = this.containers.get(id);
+      if (info) this.assertOrdinaryMutation(info);
+      await this.setDesiredState(id, "running");
+    }
     return this.withExistingWorkerLifecycleMutation(id, () =>
       this.restartUnlocked(id),
     );
@@ -3852,7 +3955,7 @@ for p in sys.argv[1:]:
       info.status = "starting";
       try {
         await this.incusRuntime.stop(info, incarnation);
-        await this.incusRuntime.start(options, incarnation);
+        await this.incusRuntime.start(options, incarnation, { assertStartAllowed: () => this.assertStartAllowed(id) });
         info.status = "running";
         info.updatedAt = new Date().toISOString();
         info.runtimeDiagnostic = undefined;
@@ -3979,6 +4082,9 @@ for p in sys.argv[1:]:
    * restart, console, or stats operations. Only disposable compute is replaced;
    * every persistent mount is verified first and no volume is ever removed. */
   async recover(id: string): Promise<ContainerInfo> {
+    const info = this.containers.get(id);
+    if (info) this.assertOrdinaryMutation(info);
+    await this.setDesiredState(id, "running");
     return this.withExistingWorkerLifecycleMutation(id, () =>
       this.recoverUnlocked(id),
     );
@@ -4744,6 +4850,9 @@ for p in sys.argv[1:]:
   }
 
   async rebuild(id: string): Promise<ContainerInfo> {
+    const info = this.containers.get(id);
+    if (info) this.assertOrdinaryMutation(info);
+    await this.setDesiredState(id, "running");
     return this.withExistingWorkerLifecycleMutation(id, () =>
       this.rebuildUnlocked(id),
     );
@@ -5102,17 +5211,31 @@ for p in sys.argv[1:]:
     return containerInfo;
   }
 
-  async unarchive(userId: string, id: string, imageResolution?: WorkerImportOptions['imageResolution']): Promise<ContainerInfo> {
+  async unarchive(userId: string, id: string, imageResolution?: WorkerImportOptions['imageResolution'], automatic = false): Promise<ContainerInfo> {
+    const intentVersion = automatic ? undefined : this.intentVersions.get(id) ?? 0;
     return withOwnerWorkerLifecycleMutation(userId, id, async () => {
       await this.assertOwnerExists(userId);
-      return this.unarchiveUnlocked(userId, id, imageResolution);
+      const record = this.workerStore?.get(userId, id);
+      if (automatic && record?.desiredRuntimeStatus !== "running") throw new Error("Automatic unarchive cancelled by stopped intent");
+      return this.unarchiveUnlocked(userId, id, imageResolution, intentVersion);
     });
+  }
+
+  private async resetUnarchiveRetry(userId: string, id: string, version: number) {
+    if ((this.intentVersions.get(id) ?? 0) !== version) {
+      useLogger().warn(`[container] unarchive cancelled for ${id}; newer operator intent retained, compute unchanged`);
+      throw Object.assign(new Error('Unarchive cancelled by a newer desired-state request'), { statusCode: 409 });
+    }
+    this.stoppedIntent.delete(id);
+    await this.workerStore!.setDesiredRuntimeStatus(userId, id, 'running', true);
+    await this.workerStore!.updateRecovery(userId, id, { reset: true });
   }
 
   private async unarchiveUnlocked(
     userId: string,
     id: string,
     imageResolution?: WorkerImportOptions['imageResolution'],
+    operatorVersion?: number,
   ): Promise<ContainerInfo> {
     assertOrdinaryWorkerIdentity(id, userId);
     this.assertMigrationSettled({ id, userId });
@@ -5139,7 +5262,7 @@ for p in sys.argv[1:]:
       const containerName = this.buildContainerName(worker.id);
       return this.recreateIncusWorker({ ...this.workerRuntimeRecord(worker), runtimeKind: 'incus-vm',
         containerName, containerId: containerName, imageName: this.config.incusWorkerImage,
-        imageId: worker.imageDigest ?? '', status: 'creating' });
+        imageId: worker.imageDigest ?? '', status: 'creating' }, undefined, false, operatorVersion);
     }
     const authorizedMounts = await this.resolveAuthorizedHostMounts(
       worker.userId,
@@ -5242,6 +5365,7 @@ for p in sys.argv[1:]:
     this.containers.set(worker.id, containerInfo);
 
     try {
+      if (operatorVersion !== undefined) await this.resetUnarchiveRetry(worker.userId, worker.id, operatorVersion);
       const container = await this.dockerService.createWorkerContainer({
         userId: worker.userId,
         id: worker.id,
@@ -5300,7 +5424,7 @@ for p in sys.argv[1:]:
 
   /** Replace disposable Incus compute. All desired inputs and canonical data
    * are checked before removing a running original; no Docker helper is used. */
-  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false): Promise<ContainerInfo> {
+  private async recreateIncusWorker(snapshot: ContainerInfo, original?: ContainerInfo, applied = false, operatorVersion?: number): Promise<ContainerInfo> {
     await this.incusRuntime.assertWorkspaceReplacementSettled(snapshot);
     if (!this.workerStore) throw new Error('WorkerStore is required for Incus recreation');
     const record = this.workerStore.get(snapshot.userId, snapshot.id);
@@ -5331,6 +5455,7 @@ for p in sys.argv[1:]:
     // recreation and unarchive retain their captured immutable VM recipe.
     const existing = await this.incusRuntime.preflightRecreation(options, applied && options.dockerEnabled, !!original && !applied);
     if (applied && !original) await assertMissing();
+    if (operatorVersion !== undefined) await this.resetUnarchiveRetry(info.userId, info.id, operatorVersion);
     const marker = { nonce: randomUUID(), originalIncarnation,
       replacementIncarnation: undefined as string | undefined };
     // Persist stopped intent before any destructive operation. The bounded
@@ -5368,7 +5493,7 @@ for p in sys.argv[1:]:
       marker.replacementIncarnation = incarnation;
       await this.workerStore.transitionIncusRecreation(info.userId, info.id,
         { status: 'active', desiredRuntimeStatus: 'stopped', incusRecreation: marker });
-      await this.incusRuntime.start({ ...options, recreationNonce: marker.nonce }, incarnation);
+      await this.incusRuntime.start({ ...options, recreationNonce: marker.nonce }, incarnation, { assertStartAllowed: () => this.assertStartAllowed(info.id) });
       await (await import('./managed-volume-manager')).useManagedVolumeManager().markDeclared(info.userId, info.id, info.containerId);
       if (!applied) await useWorkerConfigStore().markApplied(info.userId, info.id,
         this.appliedIncusBootstrap(options, info), options.configurationRevision);
@@ -7333,7 +7458,7 @@ for p in sys.argv[1:]:
           !runtime.running
         )
           // Failed observability probes must not restart a running worker.
-          await this.restart(info.id);
+          await this.automaticRecovery(info, () => this.restart(info.id, true));
         if (info.status === 'running')
           await this.refreshManagedNetworkHosts(info.id, info.containerId).catch(error => {
             // Optional peer-name configuration is not evidence that this
@@ -7354,7 +7479,7 @@ for p in sys.argv[1:]:
     // selected-path volumes, group identity, and plugin desired state remain
     // authoritative and are reattached/reconciled there.
     for (const worker of missingDesiredWorkers) {
-      await this.unarchive(worker.userId, worker.id).catch((error) =>
+      await this.automaticRecovery(worker, () => this.unarchive(worker.userId, worker.id, undefined, true)).catch((error) =>
         useLogger().warn(
           `[container] missing worker recreation deferred for ${worker.id}: ${(error as { code?: string })?.code || "runtime unavailable"}`,
         ),
@@ -7408,8 +7533,8 @@ for p in sys.argv[1:]:
                 this.get(record.id)?.containerId.startsWith('incus:')) return;
             await this.assertOwnerExists(record.userId);
             const name = this.buildContainerName(record.id);
-            await this.recreateIncusWorker({ ...this.workerRuntimeRecord(record), runtimeKind: 'incus-vm', containerName: name,
-              containerId: name, imageName: this.config.incusWorkerImage, imageId: record.imageDigest ?? '', status: 'unknown' }, undefined, true);
+            await this.automaticRecovery(record, () => this.recreateIncusWorker({ ...this.workerRuntimeRecord(record), runtimeKind: 'incus-vm', containerName: name,
+              containerId: name, imageName: this.config.incusWorkerImage, imageId: record.imageDigest ?? '', status: 'unknown' }, undefined, true));
           });
         } catch (error) {
           const current = this.get(snapshot.id), record = this.workerStore?.get(snapshot.userId, snapshot.id);
@@ -7452,6 +7577,7 @@ for p in sys.argv[1:]:
           const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
           if (!guest.provisioned || !guest.serviceReady) return true;
           info.status = 'running'; info.runtimeDiagnostic = undefined;
+          if (record.recovery?.attempts) await this.workerStore!.updateRecovery(info.userId, info.id, { reset: true });
           return this.managedNetworksNeedReconciliation(info);
         });
         if (!repair) {
@@ -7488,12 +7614,16 @@ for p in sys.argv[1:]:
             bootId = guest.bootId;
           } else if (instance.status !== 'Stopped') throw new Error('Incus guest is not ready for recovery');
           const options = await this.incusOptionsForWorker(info, true, info.containerId);
-          info.status = 'starting';
-          await this.incusRuntime.start(options, incarnation, { leaveRunningOnFailure: true });
-          const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
-          if (!guest.provisioned || !guest.serviceReady || (bootId && guest.bootId !== bootId))
-            throw new Error('Incus guest rebooted or remained unready during recovery; retry later');
-          info.status = 'running'; info.runtimeDiagnostic = undefined; info.updatedAt = new Date().toISOString();
+          const recovered = await this.automaticRecovery(info, async () => {
+            info.status = 'starting';
+            this.assertStartAllowed(info.id);
+            await this.incusRuntime.start(options, incarnation, { leaveRunningOnFailure: true, assertStartAllowed: () => this.assertStartAllowed(info.id) });
+            const guest = await this.incusRuntime.inspectGuestReadiness(info, incarnation);
+            if (!guest.provisioned || !guest.serviceReady || (bootId && guest.bootId !== bootId))
+              throw new Error('Incus guest rebooted or remained unready during recovery; retry later');
+            info.status = 'running'; info.runtimeDiagnostic = undefined; info.updatedAt = new Date().toISOString();
+          });
+          if (!recovered) return;
           useLogCollector().attach(info.containerName, info.containerId, 'worker', info.displayName).catch(() => {});
           await this.reconcileManagedNetworksForWorker(info);
           await this.reconcileWorkerPlugins(info);
@@ -7525,8 +7655,9 @@ for p in sys.argv[1:]:
       updatedAt: info.updatedAt,
       displayName: info.displayName,
       status: "active",
-      ...(info.desiredRuntimeStatus
-        ? { desiredRuntimeStatus: info.desiredRuntimeStatus }
+      recovery: this.workerStore?.get(info.userId, info.id)?.recovery,
+      ...((this.stoppedIntent.has(info.id) ? "stopped" : info.desiredRuntimeStatus)
+        ? { desiredRuntimeStatus: this.stoppedIntent.has(info.id) ? "stopped" : info.desiredRuntimeStatus }
         : {}),
       environmentId: info.environmentId,
       vcpuCount: info.vcpuCount,

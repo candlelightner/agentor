@@ -1556,9 +1556,12 @@ test('forced native stop sends no grace period and refuses a replaced incarnatio
   const calls: unknown[] = [];
   instance.status = 'Frozen';
   client.getInstanceState = async () => { throw Error('Emergency stop must not wait for guest telemetry'); };
-  client.stopInstance = async (...args: unknown[]) => { calls.push(args); };
+  client.stopInstance = async (...args: unknown[]) => { calls.push(args); instance.status = "Stopped"; };
   await runtime.stop(opts, uuid, 30, true);
   expect(calls).toEqual([[opts.containerName, { force: true, timeout: 0 }]]);
+  instance.status = 'Frozen';
+  client.stopInstance = async () => {};
+  await expect(runtime.stop(opts, uuid, 30, true)).rejects.toMatchObject({ statusCode: 503 });
   calls.length = 0;
   instance.config['volatile.uuid'] = randomUUID();
   await expect(runtime.stop(opts, uuid, 30, true)).rejects.toThrow();

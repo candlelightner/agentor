@@ -136,6 +136,8 @@ export default defineConfig({
     "api/worker-reconstruction.spec.ts",
     "api/worker-lifecycle-coordinator.spec.ts",
     "api/worker-emergency-stop.spec.ts",
+    "api/worker-recovery-controls.spec.ts",
+    "ui/worker-recovery-isolated.spec.ts",
     "api/admin-emergency-initialization.spec.ts",
     "api/incus-client.spec.ts",
     "api/incus-vcpu.spec.ts",

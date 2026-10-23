@@ -46,7 +46,7 @@ async function emergencyStop() {
     needsPassword.value = needsPassword.value || status === 423;
     error.value = status === 423
       ? 'Enter the worker lock password to confirm the emergency stop.'
-      : (cause?.data?.statusMessage || cause?.data?.message || 'The emergency stop has no confirmed outcome. Refresh worker status before retrying.');
+      : (cause?.data?.statusMessage || cause?.data?.message || 'Stopped state was requested, but shutdown is not confirmed. In-flight work may still be settling. Refresh status before retrying.');
     if (status !== 423) await refreshStatus();
     return;
   } finally {

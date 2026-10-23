@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { useContainerManager } from "./services";
+import { useContainerManager, useLogger } from "./services";
 import { withWorkerRuntimeSetup, withOwnerWorkerLifecycleMutation } from "./worker-lifecycle-coordinator";
 import { applyAdminNativePatch, validateAdminNativeState, type AdminNativeRuntimeIdentity,
   type AdminNativeMigration, type AdminNativeAcknowledge } from './admin-native-authority';
@@ -132,6 +132,8 @@ export class AdminWorkspaceStore {
   private unavailable = false;
   private runtime?: AdminWorkspaceRuntimeAdapter;
   private emergencyRuntime?: AdminWorkspaceEmergencyRuntime;
+  private stopRequested = false;
+  private stateWrites: Promise<void> = Promise.resolve();
   private identityMaterializer?: AdminWorkspaceIdentityMaterializer;
   private operationTail: Promise<void> = Promise.resolve();
   private pendingOperations = 0;
@@ -187,6 +189,7 @@ export class AdminWorkspaceStore {
     return this.loading;
   }
   private async save(record: Readonly<AdministrativeWorkspaceRecord>) {
+    if (this.stopRequested) record = { ...record, status: "stopped" };
     if (this.recordWriter) {
       await this.recordWriter(structuredClone(record));
       return;
@@ -198,8 +201,8 @@ export class AdminWorkspaceStore {
     });
     await rename(temp, this.path);
   }
-  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.pendingOperations) return Promise.reject(Object.assign(
+  private exclusive<T>(operation: () => Promise<T>, queue = false): Promise<T> {
+    if (this.pendingOperations && !queue) return Promise.reject(Object.assign(
       new Error('Administrative workspace operation is already in progress. Refresh status before retrying.'), { statusCode: 409 }));
     return withOperationDeadline(this.serialize(async () => {
       await this.init();
@@ -223,14 +226,22 @@ export class AdminWorkspaceStore {
   private async flushPendingCommit(operation: string) {
     if (!this.pendingCommit) return false;
     const pending = this.pendingCommit;
-    await this.save(pending.record);
-    this.record = structuredClone(pending.record);
+    await this.commit(pending.record);
     this.pendingCommit = undefined;
     return pending.operation === operation;
   }
-  private async commit(record: AdministrativeWorkspaceRecord) {
-    await this.save(record);
-    this.record = structuredClone(record);
+  private async commit(record: AdministrativeWorkspaceRecord, intentOnly = false) {
+    const write = this.stateWrites.then(async () => {
+      // Stop intent must merge with a late native receipt, never replace it with an older snapshot.
+      if (intentOnly) {
+        if (this.record?.id !== record.id) throw Object.assign(new Error("Administrative workspace identity changed"), { statusCode: 409 });
+        record = { ...this.record, status: "stopped", updatedAt: record.updatedAt };
+      }
+      await this.save(record);
+      this.record = structuredClone(this.stopRequested ? { ...record, status: "stopped" as const } : record);
+    });
+    this.stateWrites = write.catch(() => {});
+    return write;
   }
   private async commitExternal(
     operation: string,
@@ -252,6 +263,8 @@ export class AdminWorkspaceStore {
   }
   private nativeAcknowledge(record: AdministrativeWorkspaceRecord): AdminNativeAcknowledge {
     return async patch => {
+      if (this.stopRequested && patch.nativeRuntime?.pending?.kind === 'start' && !patch.nativeRuntime.pending.operation)
+        throw Object.assign(new Error('Administrative start cancelled by emergency stop; stopped intent retained'), { statusCode: 409 });
       if (applyAdminNativePatch(record, patch)) await this.commitExternal('native-runtime', record);
     };
   }
@@ -366,6 +379,15 @@ export class AdminWorkspaceStore {
   }
   async setStatus(status: "running" | "stopped", force = false, expectedId?: string) {
     const emergency = force && status === "stopped";
+    if (emergency) {
+      if (!this.runtime && !this.emergencyRuntime) this.requireRuntime();
+      await this.init();
+      if (!this.record || expectedId && this.record.id !== expectedId)
+        throw Object.assign(new Error("Administrative workspace identity is unavailable or changed"), { statusCode: this.record ? 409 : 404 });
+      this.stopRequested = true;
+      await this.commit({ ...this.record, status: "stopped", updatedAt: new Date().toISOString() }, true);
+      useLogger().warn(`[admin-workspace] emergency stop intent saved; ${this.pendingOperations ? "waiting for in-flight mutation settlement" : "shutdown confirmation pending"}`);
+    }
     const result = this.exclusive(async () => {
       const runtime = this.runtime ?? (emergency ? this.emergencyRuntime : undefined);
       if (!runtime) this.requireRuntime();
@@ -382,6 +404,7 @@ export class AdminWorkspaceStore {
       const candidate = structuredClone(this.record!);
       if (runtime) {
         if (status === "running") {
+          this.stopRequested = false;
           if (this.identityMaterializer)
             await this.identityMaterializer(
               structuredClone(candidate),
@@ -401,9 +424,12 @@ export class AdminWorkspaceStore {
       candidate.updatedAt = new Date().toISOString();
       if (runtime) await this.commitExternal(operation, candidate);
       else await this.commit(candidate);
+      if (emergency) useLogger().info('[admin-workspace] emergency stop confirmed; persistent data retained');
       return this.publicRecord(candidate);
-    });
-    return emergency ? withOperationDeadline(result, 15_000, "Administrative emergency stop") : result;
+    }, emergency);
+    if (!emergency) return result;
+    try { return await withOperationDeadline(result, 15_000, "Administrative emergency stop; stopped intent retained, shutdown confirmation pending"); }
+    catch (error) { useLogger().warn('[admin-workspace] emergency stop unconfirmed; stopped intent retained, recovery still required'); throw error; }
   }
   async rebuild(ownerId?: string) {
     return this.exclusive(async () => {

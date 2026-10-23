@@ -444,7 +444,8 @@ test("a failed secret bootstrap is recoverable by stop/start without rebuilding"
   );
   manager.setWorkerStore({
     get: () => record,
-    setDesiredRuntimeStatus: async () => record,
+    setDesiredRuntimeStatus: async (_owner: string, _id: string, desired: string) => { (record as any).desiredRuntimeStatus = desired; return record; },
+    updateRecovery: async (_owner: string, _id: string, change: any) => ({ maxRetries: 3, attempts: change.attempt ? 1 : 0, claimed: change.attempt }),
   } as any);
   // Production lifecycle entry points revalidate the owner through auth. This
   // focused unit test deliberately supplies only Docker/store doubles, so keep
@@ -587,7 +588,8 @@ function reconciliationFixture(running: boolean) {
     upsert: async () => undefined,
     listActive: () => [record],
     listArchived: () => [],
-    setDesiredRuntimeStatus: async () => record,
+    setDesiredRuntimeStatus: async (_owner: string, _id: string, desired: string) => { (record as any).desiredRuntimeStatus = desired; return record; },
+    updateRecovery: async (_owner: string, _id: string, change: any) => ({ maxRetries: 3, attempts: change.attempt ? 1 : 0, claimed: change.attempt }),
   } as any);
   const worker = {
     ...record, status: "running", containerId: "docker-worker-1",

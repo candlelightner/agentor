@@ -1,3 +1,4 @@
+import { useAdminWorkspaceStore } from "./admin-workspace-store";
 import { PREDEFINED_ENV_VAR_KEYS, type CreateContainerRequest, type UpdateContainerSettingsRequest } from "../../shared/types";
 import {
   useContainerManager,
@@ -130,6 +131,11 @@ export class ManagementWorkerDomain {
     const names: Array<[string, ManagementDomainTool["group"], string, Record<string, unknown>, Record<string, boolean | string>]> = [
       ["workers.create", "worker-lifecycle", "Create a worker for an explicit owner, optionally enrolling it directly in one of that owner's worker groups. Host mounts accept only centrally approved pathId references and default to read-only. workerSelfApiAccess is enforced immediately by the orchestrator.", { type:"object", required:["userId"], additionalProperties:false, properties:{ userId:{type:"string"}, displayName:{type:"string"}, environmentId:{type:"string"}, workerGroupId:{type:"string",description:"Optional direct worker-group membership. The group must belong to userId."}, workerSelfApiAccess:workerSelfApiAccessSchema(), imageDefinitionId:{type:"string"}, imageVersion:{type:"string"}, mounts:{type:"array",items:hostMountInputSchema}, hardwareDeviceIds:{type:"array",items:{type:"string",minLength:1}}, excludedGlobalEnvVarKeys:excludedEnvKeysSchema() } }, mutation],
       ["workers.update", "worker-lifecycle", "Update worker settings. workerSelfApiAccess takes effect immediately without restart or rebuild; protected workers require lockPassword.", workerUpdateInput(), mutation],
+      ["workers.recovery.get", "worker-lifecycle", "Read a worker's durable automatic recovery retry limit, attempt count and sanitized last failure.", objectWithWorker(), read],
+      ["workers.recovery.set", "worker-lifecycle", "Set maxRetries (0-100) for automatic recovery. Zero disables automatic retries. Does not reset attempts or start compute.", { type: "object", additionalProperties: false, required: ["workerId", "maxRetries"], properties: { workerId: { type: "string" }, maxRetries: { type: "integer", minimum: 0, maximum: 100 }, lockPassword: { type: "string", writeOnly: true } } }, mutation],
+      ["workers.desired-state.set", "worker-lifecycle", "Persist running/stopped intent even if observed state is unknown. Warning: intent does not confirm runtime state. Requires confirmed:true; explicit running intent resets automatic retry attempts.", { type: "object", additionalProperties: false, required: ["workerId", "desiredRuntimeStatus", "confirmed"], properties: { workerId: { type: "string" }, desiredRuntimeStatus: { type: "string", enum: ["running", "stopped"] }, confirmed: { type: "boolean", enum: [true] }, lockPassword: { type: "string", writeOnly: true } } }, mutation],
+      ["workers.emergency-stop", "worker-lifecycle", "Force-stop an ordinary worker, including unknown/pending lifecycle state. Stopped intent is saved before waiting for in-flight mutation settlement. Requires confirmed:true; reports success only after native shutdown confirmation.", confirmedWorkerInput(), { ...mutation, destructiveHint: true }],
+      ["admin-workspace.emergency-stop", "worker-lifecycle", "Platform administrator only: emergency-stop the exact platform administrative workspace without provisioning or requiring healthy readiness. Requires confirmed:true; saved stop intent does not confirm shutdown.", confirmedWorkerInput(), { ...mutation, destructiveHint: true }],
       ["workers.restart", "worker-lifecycle", "Restart a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.recover", "worker-lifecycle", "Recover an unresponsive worker through the bounded Agentor control plane. Persistent mounts are verified, only disposable compute is replaced, managed secrets are bootstrapped, and plugins are reconciled; protected workers require lockPassword.", objectWithWorker(), mutation],
       ["workers.rebuild", "worker-lifecycle", "Rebuild a worker; protected workers require lockPassword.", objectWithWorker(), mutation],
@@ -153,6 +159,7 @@ export class ManagementWorkerDomain {
       ["groups.admin-workspace.get", "groups", "Get and reconcile the persistent administrative workspace for a worker group; returns 404 if none was provisioned. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, read],
       ["groups.admin-workspace.provision", "groups", "Provision or return the one persistent trusted administrative workspace for a worker group. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["groups.admin-workspace.start", "groups", "Provision if needed, then start a worker-group administrative workspace. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
+      ["groups.admin-workspace.emergency-stop", "groups", "Emergency-stop an existing administrative workspace in an authorized group subtree, including unknown/pending lifecycle state. Requires confirmed:true; never provisions a missing workspace.", { ...groupAdminLifecycleInput, required: ["groupId", "confirmed"], properties: { ...groupAdminLifecycleInput.properties, confirmed: { type: "boolean", enum: [true] }, lockPassword: { type: "string", writeOnly: true } } }, { ...mutation, destructiveHint: true }],
       ["groups.admin-workspace.stop", "groups", "Provision if needed, then stop a worker-group administrative workspace without deleting its workspace data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["groups.admin-workspace.rebuild", "groups", "Provision if needed, then rebuild and start a worker-group administrative workspace while retaining its group binding and data. The server operation deadline defaults to 120 seconds.", groupAdminLifecycleInput, mutation],
       ["groups.admin-workspace.startup-script.get", "groups", "Read the non-secret startup script and bounded runtime status for an existing group-administrative workspace. The target must be an authorized group; timeoutSeconds bounds the request.", groupAdminStartupScriptInput(false), read],
@@ -209,9 +216,17 @@ export class ManagementWorkerDomain {
         : await operation();
       return { handled:true, result };
     }
+    if (name === "admin-workspace.emergency-stop") {
+      if (args.confirmed !== true) throw status(400, "Explicit emergency-stop confirmation required");
+      const id = required(args.workerId, "workerId");
+      await locks.verify(id, args.lockPassword);
+      await useAdminWorkspaceStore().setStatus("stopped", true, id);
+      return { handled: true, result: { workerId: id, status: "stopped" } };
+    }
     const workerId = required(args.workerId, "workerId");
     const worker = cm.get(workerId) ?? useWorkerStore().findById(workerId);
     if (!worker) throw status(404,"Worker not found");
+    if (name === "workers.recovery.get") return { handled: true, result: cm.getRecovery(workerId) };
     if (name === "workers.env-keys") {
       return {handled:true,result:await withinManagementFailFastDeadline(async()=>{
         const configured=useUserEnvStore().getOrDefault(worker.userId).envVars.map(({key})=>key);
@@ -236,6 +251,16 @@ export class ManagementWorkerDomain {
     }
     if (name === "workers.restart") { await locks.verify(workerId,args.lockPassword); await cm.restart(workerId); return {handled:true,result:{workerId,status:"running"}}; }
     await locks.verify(workerId,args.lockPassword);
+    if (name === "workers.recovery.set") return { handled: true, result: await cm.setRecovery(workerId, args.maxRetries) };
+    if (name === "workers.desired-state.set") {
+      if (args.confirmed !== true) throw status(400, "Confirm the warning: desired state does not confirm runtime state");
+      return { handled: true, result: await cm.setDesiredState(workerId, args.desiredRuntimeStatus as "running" | "stopped") };
+    }
+    if (name === "workers.emergency-stop") {
+      if (args.confirmed !== true) throw status(400, "Explicit emergency-stop confirmation required");
+      await cm.emergencyStop(workerId);
+      return { handled: true, result: { workerId, status: "stopped" } };
+    }
     if (name === "workers.recover") return {handled:true,result:await cm.recover(workerId)};
     if (name === "workers.update") {
       const updated=await cm.updateSettings(workerId, settings(args));
@@ -315,6 +340,13 @@ export class ManagementWorkerDomain {
       }
       if(name==="groups.admin-workspace.provision") return withinGroupAdminLifecycleDeadline(() => workspaces.ensure(group.id,group.userId,authorize), deadline);
       if(name==="groups.admin-workspace.start") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"running",authorize), deadline);
+      if(name==="groups.admin-workspace.emergency-stop") {
+        if (args.confirmed !== true) throw status(400, "Explicit emergency-stop confirmation required");
+        const id = group.adminWorkspace?.id;
+        if (!id) throw status(404, "Group administrative workspace is not provisioned");
+        await useWorkerProtectionLockStore().verify(id, args.lockPassword);
+        return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id, "stopped", authorize, true, id), deadline);
+      }
       if(name==="groups.admin-workspace.stop") return withinGroupAdminLifecycleDeadline(() => workspaces.setStatus(group.id,"stopped",authorize), deadline);
       if(name==="groups.admin-workspace.rebuild") return withinGroupAdminLifecycleDeadline(() => workspaces.rebuild(group.id,group.userId,authorize), deadline);
     }
@@ -377,4 +409,10 @@ function withinGroupWorkerLifecycleDeadline<T>(operation: () => Promise<T>, time
     timer.unref?.();
     void operation().then(resolve, reject);
   }).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+function confirmedWorkerInput() {
+  return { type: "object", additionalProperties: false, required: ["workerId", "confirmed"], properties: {
+    workerId: { type: "string" }, confirmed: { type: "boolean", enum: [true] }, lockPassword: { type: "string", writeOnly: true },
+  } };
 }

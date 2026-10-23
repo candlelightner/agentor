@@ -16,7 +16,7 @@ import {
   publicStartupScriptStatus,
   validateAdminWorkspaceStartupScript,
 } from "./admin-workspace-store";
-import { useWorkerGroupStore } from "./services";
+import { useWorkerGroupStore, useLogger } from "./services";
 import type { WorkerGroup, WorkerGroupStore } from "./worker-group-store";
 import { withWorkerNetworkMutation } from "./worker-group-manager";
 import {
@@ -46,6 +46,8 @@ export class GroupAdminWorkspaceStore {
     intent: AdminWorkspaceIdentityMaterializationIntent,
   ) => Promise<void>;
   private running = new Set<string>();
+  private stopRequested = new Set<string>();
+  private stateWrites = new Map<string, Promise<void>>();
   private pendingCommits = new Map<
     string,
     { operation: string; record: GroupAdministrativeWorkspaceRecord }
@@ -96,10 +98,18 @@ export class GroupAdminWorkspaceStore {
       | undefined;
     return record ? structuredClone(record) : undefined;
   }
-  private async save(record: GroupAdministrativeWorkspaceRecord) {
-    await this.groups.update(record.ownerId, record.groupId, {
-      adminWorkspace: structuredClone(record),
+  private async save(record: GroupAdministrativeWorkspaceRecord, intentOnly = false) {
+    const write = (this.stateWrites.get(record.groupId) ?? Promise.resolve()).then(async () => {
+      if (intentOnly) {
+        const current = this.record(record.groupId);
+        if (current?.id !== record.id) throw Object.assign(new Error("Group administrative workspace identity changed"), { statusCode: 409 });
+        record = { ...current, status: "stopped", updatedAt: record.updatedAt };
+      }
+      if (this.stopRequested.has(record.groupId)) record = { ...record, status: "stopped" };
+      await this.groups.update(record.ownerId, record.groupId, { adminWorkspace: structuredClone(record) });
     });
+    this.stateWrites.set(record.groupId, write.catch(() => {}));
+    return write;
   }
   private async withGroup<T>(
     groupId: string,
@@ -146,7 +156,12 @@ export class GroupAdminWorkspaceStore {
       throw error;
     }
   }
-  private async run<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
+  private async run<T>(groupId: string, operation: () => Promise<T>, queue = false): Promise<T> {
+    if (queue) {
+      const snapshot = this.group(groupId);
+      return this.serializeOwner(snapshot.userId, () => withWorkerLifecycleMutation(
+        snapshot.adminWorkspace?.id ?? `admin-group-bootstrap:${groupId}`, operation));
+    }
     // Lifecycle operations can rebuild images and take longer than an HTTP
     // proxy timeout. Never queue retries behind an operation whose client has
     // disconnected: a burst of clicks/MCP retries would otherwise destroy and
@@ -178,6 +193,8 @@ export class GroupAdminWorkspaceStore {
   }
   private nativeAcknowledge(record: GroupAdministrativeWorkspaceRecord): AdminNativeAcknowledge {
     return async patch => {
+      if (this.stopRequested.has(record.groupId) && patch.nativeRuntime?.pending?.kind === 'start' && !patch.nativeRuntime.pending.operation)
+        throw Object.assign(new Error('Administrative start cancelled by emergency stop; stopped intent retained'), { statusCode: 409 });
       if (applyAdminNativePatch(record, patch)) await this.commitExternal('native-runtime', record);
     };
   }
@@ -306,6 +323,16 @@ export class GroupAdminWorkspaceStore {
     expectedId?: string,
   ) {
     const emergency = force && status === "stopped";
+    if (emergency) {
+      authorize?.();
+      if (!this.runtime && !this.emergencyRuntime) this.requireRuntime();
+      const record = this.record(groupId);
+      if (!record || expectedId && record.id !== expectedId)
+        throw Object.assign(new Error("Group administrative workspace identity is unavailable or changed"), { statusCode: record ? 409 : 404 });
+      this.stopRequested.add(groupId);
+      await this.save({ ...record, status: "stopped", updatedAt: new Date().toISOString() }, true);
+      useLogger().warn(`[group-admin-workspace] emergency stop intent saved; ${this.running.has(groupId) ? "waiting for in-flight mutation settlement" : "shutdown confirmation pending"}`);
+    }
     const result = this.run(groupId, () =>
       this.withGroup(groupId, false, async (group) => {
         authorize?.();
@@ -331,6 +358,7 @@ export class GroupAdminWorkspaceStore {
         const record = this.record(groupId)!;
         if (runtime) {
           if (status === "running") {
+            this.stopRequested.delete(groupId);
             if (this.identityMaterializer)
               await this.identityMaterializer(
                 structuredClone(record),
@@ -350,10 +378,13 @@ export class GroupAdminWorkspaceStore {
         record.updatedAt = new Date().toISOString();
         if (runtime) await this.commitExternal(operation, record);
         else await this.save(record);
+        if (emergency) useLogger().info('[group-admin-workspace] emergency stop confirmed; persistent data retained');
         return this.publicRecord(record);
-      }),
+      }), emergency,
     );
-    return emergency ? withOperationDeadline(result, 15_000, "Group administrative emergency stop") : result;
+    if (!emergency) return result;
+    try { return await withOperationDeadline(result, 15_000, "Group administrative emergency stop; stopped intent retained, shutdown confirmation pending"); }
+    catch (error) { useLogger().warn('[group-admin-workspace] emergency stop unconfirmed; stopped intent retained, recovery still required'); throw error; }
   }
   async rebuild(groupId: string, ownerId?: string, authorize?: () => void) {
     return this.run(groupId, () =>

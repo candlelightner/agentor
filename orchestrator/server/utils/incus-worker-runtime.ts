@@ -1,3 +1,4 @@
+import { WorkerStartupError, workerStartupFailure } from "./worker-startup-error";
 import { sameIncusDevice as sameDevice } from './incus-device-layout';
 import { MANAGED_KILO_PARENT, MANAGED_KILO_PARENT_CHECK } from './managed-volume-kilo-parent';
 import { effectiveIncusWorkerMemoryLimit } from '../../shared/worker-memory';
@@ -1451,9 +1452,9 @@ export class IncusWorkerRuntime {
     return instance;
   }
 
-  private async checkedExec(name: string, command: string[]): Promise<void> {
+  private async checkedExec(name: string, command: string[], phase = "guest bootstrap"): Promise<void> {
     const result = await this.client.exec(name, command);
-    if (result.returnCode !== 0) throw new Error(`Incus worker bootstrap command failed (${command[0]}, exit ${result.returnCode})`);
+    if (result.returnCode !== 0) throw new WorkerStartupError(phase, result.returnCode);
   }
 
   /** Raw paths must be private import scratch, not caller-selected host files.
@@ -1860,7 +1861,7 @@ export class IncusWorkerRuntime {
   }
 
   async start(opts: IncusWorkerOptions, incarnation?: string,
-    recovery: { leaveRunningOnFailure?: boolean } = {}): Promise<void> {
+    recovery: { leaveRunningOnFailure?: boolean; assertStartAllowed?: () => void } = {}): Promise<void> {
     this.validateOptions(opts);
     await this.assertWorkspaceReplacementSettled(opts);
     await this.assertReady();
@@ -1908,6 +1909,7 @@ export class IncusWorkerRuntime {
       const current = await this.assertOwned(name, opts.id, opts.userId, instance.config['volatile.uuid']);
       assertIncusHardwareLayout(current, await this.preflightHardware(opts, current, 'attach'));
     }
+    recovery.assertStartAllowed?.();
     if (state.status !== "Running") await this.client.startInstance(name);
     const deadline = Date.now() + 120_000;
     let ready = false;
@@ -1918,7 +1920,10 @@ export class IncusWorkerRuntime {
       } catch { /* Agent becomes available after the guest has booted. */ }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    if (!ready) throw new Error("Incus worker agent did not become ready");
+    if (!ready) {
+      useLogger().warn("[incus-worker] guest agent readiness deadline expired; startup unconfirmed, VM retained for recovery");
+      throw new WorkerStartupError("guest agent readiness deadline");
+    }
     try {
       for (const volume of opts.managedVolumes ?? []) if (volume.target === MANAGED_KILO_PARENT)
         await this.checkedExec(name, ['timeout', '15', '/usr/bin/python3', '-c', MANAGED_KILO_PARENT_CHECK, volume.target]);
@@ -1973,7 +1978,7 @@ export class IncusWorkerRuntime {
           initialize: await storage.dockerInitializationAllowed(opts),
         }), { uid: 0, gid: 0, mode: 0o600 });
         await this.checkedExec(name, ["systemctl", "unmask", "docker", "docker.socket", "containerd", "agentor-docker-storage"]);
-        await this.checkedExec(name, ["systemctl", "start", "agentor-docker-storage"]);
+        await this.checkedExec(name, ["systemctl", "start", "agentor-docker-storage"], "Docker storage preparation");
         await this.checkedExec(name, ["mountpoint", "-q", "/var/lib/docker"]);
         await storage.markDockerInitialized(opts);
       } else {
@@ -1982,7 +1987,8 @@ export class IncusWorkerRuntime {
         // vendor Docker units, masking it would overwrite an installed unit.
         await this.checkedExec(name, ["systemctl", "mask", "docker", "docker.socket", "containerd"]);
       }
-      await this.checkedExec(name, ["systemctl", "start", "agentor-worker.service"]);
+      recovery.assertStartAllowed?.();
+      await this.checkedExec(name, ["systemctl", "start", "agentor-worker.service"], "worker service start");
       await this.checkedExec(name, ["systemctl", "is-active", "--quiet", "agentor-worker.service"]);
       const workerDeadline = Date.now() + 120_000;
       let workerReady = false;
@@ -1992,10 +1998,15 @@ export class IncusWorkerRuntime {
         if (result.returnCode === 0) { workerReady = true; break; }
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      if (!workerReady) throw new Error("Incus worker service did not complete startup");
+      if (!workerReady) throw new WorkerStartupError("worker service readiness deadline");
     } catch (error) {
-      if (!recovery.leaveRunningOnFailure || state.status !== 'Running')
-        await this.stop(opts, instance.config['volatile.uuid']).catch(() => {});
+      let outcome = 'VM retained running; recovery still required';
+      if ((error as { code?: string })?.code === 'WORKER_STOP_REQUESTED') outcome = 'startup cancelled; emergency shutdown queued';
+      else if (!recovery.leaveRunningOnFailure || state.status !== 'Running') {
+        try { await this.stop(opts, instance.config['volatile.uuid']); outcome = 'startup VM stopped; persistent data retained'; }
+        catch { outcome = 'startup cleanup unconfirmed; operator recovery required'; }
+      }
+      useLogger().warn(`[incus-worker] ${workerStartupFailure(error).message}; ${outcome}`);
       throw error;
     }
   }
@@ -2048,6 +2059,8 @@ export class IncusWorkerRuntime {
       typeof target === 'string' ? undefined : target.userId, incarnation);
     const state = force ? instance : await this.client.getInstanceState(name);
     if (state.status !== "Stopped") await this.client.stopInstance(name, force ? { force: true, timeout: 0 } : { timeout });
+    if (force && (await this.assertOwned(name, typeof target === "string" ? undefined : target.id, typeof target === "string" ? undefined : target.userId, incarnation)).status !== "Stopped")
+      throw Object.assign(new Error("Emergency stop is unconfirmed; stopped intent retained"), { statusCode: 503 });
   }
 
   async refreshSshKeys(owner: IncusStorageOwner, content: string): Promise<void> {
