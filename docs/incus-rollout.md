@@ -223,6 +223,66 @@ roughly 1 GiB default for previously uncapped Docker environments. Existing
 positive caps and Docker behavior remain unchanged; running VMs are not resized.
 See `docs/environments.md` for precedence, validation and effective UI reporting.
 
+## Host reboot ordering
+
+The installer and `--update-policy` install an owned
+`agentor-incus-<installation-prefix>-bridge-ready.service` and a separate
+`docker.service.d/50-agentor-incus-<installation-prefix>-bridge.conf`.
+Docker requires the oneshot to finish before restoring containers. It waits for
+Incus daemon startup, then verifies the canonical installation marker, owned
+primary network, configured callback gateway, and that exact IPv4 address/prefix
+on the up kernel bridge. It never calls Docker, provisions resources, changes
+firewalls or repairs endpoints. Imported source-validation/GPU modules are passive.
+The existing policy/routing services remain after Docker, avoiding a dependency
+on the callback service that itself needs Docker. A new Docker start reruns the
+oneshot; successful readiness is not cached across daemon starts.
+
+This ordering affects **every container on this Docker daemon**. If the bridge
+is unavailable or its identity/configuration differs, Docker startup is blocked
+instead of attempting a callback-port bind that leaves the controller stopped.
+The installed private config's `bridgeReadyTimeoutSeconds` is an integer from
+1 to 3600, default 120. The default allows bridge/address restoration after the
+daemon is ready; it does not wait for worker VMs, image conversion or routing.
+Each read and conditional poll uses the remaining budget. The systemd watchdog
+adds 15 seconds for process settlement; Incus daemon startup retains its own
+operator-configured service deadline. To change the bridge budget, edit only
+that field in the existing private config and rerun `--update-policy` so the
+watchdog matches. This is host startup policy, separate from converter readiness.
+
+Run the update from the trusted checkout on the authorized host:
+
+```sh
+sudo scripts/setup-incus-host.sh --update-policy \
+  --config /etc/agentor/incus/<installation-uuid>/config.json
+```
+
+Legacy configs gain the explicit default; existing operator values are retained.
+Before changing installed scripts/units, setup verifies the proposed Docker/Incus
+activation transaction and checks the default boot transaction for ordering
+cycles, including existing operator drop-ins. It refuses cycles
+even when systemd reports success after deleting a job. Foreign or unsafe owned
+filenames are refused; unrelated operator files are preserved. Updating reloads
+unit definitions and restarts only the existing policy service, **never Docker**.
+Loopback GUI publication, bridge-only callback publication, DATA and read-only
+TLS mounts retain their existing configuration.
+
+The gate logs its wait, refusal/timeout and blocked-Docker outcome, or successful
+readiness. Inspect its journal together with `incus.service` and `docker.service`
+privately. After correcting the prerequisite, explicitly retry
+`systemctl start docker.service`; do not broaden bindings or repeatedly start a
+controller with an uncertain endpoint. The gate does not repair a prior failed
+restore: [the existing endpoint checks and explicit recovery](incus-recovery.md#controller-running-without-a-docker-network-endpoint-3)
+still apply. Removal is a maintenance action: first remove the dependent callback
+publication from the approved stack while preserving DATA/TLS and ownership,
+then remove only this installation's acknowledged drop-in and readiness unit and
+run `systemctl daemon-reload`. Never remove the whole drop-in directory or native
+storage/network resources as startup cleanup.
+
+Synthetic installer/order tests are not cold-boot acceptance. Keep issue #37 open
+until a disposable delayed-Incus boot and a second normal reboot prove automatic
+controller restoration, valid Docker endpoint, GUI/backend/callback connectivity
+and unchanged storage/mount identities.
+
 ## Optional hardware grants
 
 USB VM grants have a guarded, opt-in implementation; real-device acceptance is still pending. Keep `INCUS_USB_ENABLED=false` during ordinary rollout. See [hardware device permissions](hardware-devices.md#incus-vm-hardware-opt-in-physical-acceptance-pending) for the operator setup flag, exact serial matching, exclusive reservations and storage/controller rejection. Do not enable passthrough against disks containing Agentor data, backups or VM pools. Intel GVT-g mdev assignment is separately gated by an actual operator-selected host profile and matching restricted project policy; it remains disabled until reviewed host enablement and physical guest acceptance. Physical GPU assignment has a separate disabled-by-default `INCUS_GPU_PHYSICAL_ENABLED` opt-in and `--enable-physical-gpu` setup/check flag; review its serial identity, isolation and pre-released ownership requirements in the hardware guide before approved disposable acceptance. SR-IOV/native-context assignment remains unsupported. Migration preserves grants and rejects unavailable hardware before stopping the source. Issue #12 remains open until physical USB and supported-GPU acceptance can be demonstrated safely.

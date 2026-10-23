@@ -28,7 +28,8 @@ class InstallerTests(unittest.TestCase):
         config=self.config();config.update(listen="172.25.0.1",policyPort=9444)
         library=Path("/usr/local/lib/agentor-incus")/INSTALLATION
         directory=Path("/etc/agentor/incus")/INSTALLATION
-        with patch.object(SETUP,"namespace"),patch.object(SETUP,"owned"), \
+        with tempfile.TemporaryDirectory() as temporary, patch.object(SETUP,"SYSTEMD_SYSTEM",Path(temporary)), \
+             patch.object(SETUP,"namespace"),patch.object(SETUP,"owned"), patch.object(SETUP,"verify_startup_order"), \
              patch.object(SETUP,"write_file") as write,patch.object(SETUP,"command"):
             SETUP.install_units(config,directory,library)
         for name in ("recover-incus-job.py","incus-host-mount-sources.py","incus-gpu-mdev.py","incus-admin-network-policy.py"):
@@ -37,6 +38,166 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(units), 1)
         self.assertIn('"--admin-pool" "owned-pool"', units[0])
         self.assertIn('"--orchestrator-container" "agentor-orchestrator"', units[0])
+
+    def test_owned_boot_gate_is_idempotent_preserves_operator_dropins_and_migrates_legacy_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base=Path(temporary); units=base/'systemd'; units.mkdir(); directory=base/'operator'; directory.mkdir(mode=0o700)
+            library=base/'library'; config={**self.config(), 'listen':'172.25.0.1', 'policyPort':9444}
+            (directory/'config.json').write_text(json.dumps(config)); (directory/'config.json').chmod(0o600)
+            dropins=units/'docker.service.d'; dropins.mkdir(); operator=dropins/'10-operator.conf'; operator.write_text('[Service]\nEnvironment=KEEP_OPERATOR_VALUE=yes\n')
+            with patch.object(SETUP,'SYSTEMD_SYSTEM',units), patch.object(SETUP,'command') as command, \
+                 patch.object(SETUP,'verify_startup_order') as verify, contextlib.redirect_stdout(io.StringIO()):
+                SETUP.install_units(config,directory,library)
+                self.assertEqual(config['bridgeReadyTimeoutSeconds'],120)
+                self.assertEqual(json.loads((directory/'config.json').read_text())['bridgeReadyTimeoutSeconds'],120)
+                config['bridgeReadyTimeoutSeconds']=47
+                (directory/'config.json').write_text(json.dumps(config))
+                SETUP.install_units(config,directory,library)
+            ready=(units/'agentor-incus-12345678-bridge-ready.service').read_text()
+            dropin=(dropins/'50-agentor-incus-12345678-bridge.conf').read_text()
+            self.assertIn('Wants=incus.service\nAfter=incus.service\nBefore=docker.service',ready)
+            self.assertIn('RequiresMountsFor="/srv/agentor"',ready)
+            self.assertIn('"--bridge-ready" "--config"',ready); self.assertIn('TimeoutStartSec=62\n',ready)
+            self.assertNotIn('RemainAfterExit=yes',ready); self.assertNotIn('After=docker.service',ready)
+            self.assertIn('Requires=agentor-incus-12345678-bridge-ready.service',dropin)
+            self.assertIn('After=agentor-incus-12345678-bridge-ready.service',dropin)
+            self.assertEqual(operator.read_text(),'[Service]\nEnvironment=KEEP_OPERATOR_VALUE=yes\n')
+            self.assertEqual(verify.call_count,2)
+            self.assertEqual(json.loads((directory/'config.json').read_text())['bridgeReadyTimeoutSeconds'],47)
+            self.assertFalse(any(call.args[:2] in [('systemctl','start'),('systemctl','restart')] and 'docker' in ' '.join(call.args) for call in command.call_args_list))
+
+    def test_boot_install_foreign_leaf_or_cycle_refusal_happens_before_any_installed_script_write(self):
+        for case in ('foreign','symlink','fifo','writable','directory-symlink','directory-writable','cycle'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                units=Path(temporary); dropins=units/'docker.service.d'; dropins.mkdir()
+                target=dropins/'50-agentor-incus-12345678-bridge.conf'
+                if case=='foreign': target.write_text('operator-managed\n')
+                elif case=='symlink': target.symlink_to(units/'absent')
+                elif case=='fifo': os.mkfifo(target)
+                elif case=='writable': target.write_text('# Agentor installation '+INSTALLATION+'\n'); target.chmod(0o666)
+                elif case=='directory-symlink':
+                    dropins.rmdir(); (units/'foreign-directory').mkdir(); dropins.symlink_to(units/'foreign-directory')
+                elif case=='directory-writable': dropins.chmod(0o777)
+                with patch.object(SETUP,'SYSTEMD_SYSTEM',units), patch.object(SETUP,'namespace') as namespace, \
+                     patch.object(SETUP,'write_file') as write, patch.object(SETUP,'command') as command, \
+                     patch.object(SETUP,'verify_startup_order',side_effect=SETUP.SetupFailure('cycle') if case=='cycle' else None) as verify:
+                    with self.assertRaisesRegex(ValueError,'foreign|cycle|symlink|protected'):
+                        SETUP.install_units({**self.config(),'listen':'172.25.0.1','policyPort':9444},units,units/'library')
+                    namespace.assert_not_called(); write.assert_not_called(); command.assert_not_called()
+                    if case!='cycle': verify.assert_not_called()
+
+    def test_real_systemd_verifier_accepts_valid_order_and_refuses_direct_or_transitive_operator_cycles(self):
+        for cycle in ('none','direct','transitive','boot-only','boot-warning'):
+            with self.subTest(cycle=cycle), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary)
+                for name in ('sysinit.target','basic.target','shutdown.target','network-online.target'):
+                    (root/name).write_text('[Unit]\nDefaultDependencies=no\n')
+                (root/'incus.service').write_text('[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n')
+                (root/'docker.socket').write_text('[Unit]\nDefaultDependencies=no\nBefore=docker.service\n[Socket]\nListenStream=/run/fixture-docker.sock\n')
+                (root/'incus.service.d').mkdir()
+                if cycle not in ('none','boot-warning'):
+                    (root/'incus.service.d/operator.conf').write_text('[Unit]\nAfter='+('docker.service' if cycle=='direct' else 'fixture-network.service')
+                        + ('\nWants=fixture-network.service' if cycle=='transitive' else '')+'\n')
+                (root/'fixture-network.service').write_text('[Unit]\nDefaultDependencies=no\nAfter=docker.service\n[Service]\nExecStart=/bin/true\n')
+                (root/'default.target').write_text('[Unit]\nDefaultDependencies=no\nWants=docker.service fixture-network.service'+(' broken.service' if cycle=='boot-warning' else '')+'\n')
+                (root/'broken.service').write_text('[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/fixture-nonexistent-executable\n')
+                ready='[Unit]\nWants=incus.service\nAfter=incus.service\nBefore=docker.service\n[Service]\nType=oneshot\nExecStart=/bin/true\n'
+                docker=b'[Unit]\nDefaultDependencies=no\nRequires=docker.socket\nAfter=docker.socket\n[Service]\nExecStart=/bin/true\n'
+                dropin='[Unit]\nRequires=fixture-bridge-ready.service\nAfter=fixture-bridge-ready.service\n'
+                original=SETUP.tempfile.TemporaryDirectory; staged=[]
+                def staging(*args,**kwargs):
+                    result=original(*args,**kwargs); staged.append(Path(result.name)); return result
+                with patch.dict(os.environ,{'SYSTEMD_UNIT_PATH':temporary}), patch.object(SETUP,'command',return_value=docker), \
+                     patch.object(SETUP.tempfile,'TemporaryDirectory',side_effect=staging), contextlib.redirect_stderr(io.StringIO()):
+                    if cycle in ('none','boot-warning'): SETUP.verify_startup_order('fixture-bridge-ready.service',ready,dropin)
+                    else:
+                        with self.assertRaisesRegex(ValueError,'dependency validation failed'):
+                            SETUP.verify_startup_order('fixture-bridge-ready.service',ready,dropin)
+                self.assertTrue(staged); self.assertTrue(all(not path.exists() for path in staged))
+
+    def test_systemd_late_empty_dependency_assignments_do_not_remove_owned_docker_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for name in ('sysinit.target','basic.target','shutdown.target'):
+                (root/name).write_text('[Unit]\nDefaultDependencies=no\n')
+            (root/'docker.service').write_text('[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n')
+            (root/'docker.service.d').mkdir()
+            (root/'docker.service.d/50-owned.conf').write_text('[Unit]\nRequires=fixture-gate.service\nAfter=fixture-gate.service\n')
+            (root/'docker.service.d/90-operator.conf').write_text('[Unit]\nRequires=\nAfter=\n')
+            (root/'fixture-gate.service').write_text('[Unit]\nDefaultDependencies=no\nWants=incus.service\nAfter=incus.service\n[Service]\nType=oneshot\nExecStart=/bin/true\n')
+            (root/'incus.service').write_text('[Unit]\nDefaultDependencies=no\nAfter=docker.service\n[Service]\nExecStart=/bin/true\n')
+            result=subprocess.run(['systemd-analyze','verify','--man=no','--generators=no',str(root/'docker.service')],
+                capture_output=True,env={**os.environ,'SYSTEMD_UNIT_PATH':temporary,'LC_ALL':'C'},timeout=15)
+            self.assertIn(b'ordering cycle',result.stderr.lower())
+
+    def test_bridge_ready_installed_mode_never_dispatches_docker_setup_or_routing(self):
+        config={**self.config(),'internalUrl':'http://10.25.0.1:3079','bridgeReadyTimeoutSeconds':47}
+        path=Path('/etc/agentor/incus')/INSTALLATION/'config.json'
+        info=types.SimpleNamespace(st_mode=stat.S_IFREG|0o600,st_uid=0,st_size=1024)
+        with patch.object(sys,'argv',['installer','--bridge-ready','--config',str(path)]), \
+             patch.object(SETUP.os,'geteuid',return_value=0), patch.object(SETUP.os,'umask'), \
+             patch.object(SETUP.SOURCES,'directory_identity'), patch.object(Path,'lstat',return_value=info), \
+             patch.object(Path,'read_text',return_value=json.dumps(config)), patch.object(SETUP,'bridge_ready') as ready, \
+             patch.object(SETUP,'install_units') as install, patch.object(SETUP,'docker_context') as docker, \
+             patch.object(SETUP,'resource_setup') as resources, patch.object(SETUP,'routing') as routing:
+            SETUP.main()
+            ready.assert_called_once_with(config)
+            install.assert_not_called(); docker.assert_not_called(); resources.assert_not_called(); routing.assert_not_called()
+
+    def test_bridge_gate_waits_for_real_predicates_without_docker_or_mutation_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base=Path(temporary); SETUP.namespace(base/INSTALLATION,INSTALLATION)
+            config={**self.config(),'internalUrl':'http://10.25.0.1:3079','bridgeReadyTimeoutSeconds':1}
+            network={'name':config['network'],'managed':True,'type':'bridge','config':{SETUP.MARKER:INSTALLATION,'ipv4.address':'10.25.0.1/24'}}
+            link=[{'ifname':config['network'],'flags':['UP'],'addr_info':[{'family':'inet','local':'10.25.0.1','prefixlen':24}]}]
+            clock=[0.0]; calls=[]; observations=[0,0]; output=io.StringIO()
+            def command(*args,**kwargs):
+                calls.append((args,kwargs['timeout'])); self.assertGreater(kwargs['timeout'],0); self.assertLessEqual(kwargs['timeout'],1-clock[0])
+                if args[0]=='incus':
+                    observations[0]+=1
+                    if observations[0]==1: raise SETUP.SetupFailure('Fixture daemon not ready')
+                    return json.dumps(network).encode()
+                self.assertEqual(args,('ip','-j','-4','address','show','dev',config['network']))
+                observations[1]+=1; return json.dumps([] if observations[1]==1 else link).encode()
+            with patch.object(SETUP,'OPERATOR_ROOT',base), patch.object(SETUP,'installation_id',return_value=INSTALLATION), \
+                 patch.object(SETUP,'command',side_effect=command), patch.object(SETUP.time,'monotonic',side_effect=lambda:clock[0]), \
+                 patch.object(SETUP.time,'sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)), contextlib.redirect_stdout(output):
+                SETUP.bridge_ready(config)
+            self.assertEqual(observations,[3,2]); self.assertLess(clock[0],1)
+            self.assertIn('Docker startup may proceed',output.getvalue()); self.assertNotIn(INSTALLATION,output.getvalue())
+            self.assertTrue(all(args[0] in ('incus','ip') for args,_ in calls))
+
+    def test_bridge_gate_rejects_ownership_binding_and_installation_changes_or_bounded_unready_observations(self):
+        for case in ('owner','binding','installation','not-up','missing','late-read'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base=Path(temporary); SETUP.namespace(base/INSTALLATION,INSTALLATION)
+                config={**self.config(),'internalUrl':'http://10.25.0.1:3079','bridgeReadyTimeoutSeconds':1}
+                network={'name':config['network'],'managed':True,'type':'bridge','config':{SETUP.MARKER:INSTALLATION,'ipv4.address':'10.25.0.1/24'}}
+                if case=='owner': network['config'][SETUP.MARKER]='foreign'
+                if case=='binding': config['internalUrl']='http://10.25.99.1:3079'
+                clock=[0.0]; calls=[]; error=io.StringIO()
+                def command(*args,**kwargs):
+                    calls.append(args)
+                    if args[0]=='incus': return json.dumps(network).encode()
+                    self.assertEqual(args[0],'ip')
+                    if case=='late-read': clock[0]=1.0
+                    return json.dumps([] if case=='missing' else [{'ifname':config['network'],'flags':[] if case=='not-up' else ['UP'],
+                        'addr_info':[{'family':'inet','local':'10.25.0.1','prefixlen':24}]}]).encode()
+                with patch.object(SETUP,'OPERATOR_ROOT',base), patch.object(SETUP,'installation_id',return_value='foreign' if case=='installation' else INSTALLATION), \
+                     patch.object(SETUP,'command',side_effect=command), patch.object(SETUP.time,'monotonic',side_effect=lambda:clock[0]), \
+                     patch.object(SETUP.time,'sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)), \
+                     contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(ValueError): SETUP.bridge_ready(config)
+                self.assertIn('Docker startup remains blocked',error.getvalue())
+                self.assertTrue(all(args[0] in ('incus','ip') for args in calls))
+                if case in ('owner','binding','installation'): self.assertFalse(any(args[0]=='ip' for args in calls))
+
+    def test_bridge_gate_budget_is_finite_validated_and_preserves_operator_choice(self):
+        self.assertEqual(SETUP.bridge_ready_timeout({}),120)
+        for budget in (1,47,3600): self.assertEqual(SETUP.bridge_ready_timeout({'bridgeReadyTimeoutSeconds':budget}),budget)
+        for budget in (None,True,False,0,-1,1.5,3601,'120'):
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError,'startup policy was not changed'):
+                SETUP.bridge_ready_timeout({'bridgeReadyTimeoutSeconds':budget})
 
     def test_context_rejects_missing_or_stale_controller_endpoint_before_any_mutation(self):
         network = {"Id": "a" * 64, "Driver": "bridge", "Internal": False, "Options": {},
@@ -648,6 +809,31 @@ print('attempting',flush=True);m.routing({'installation':ident})
     def test_systemd_argument_does_not_expand_path_variables_or_specifiers(self):
         value = SETUP.unit_argument('/srv/a b/$secret%name"file')
         self.assertEqual(value, '"/srv/a b/$$secret%%name\\"file"')
+
+    def test_generated_mount_dependency_resolves_literal_dollar_space_and_percent_data_path(self):
+        data = '/srv/agentor $literal%data'
+        self.assertEqual(SETUP.SOURCES.canonical(data), data)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); name = 'agentor-incus-12345678-bridge-ready.service'
+            config = {**self.config(), 'dataDir': data, 'listen': '172.25.0.1', 'policyPort': 9444}
+            with patch.object(SETUP, 'SYSTEMD_SYSTEM', root), patch.object(SETUP, 'namespace'), \
+                 patch.object(SETUP, 'verify_startup_order'), patch.object(SETUP, 'command'), patch.object(SETUP, 'write_file') as write:
+                SETUP.install_units(config, root / 'operator', root / 'library')
+            body = next(call.args[1] for call in write.call_args_list if call.args[0] == root / name)
+            self.assertIn('RequiresMountsFor="/srv/agentor $literal%%data"\n', body)
+            (root / name).write_text(body)
+            for target in ('sysinit.target', 'basic.target', 'shutdown.target'):
+                (root / target).write_text('[Unit]\nDefaultDependencies=no\n')
+            (root / 'incus.service').write_text('[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n')
+            mount = subprocess.check_output(['systemd-escape', '--path', '--suffix=mount', data], text=True).strip()
+            (root / mount).write_text('[Unit]\nDefaultDependencies=no\nAfter=' + name +
+                                     '\n[Mount]\nWhat=tmpfs\nType=tmpfs\nWhere=/srv/agentor $literal%%data\n')
+            # This reverse ordering must form a cycle only when the generated
+            # gate actually depends on the exact DATA mount, including its '$'.
+            result = subprocess.run(['systemd-analyze', 'verify', '--man=no', '--generators=no', str(root / name)],
+                                    capture_output=True, timeout=15,
+                                    env={**os.environ, 'SYSTEMD_UNIT_PATH': temporary, 'LC_ALL': 'C'})
+            self.assertIn(b'ordering cycle', result.stderr.lower())
 
     def test_generated_nft_check_and_install_use_separate_chain_table_closing_lines(self):
         config = self.config(); submitted = []
