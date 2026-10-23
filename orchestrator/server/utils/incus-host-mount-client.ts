@@ -30,6 +30,19 @@ export class IncusHostMountClient {
   ensure(mount: MountConfig): Promise<IncusHostExport> { return this.resolve('ensure', mount); }
   inspect(mount: MountConfig): Promise<IncusHostExport> { return this.resolve('inspect', mount); }
 
+  async cleanupWorkerExports(userId: string, workerId: string, incarnation: string): Promise<number> {
+    const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId) || !uuid.test(workerId) || !uuid.test(incarnation))
+      throw new Error('Host export cleanup requires exact worker identity and incarnation');
+    const installation = await readBackupInstallationId(this.config.dataDir);
+    const result = await this.client.request('POST', '/v1/host-mounts/cleanup-worker', { userId, workerId, incarnation });
+    if (!result || result.installation !== installation || result.project !== this.config.incusProject ||
+        result.userId !== userId || result.workerId !== workerId || result.incarnation !== incarnation ||
+        result.cleanupConfirmed !== true || !Number.isInteger(result.cleaned) || result.cleaned < 0 || result.cleaned > 4096)
+      throw new Error('Incus host export cleanup authority or confirmation changed');
+    return result.cleaned;
+  }
+
   /** Normal account onboarding reuses the operator's fixed policy service.
    * Only durable owner/worker IDs cross HTTPS; expected paths are local checks,
    * never a request for caller-selected host filesystem authority. */

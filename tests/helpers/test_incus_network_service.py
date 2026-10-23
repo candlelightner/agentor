@@ -104,6 +104,8 @@ class TransportTests(unittest.TestCase):
         self.calls = []
         self.host_calls = []
         self.account_calls = []
+        self.cleanup_calls = []
+        self.incarnation = str(uuid.uuid4())
         self.worker_id = str(uuid.uuid4())
         self.path_id = str(uuid.uuid4())
         self.selected_source = {"pathId": self.path_id, "source": "/srv/approved-fixture",
@@ -121,6 +123,13 @@ class TransportTests(unittest.TestCase):
 
             def inspect(self, payload):
                 return self.selected("inspect", payload)
+
+            def cleanup_worker_exports(self, payload):
+                if payload != {"userId": "owner", "workerId": outer.worker_id, "incarnation": outer.incarnation}:
+                    raise MODULE.POLICY.PolicyError("Unexpected export cleanup authority")
+                outer.cleanup_calls.append(payload)
+                return {"installation": outer.installation, "project": "agentor", **payload,
+                        "cleaned": 1, "cleanupConfirmed": True}
 
             def ensure_account_shares(self, payload):
                 if not isinstance(payload, dict) or set(payload) != {"userId", "workerId"} or payload != {"userId": "owner", "workerId": outer.worker_id}:
@@ -223,6 +232,22 @@ class TransportTests(unittest.TestCase):
             for body in (b"x" * 4097, b"not-json", json.dumps({"path": "/etc"}).encode()):
                 self.assertGreaterEqual(self.request("POST", f"/v1/managed-networks/{endpoint}", body)[0], 400)
         self.assertEqual(self.calls, [])
+
+    def test_export_cleanup_endpoint_retains_exact_mtls_identity_only_body_and_safe_failure(self):
+        payload = {"userId": "owner", "workerId": self.worker_id, "incarnation": self.incarnation}
+        endpoint = "/v1/host-mounts/cleanup-worker"
+        status, result = self.request("POST", endpoint, json.dumps(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(result["metadata"]["cleaned"], 1)
+        self.assertEqual(self.cleanup_calls, [payload])
+        for body in ({**payload, "source": "/etc"}, {**payload, "incarnation": "foreign"}):
+            self.assertEqual(self.request("POST", endpoint, json.dumps(body))[0], 409)
+        self.assertEqual(self.request("POST", endpoint, json.dumps(payload), identity="other")[0], 409)
+        for query in ("?project=foreign", "?command=true"):
+            self.assertGreaterEqual(self.request("POST", endpoint + query, json.dumps(payload))[0], 400)
+        self.assertEqual(self.cleanup_calls, [payload])
+        self.start_server(None)
+        self.assertEqual(self.request("POST", endpoint, json.dumps(payload))[0], 503)
 
     def test_host_mount_endpoints_forward_only_selected_catalog_identity(self):
         payload = {"pathId": self.path_id}

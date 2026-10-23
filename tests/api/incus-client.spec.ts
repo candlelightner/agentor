@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   IncusClient,
@@ -678,6 +679,47 @@ test.describe("IncusClient mock server protocol tests", () => {
       .rejects.toThrow('Operation observation lost');
     expect(recoveryOperation).toBe('/1.0/operations/device-cutover');
     expect(puts).toBe(3);
+  });
+
+  test('host export revocation changes only removed devices and metadata under the captured stopped ETag', async () => {
+    const client = new IncusClient({ endpoint: 'https://mock.invalid', project: 'agentor' });
+    const pathId = '01234567-1111-2222-3333-444444444444', target = '/workspace/model';
+    const key = 'hm' + createHash('sha256').update(`${pathId}:${target}`).digest('hex').slice(0, 6);
+    const original: any = { name: 'worker', type: 'virtual-machine', status: 'Stopped', profiles: [], config: {
+      'volatile.uuid': 'captured', 'user.agentor.host-mounts': JSON.stringify([{ key, pathId, sourceIdentity: 'a'.repeat(64) }]),
+      'user.agentor.owner': 'owner', 'user.agentor.installation': 'installation' }, devices: {
+      root: { type: 'disk', path: '/', pool: 'pool' },
+      [key]: { type: 'disk', path: target, source: '/srv/model', readonly: 'true' } } };
+    let current = structuredClone(original), puts = 0, written: any;
+    client.request = async () => ({}) as any;
+    client.rawRequest = async (method, _path, body, headers) => {
+      if (method === 'GET') return { statusCode: 200, headers: { etag: 'captured-etag' },
+        body: Buffer.from(JSON.stringify({ type: 'sync', metadata: current })) };
+      expect(headers).toEqual({ 'If-Match': 'captured-etag' }); puts++; written = body;
+      return { statusCode: 200, headers: {}, body: Buffer.from(JSON.stringify({ type: 'sync' })) };
+    };
+    const devices = { root: original.devices.root };
+    await client.removeHostMounts('worker', devices, '[]', original);
+    expect(puts).toBe(1); expect(written.devices).toEqual(devices);
+    expect(written.config).toEqual({ ...original.config, 'user.agentor.host-mounts': '[]' });
+    for (const mutate of [
+      (v: any) => { v.status = 'Running'; },
+      (v: any) => { v.profiles = ['foreign']; },
+      (v: any) => { v.config['user.agentor.administrative'] = 'platform'; },
+      (v: any) => { v.config['user.agentor.host-mounts'] = '[]'; },
+      (v: any) => { v.expanded_devices = {}; },
+    ]) {
+      current = structuredClone(original); mutate(current);
+      await expect(client.removeHostMounts('worker', devices, '[]', structuredClone(current))).rejects.toThrow();
+    }
+    current = structuredClone(original); current.config['volatile.uuid'] = 'replacement';
+    await expect(client.removeHostMounts('worker', devices, '[]', original)).rejects.toThrow('changed');
+    current = structuredClone(original);
+    for (const candidate of [{}, { root: { ...devices.root, pool: 'foreign' } },
+      { ...devices, added: original.devices[key] }, original.devices])
+      await expect(client.removeHostMounts('worker', candidate, '[]', original)).rejects.toThrow();
+    await expect(client.removeHostMounts('worker', devices, original.config['user.agentor.host-mounts'], original)).rejects.toThrow();
+    expect(puts).toBe(1);
   });
 
   test('canonical completion uses exact stopped nonce-owned snapshot and narrowly changes restore/host metadata with device PUT', async () => {

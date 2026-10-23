@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import ipaddress
 import json
+import logging
 from pathlib import Path
 import socket
 import ssl
@@ -169,7 +170,8 @@ def handler(policy, client_fingerprint, host_mounts=None, admin_networks=None):
         def do_POST(self):
             try:
                 path = self.validate()
-                mount_request = path in ("/v1/host-mounts/ensure", "/v1/host-mounts/inspect")
+                cleanup_request = path == "/v1/host-mounts/cleanup-worker"
+                mount_request = cleanup_request or path in ("/v1/host-mounts/ensure", "/v1/host-mounts/inspect")
                 account_request = path == "/v1/account-shares/ensure"
                 admin_request = path in ("/v1/admin-networks/ensure", "/v1/admin-networks/inspect")
                 if not mount_request and not account_request and not admin_request and path not in ("/v1/managed-networks/ensure", "/v1/managed-networks/remove", "/v1/managed-networks/inspect"):
@@ -189,18 +191,26 @@ def handler(policy, client_fingerprint, host_mounts=None, admin_networks=None):
                 elif account_request:
                     result = host_mounts.ensure_account_shares(payload)
                 elif mount_request:
-                    result = host_mounts.inspect(payload) if path.endswith("/inspect") else host_mounts.ensure(payload)
+                    if cleanup_request:
+                        result = host_mounts.cleanup_worker_exports(payload)
+                        logging.info("[host-export-cleanup] verified stopped worker exports; cleaned=%s; source data retained", result["cleaned"])
+                    else:
+                        result = host_mounts.inspect(payload) if path.endswith("/inspect") else host_mounts.ensure(payload)
                 elif path.endswith("/inspect"):
                     result = policy.inspect(payload)
                 else:
                     result = policy.ensure(payload) if path.endswith("/ensure") else policy.remove(payload)
                 self.reply(200, result)
-            except (OSError, ValueError, POLICY.PolicyError, IncusRejected):
+            except (OSError, ValueError, POLICY.PolicyError, IncusRejected) as error:
+                if locals().get("cleanup_request"):
+                    reason = str(error)[:512] if type(error).__name__ == "SourceRejected" else "Host authority could not be verified"
+                    logging.warning("[host-export-cleanup] %s; cleanup unconfirmed, source data retained", reason)
                 self.reply(409)
     return Handler
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     for argument in ["data-dir", "installation", "project", "primary", "bind", "server-cert", "server-key", "client-cert"]:
         parser.add_argument("--" + argument, required=True)

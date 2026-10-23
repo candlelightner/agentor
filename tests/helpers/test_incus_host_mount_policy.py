@@ -73,6 +73,138 @@ class PolicyTests(unittest.TestCase):
     def mutations(self):
         return [call for call in self.calls if call[0] != "GET"]
 
+    def cleanup_fixture(self, real_mount=False):
+        self.policy.host_mountinfo = lambda: self.policy.mountinfo()
+        selected = self.policy.ensure(self.payload)
+        incarnation = str(uuid.uuid4())
+        target = "/workspace/model-dir"
+        key = "hm" + hashlib.sha256(f"{self.path_id}:{target}".encode()).hexdigest()[:6]
+        name = "agentor-worker-" + self.worker_id
+        device = {"type": "disk", "source": str(self.root / "share"), "path": target, "readonly": "true"}
+        self.cleanup_instance = {"name": name, "type": "virtual-machine", "profiles": [], "status": "Stopped",
+            "config": {"user.agentor.installation": self.installation, "user.agentor.id": self.worker_id,
+                "user.agentor.owner": self.owner, "volatile.uuid": incarnation,
+                "user.agentor.host-mounts": json.dumps([{"key": key, "pathId": self.path_id,
+                    "sourceIdentity": selected["sourceIdentity"]}])},
+            "devices": {key: device}, "expanded_devices": {key: copy.deepcopy(device)}}
+        self.cleanup_state = {"status": "Stopped", "pid": 0}
+        encoded = ("disk." + key + "." + target[1:]).replace("-", "--").replace("/", "-")
+        self.cleanup_stage = self.root / "native" / "devices" / ("agentor_" + name) / encoded
+        self.cleanup_stage.mkdir(parents=True)
+        self.cleanup_mounts = [str(self.cleanup_stage)]
+        self.cleanup_calls = []
+        original_request = self.policy.request
+
+        def request(method, path, body=None, etag=None):
+            if path == "/1.0/instances?recursion=1&project=agentor":
+                return [copy.deepcopy(self.cleanup_instance)], None
+            if path == "/1.0/instances/" + name + "?project=agentor":
+                return copy.deepcopy(self.cleanup_instance), "instance-etag"
+            if path == "/1.0/instances/" + name + "/state?project=agentor":
+                return copy.deepcopy(self.cleanup_state), None
+            return original_request(method, path, body, etag)
+
+        self.policy.request = request
+        self.policy.mountinfo = lambda: "1 0 8:1 / / rw - ext4 /dev/vda1 rw\n" + "".join(
+            f"{index + 2} 1 8:2 / {path} ro - ext4 /dev/vdb1 rw\n" for index, path in enumerate(self.cleanup_mounts))
+        original_identity = MODULE.SOURCES.directory_identity
+        source_identity = original_identity(str(self.root / "share"))
+        if not real_mount:
+            identity_patch = patch.object(MODULE.SOURCES, "directory_identity",
+                side_effect=lambda path: source_identity if path == str(self.cleanup_stage) else original_identity(path))
+            identity_patch.start(); self.addCleanup(identity_patch.stop)
+
+        def unmount(path):
+            self.assertEqual(path, self.cleanup_stage)
+            self.cleanup_calls.append(path)
+            self.cleanup_mounts.remove(str(path))
+        self.policy.unmount = unmount
+        self.calls.clear()
+        (self.root / "share" / "model").write_text("preserved model fixture")
+        return {"userId": self.owner, "workerId": self.worker_id, "incarnation": incarnation}
+
+    def test_stale_owned_export_cleanup_is_bounded_idempotent_and_does_not_delete_source(self):
+        payload = self.cleanup_fixture()
+        result = self.policy.cleanup_worker_exports(payload)
+        self.assertEqual(result["cleaned"], 1)
+        self.assertTrue(result["cleanupConfirmed"])
+        self.assertEqual(self.policy.cleanup_worker_exports(payload)["cleaned"], 0)
+        self.assertEqual(self.cleanup_calls, [self.cleanup_stage])
+        self.assertEqual((self.root / "share" / "model").read_text(), "preserved model fixture")
+        self.assertTrue(self.cleanup_stage.is_dir())  # No rm, recursive unmount, or source mutation.
+        self.assertEqual(self.mutations(), [])
+
+    def test_cleanup_does_not_regrant_catalog_or_worker_access_removed_before_delete(self):
+        payload = self.cleanup_fixture()
+        self.worker.update(mounts=[], deletionPending=True)
+        self.worker_file.write_text(json.dumps([self.worker]))
+        self.catalog.clear(); self.persist()
+        self.project["config"]["restricted.devices.disk.paths"] = str(self.root / "credentials")
+        self.assertEqual(self.policy.cleanup_worker_exports(payload)["cleaned"], 1)
+        self.assertEqual(self.mutations(), [])
+
+    def test_live_or_foreign_worker_export_is_never_unmounted(self):
+        payload = self.cleanup_fixture()
+        for field, value in [("user.agentor.owner", "foreign"), ("volatile.uuid", str(uuid.uuid4())),
+                             ("user.agentor.installation", str(uuid.uuid4())), ("user.agentor.administrative", "platform")]:
+            with self.subTest(field=field):
+                previous = self.cleanup_instance["config"].get(field)
+                self.cleanup_instance["config"][field] = value
+                with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+                if previous is None: self.cleanup_instance["config"].pop(field)
+                else: self.cleanup_instance["config"][field] = previous
+        for state in [{"status": "Running", "pid": 123}, {"status": "Stopped", "pid": 123}]:
+            self.cleanup_state = state
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.assertEqual(self.cleanup_calls, [])
+
+    def test_cleanup_rejects_nested_duplicate_or_changed_export_identity(self):
+        payload = self.cleanup_fixture()
+        for mounts in [[str(self.cleanup_stage), str(self.cleanup_stage) + "/nested"],
+                       [str(self.cleanup_stage), str(self.cleanup_stage)]]:
+            self.cleanup_mounts = mounts
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.cleanup_mounts = [str(self.cleanup_stage)]
+        identities = json.loads(self.cleanup_instance["config"]["user.agentor.host-mounts"])
+        identities[0]["sourceIdentity"] = "0" * 64
+        self.cleanup_instance["config"]["user.agentor.host-mounts"] = json.dumps(identities)
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.assertEqual(self.cleanup_calls, [])
+
+    def test_cleanup_refuses_caller_paths_unreserved_sources_and_unknown_incarnation(self):
+        payload = self.cleanup_fixture()
+        for bad in [{**payload, "source": "/etc"}, {**payload, "incarnation": "../foreign"},
+                    {**payload, "userId": "../foreign"}, {**payload, "workerId": str(uuid.uuid4())}]:
+            with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(bad)
+        self.project["config"].pop(MODULE.OWNED_ROOTS)
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.assertEqual(self.cleanup_calls, [])
+
+    def test_busy_or_unconfirmed_cleanup_never_claims_success(self):
+        payload = self.cleanup_fixture()
+        def busy(_): raise MODULE.SOURCES.SourceRejected("still busy; source retained")
+        self.policy.unmount = busy
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.policy.unmount = lambda _: None  # Lost acknowledgement/readback still mounted.
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.assertEqual((self.root / "share" / "model").read_text(), "preserved model fixture")
+
+    def test_cleanup_rechecks_incarnation_after_mutation_and_stops_on_change(self):
+        payload = self.cleanup_fixture()
+        def replace(_): self.cleanup_instance["config"]["volatile.uuid"] = str(uuid.uuid4())
+        self.policy.unmount = replace
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+
+    def test_migration_cleanup_requires_exact_destination_receipt(self):
+        payload = self.cleanup_fixture()
+        nonce = str(uuid.uuid4())
+        self.worker.update(runtimeKind="legacy-docker", incusMigration={"nonce": nonce,
+            "destinationIncarnation": payload["incarnation"]})
+        self.worker_file.write_text(json.dumps([self.worker]))
+        with self.assertRaises(MODULE.SOURCES.SourceRejected): self.policy.cleanup_worker_exports(payload)
+        self.cleanup_instance["config"]["user.agentor.recreation"] = nonce
+        self.assertEqual(self.policy.cleanup_worker_exports(payload)["cleaned"], 1)
+
     def test_idempotent_exact_allowlist_preserves_accounts_and_unrelated_restrictions(self):
         original = copy.deepcopy(self.project)
         result = self.policy.ensure(self.payload)

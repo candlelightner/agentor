@@ -48,6 +48,8 @@ jobs:
               - 'scripts/build-incus-worker-image.sh'
               - 'scripts/incus-canary.mjs'
               - 'scripts/incus-admin-network-policy.py'
+              - 'scripts/incus-host-mount-policy.py'
+              - 'scripts/agentor-incus-network-service.py'
               - 'scripts/setup-incus-host.sh'
               - 'scripts/profile-ci-workflow.py'
               - '.dockerignore'
@@ -107,6 +109,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-utils
+
+      - name: Verify busy native export cleanup in a private mount namespace
+        run: sudo env INCUS_EXPORT_CLEANUP_MOUNT_TEST=true python3 tests/helpers/test_incus_export_cleanup_mount.py
 
       - name: Install locked Playwright Chromium and system dependencies
         if: steps.quality-runner.outputs.mode == 'baseline'

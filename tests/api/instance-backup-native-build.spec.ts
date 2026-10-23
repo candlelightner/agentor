@@ -21,9 +21,9 @@ test('standalone native helper adapter imports isolated locked dependencies with
     const result = JSON.parse(stdout.trim());
     expect(result.externalPackages).toEqual(['dockerode', 'h3', 'tar-stream', 'ws']);
     expect(result.dependencyFiles).toBeGreaterThan(0); expect(result.dependencyFiles).toBeLessThan(2000);
-    // Native admin recovery joins the catalog, memory and hardware policy in
-    // this bounded adapter; the dependency and application-isolation checks remain strict.
-    expect(result.bundleBytes).toBeLessThan(1_000_000);
+    // Host-export recovery adds stopped-VM checks to the native adapter. Keep
+    // the size budget bounded and dependency/application isolation strict.
+    expect(result.bundleBytes).toBeLessThan(1_050_000);
     expect(result.bundledInputs).toContain('server/utils/instance-restore-administrative.ts');
     expect(result.bundledInputs).toContain('server/utils/incus-admin-restore.ts');
     expect(result.bundledInputs).toContain('server/utils/incus-worker-runtime.ts');

@@ -1,3 +1,4 @@
+import { assertIncusHostMountRemoval } from './incus-device-layout';
 import https from 'node:https';
 import http, { type IncomingHttpHeaders } from 'node:http';
 import { readFile, open, type FileHandle } from 'node:fs/promises';
@@ -675,6 +676,11 @@ export class IncusClient {
     return this.updateInstanceDefinition(name, devices, onAccepted, expected, completeCanonicalRestore);
   }
 
+  async removeHostMounts(name: string, devices: Record<string, IncusDevice>, metadata: string,
+    expected: IncusInstance): Promise<void> {
+    return this.updateInstanceDefinition(name, devices, undefined, expected, undefined, undefined, undefined, metadata);
+  }
+
   async assertInstanceMutationSettled(name: string): Promise<void> {
     // A previous device PUT can outlive its observer. Incus serializes native
     // instance updates and checks ETag AFTER taking that lock. Do not queue a
@@ -704,7 +710,7 @@ export class IncusClient {
 
   private async updateInstanceDefinition(name: string, devices: Record<string, IncusDevice>,
     onAccepted?: (operationPath: string | undefined) => Promise<void>, expected?: IncusInstance,
-    completeCanonicalRestore?: { nonce: string; hostMountMetadata?: string }, cpuCount?: number, onSubmit?: () => void): Promise<void> {
+    completeCanonicalRestore?: { nonce: string; hostMountMetadata?: string }, cpuCount?: number, onSubmit?: () => void, hostMountRemoval?: string): Promise<void> {
     await this.assertInstanceMutationSettled(name);
     const path = `/1.0/instances/${encodeURIComponent(name)}`;
     const snapshot = await this.rawRequest('GET', path);
@@ -718,6 +724,13 @@ export class IncusClient {
     if (expected && !isDeepStrictEqual(fields(expected), fields(current)))
       throw new IncusError('Incus instance changed since the caller device snapshot; no update was submitted');
     const config = { ...current.config };
+    if (hostMountRemoval !== undefined) {
+      if (!expected || current.name !== name || expected.name !== name ||
+          current.config['volatile.uuid'] !== expected.config['volatile.uuid'])
+        throw new IncusError('Host mount removal incarnation changed; no update submitted');
+      assertIncusHostMountRemoval(current, devices, hostMountRemoval);
+      config['user.agentor.host-mounts'] = hostMountRemoval;
+    }
     if (cpuCount !== undefined) {
       if (!expected || current.name !== name || expected.name !== name ||
           current.type !== 'virtual-machine' || expected.type !== 'virtual-machine' ||

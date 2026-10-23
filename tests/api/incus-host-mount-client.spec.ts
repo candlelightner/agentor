@@ -6,6 +6,33 @@ import { randomUUID } from 'node:crypto';
 import { IncusHostMountClient } from '../../orchestrator/server/utils/incus-host-mount-client';
 import { backupInstallationId } from '../../orchestrator/server/utils/backup-installation';
 import type { Config } from '../../orchestrator/server/utils/config';
+import { execFileSync } from 'node:child_process';
+
+for (const helper of ['test_incus_host_mount_policy.py', 'test_incus_network_service.py'])
+  test(`operator host export safety regression: ${helper}`, () => {
+    execFileSync('python3', [new URL('../helpers/' + helper, import.meta.url).pathname], { timeout: 30_000, stdio: 'pipe' });
+  });
+
+test('stale export cleanup sends only captured identity and requires a pinned confirmed response', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'agentor-export-cleanup-client-'));
+  try {
+    const installation = await backupInstallationId(dataDir), workerId = randomUUID(), incarnation = randomUUID();
+    const config = { dataDir, incusProject: 'agentor', incusNetworkHostEndpoint: 'https://host.invalid' } as Config;
+    const expected = { installation, project: 'agentor', userId: 'owner', workerId, incarnation, cleaned: 1, cleanupConfirmed: true };
+    let result: any = expected; const calls: unknown[] = [];
+    const host = new IncusHostMountClient(config, { request: async (...args: any[]) => { calls.push(args); return result; } });
+    expect(await host.cleanupWorkerExports('owner', workerId, incarnation)).toBe(1);
+    expect(calls).toEqual([['POST', '/v1/host-mounts/cleanup-worker', { userId: 'owner', workerId, incarnation }]]);
+    for (const patch of [{ workerId: randomUUID() }, { incarnation: randomUUID() }, { installation: randomUUID() },
+      { project: 'foreign' }, { cleanupConfirmed: false }, { cleaned: -1 }, { cleaned: 4097 }]) {
+      result = { ...expected, ...patch };
+      await expect(host.cleanupWorkerExports('owner', workerId, incarnation)).rejects.toThrow('cleanup authority');
+    }
+    calls.length = 0;
+    await expect(host.cleanupWorkerExports('../foreign', workerId, incarnation)).rejects.toThrow('exact worker');
+    expect(calls).toEqual([]);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
 
 test('host mount client sends only catalog ID and pins source/project/installation/mode/identity', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'agentor-host-export-client-'));
