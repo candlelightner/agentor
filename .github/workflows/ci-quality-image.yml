@@ -1,0 +1,177 @@
+name: Prepare quality runner image
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/ci-quality/**'
+      - 'tests/helpers/test_ci_quality_image.py'
+      - 'tests/package.json'
+      - 'tests/package-lock.json'
+      - 'orchestrator/package.json'
+      - 'orchestrator/package-lock.json'
+      - '.github/workflows/ci-quality-image.yml'
+      - '.github/workflows/docker-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tests/ci-quality/**'
+      - 'tests/package.json'
+      - 'tests/package-lock.json'
+      - '.github/workflows/ci-quality-image.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Validate candidate quality image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      image-id: ${{ steps.image.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify image compatibility checks
+        run: |
+          node tests/ci-quality/check-image.mjs --self-test
+          python3 -m unittest discover -s tests/helpers -p test_ci_quality_image.py
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build fresh Ubuntu amd64 candidate
+        id: image
+        env:
+          BUILDX_METADATA_PROVENANCE: max
+        run: |
+          docker buildx build --pull --no-cache --platform linux/amd64 --load \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label org.opencontainers.image.source=https://github.com/candlelightner/agentor \
+            --metadata-file "$RUNNER_TEMP/quality-build-metadata.json" \
+            -f tests/ci-quality/Dockerfile -t agentor-quality-candidate:validation .
+          echo "id=$(docker image inspect agentor-quality-candidate:validation --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+          echo "abi=$(docker run --rm --network=none --read-only agentor-quality-candidate:validation node -p process.versions.modules)" >> "$GITHUB_OUTPUT"
+          docker run --rm --network=none --read-only agentor-quality-candidate:validation cat /etc/agentor-ci-quality.json > "$RUNNER_TEMP/quality-image-contract.json"
+          # Retain public dependency identities, not raw builder/runner metadata.
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads((Path(os.environ['RUNNER_TEMP']) / 'quality-build-metadata.json').read_text())
+          materials = data.get('buildx.build.provenance', {}).get('materials', [])
+          public = [item for item in materials if item.get('uri', '').startswith('pkg:docker/')]
+          if len(public) < 3 or any(not item.get('digest') for item in public):
+              raise SystemExit('Resolved base/Node/CLI provenance is incomplete; candidate stopped and no image was published.')
+          (Path(os.environ['RUNNER_TEMP']) / 'quality-base-materials.json').write_text(json.dumps(public, indent=2) + '\n')
+          PY
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/quality-npm-cache
+          key: quality-npm-v1-${{ runner.os }}-${{ runner.arch }}-node22-abi${{ steps.image.outputs.abi }}-${{ hashFiles('orchestrator/package-lock.json', 'tests/package-lock.json') }}
+          restore-keys: quality-npm-v1-${{ runner.os }}-${{ runner.arch }}-node22-abi${{ steps.image.outputs.abi }}-
+
+      - name: Run unchanged quality and privileged archive checks
+        env:
+          CANDIDATE_ID: ${{ steps.image.outputs.id }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/quality-npm-cache"
+          # Hosted ubuntu-24.04 uses UID 1001; fail visibly if that assumption changes.
+          [[ "$(id -u)" == 1001 && -w "$RUNNER_TEMP/quality-npm-cache" ]] || { echo 'Runner/cache ownership differs from UID 1001; candidate stopped before container execution.' >&2; exit 1; }
+          docker run --rm --init --shm-size=1g \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --mount "type=bind,src=$RUNNER_TEMP/quality-npm-cache,dst=/home/runner/.npm" \
+            --env CI=true "$CANDIDATE_ID" bash tests/ci-quality/run-quality.sh
+
+      - name: Save the exact tested image for trusted publication
+        if: github.repository == 'candlelightner/agentor' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          CANDIDATE_ID: ${{ steps.image.outputs.id }}
+        run: |
+          mkdir "$RUNNER_TEMP/quality-image"
+          docker image save "$CANDIDATE_ID" -o "$RUNNER_TEMP/quality-image/image.tar"
+          printf '%s\n' "$CANDIDATE_ID" > "$RUNNER_TEMP/quality-image/image-id.txt"
+          cp "$RUNNER_TEMP/quality-base-materials.json" "$RUNNER_TEMP/quality-image/base-materials.json"
+          cp "$RUNNER_TEMP/quality-image-contract.json" "$RUNNER_TEMP/quality-image/contract.json"
+
+      - uses: actions/upload-artifact@v4
+        if: github.repository == 'candlelightner/agentor' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        with:
+          name: tested-quality-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality-image/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Publish exact trusted quality candidate
+    needs: candidate
+    if: github.repository == 'candlelightner/agentor' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tested-quality-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality-image
+
+      - name: Verify the same-run tested image
+        env:
+          TESTED_ID: ${{ needs.candidate.outputs.image-id }}
+        run: |
+          [[ "$TESTED_ID" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo 'Invalid tested image identity; publication refused.' >&2; exit 1; }
+          [[ "$(cat "$RUNNER_TEMP/quality-image/image-id.txt")" == "$TESTED_ID" ]] || { echo 'Artifact identity differs; publication refused.' >&2; exit 1; }
+          docker image load -i "$RUNNER_TEMP/quality-image/image.tar"
+          [[ "$(docker image inspect "$TESTED_ID" --format '{{.Id}}')" == "$TESTED_ID" ]] || { echo 'Loaded image differs; publication refused.' >&2; exit 1; }
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish a unique version and report its immutable reference
+        env:
+          TESTED_ID: ${{ needs.candidate.outputs.image-id }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          image="ghcr.io/candlelightner/agentor-ci-quality:sha-${SOURCE_SHA}-run-${RUN_ID}-${RUN_ATTEMPT}"
+          docker image tag "$TESTED_ID" "$image"
+          docker image push "$image"
+          ref=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
+          [[ "$ref" =~ ^ghcr.io/candlelightner/agentor-ci-quality@sha256:[a-f0-9]{64}$ ]] || { echo 'Published digest could not be confirmed; active CI remains unchanged.' >&2; exit 1; }
+          printf '%s\n' "$ref" > "$RUNNER_TEMP/quality-image/publication-reference.txt"
+          printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/quality-image/source-sha.txt"
+          printf 'Tested quality image: `%s`\n\nSource: `%s`\n\nPreparation only: active CI was not switched.\n' "$ref" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          {
+            printf '\nImage contract:\n```json\n'
+            cat "$RUNNER_TEMP/quality-image/contract.json"
+            printf '```\n\nResolved public base inputs:\n```json\n'
+            cat "$RUNNER_TEMP/quality-image/base-materials.json"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain the small public publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-image-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/quality-image/contract.json
+            ${{ runner.temp }}/quality-image/base-materials.json
+            ${{ runner.temp }}/quality-image/image-id.txt
+            ${{ runner.temp }}/quality-image/publication-reference.txt
+            ${{ runner.temp }}/quality-image/source-sha.txt
+          retention-days: 30
+          if-no-files-found: error
